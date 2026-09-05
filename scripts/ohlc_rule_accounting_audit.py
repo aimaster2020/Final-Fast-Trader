@@ -54,7 +54,12 @@ def _close_position(
     if liquidation:
         gross_pnl = -position["margin"]
 
-    net_pnl = gross_pnl - close_fee
+    # Net trade PnL includes BOTH entry and exit fees. Entry fee was already
+    # deducted from cash when the position was opened, so include it here only
+    # for trade-level analytics; do not deduct it from cash a second time.
+    total_trade_fees = position["entry_fee"] + close_fee
+    net_pnl = gross_pnl - total_trade_fees
+
     cash += position["margin"] + gross_pnl - close_fee
     cash = max(0.0, cash)
     return cash, gross_pnl, net_pnl, close_fee
@@ -74,8 +79,8 @@ def evaluate_rule_audited(
 
     Accounting:
     - Dollar PnL is calculated from actual isolated-margin positions.
-    - Gross PF is before closing fees.
-    - Net PF is after entry and exit fees.
+    - Gross PF is before trading fees.
+    - Net PF is after BOTH entry and exit fees.
     - Each isolated-margin position cannot lose more than its margin.
     - Intrabar liquidation is detected from candle high/low.
     - Equity is marked to market and cannot become negative.
@@ -100,7 +105,9 @@ def evaluate_rule_audited(
             {
                 "gross_pnl": gross_pnl,
                 "net_pnl": net_pnl,
-                "fee": close_fee,
+                "entry_fee": p["entry_fee"],
+                "exit_fee": close_fee,
+                "fee": p["entry_fee"] + close_fee,
                 "liquidation": liquidation,
             }
         )
@@ -147,6 +154,7 @@ def evaluate_rule_audited(
                         "entry": c.close,
                         "margin": margin,
                         "notional": notional,
+                        "entry_fee": entry_fee,
                         "opened_at": c.timestamp,
                     }
                 )
