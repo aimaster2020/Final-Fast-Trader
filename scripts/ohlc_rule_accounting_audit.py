@@ -41,23 +41,23 @@ def _close_position(
     fee: float,
     leverage: float,
     liquidation: bool = False,
-) -> tuple[float, float, float]:
-    gross = (
+) -> tuple[float, float, float, float]:
+    gross_return = (
         price / position["entry"] - 1.0
         if position["side"] == 1
         else position["entry"] / price - 1.0
     )
-    pnl = position["margin"] * leverage * gross
+    gross_pnl = position["margin"] * leverage * gross_return
     close_fee = position["notional"] * fee
 
-    # Loss is limited by isolated margin. This prevents impossible negative equity.
+    # Isolated margin: liquidation consumes the remaining margin.
     if liquidation:
-        pnl = -position["margin"]
+        gross_pnl = -position["margin"]
 
-    net_pnl = pnl - close_fee
-    cash += position["margin"] + pnl - close_fee
+    net_pnl = gross_pnl - close_fee
+    cash += position["margin"] + gross_pnl - close_fee
     cash = max(0.0, cash)
-    return cash, net_pnl, close_fee
+    return cash, gross_pnl, net_pnl, close_fee
 
 
 def evaluate_rule_audited(
@@ -70,19 +70,19 @@ def evaluate_rule_audited(
     fee: float,
     leverage: float,
 ):
-    """Audited accounting model.
+    """Audited accounting model for the existing OHLC signal semantics.
 
-    Signal generation is unchanged. Accounting is corrected:
-    - PnL is dollar PnL from actual position notional.
-    - Profit Factor uses dollar gross profit / dollar gross loss.
+    Accounting:
+    - Dollar PnL is calculated from actual isolated-margin positions.
+    - Gross PF is before closing fees.
+    - Net PF is after entry and exit fees.
     - Each isolated-margin position cannot lose more than its margin.
     - Intrabar liquidation is detected from candle high/low.
-    - Equity and drawdown are marked to market and cannot become negative.
-    - Fees are charged exactly once at entry and once at exit/liquidation.
+    - Equity is marked to market and cannot become negative.
     """
     cash = initial_capital
     positions: list[dict] = []
-    trade_pnls: list[float] = []
+    trade_records: list[dict] = []
     fees_paid = 0.0
     liquidations = 0
     peak_equity = initial_capital
@@ -90,6 +90,23 @@ def evaluate_rule_audited(
     last_signal = 0
 
     signals = buys = sells = holds = accepted_signals = 0
+
+    def record_close(p: dict, price: float, liquidation: bool = False) -> None:
+        nonlocal cash, fees_paid, liquidations
+        cash, gross_pnl, net_pnl, close_fee = _close_position(
+            p, price, cash, fee, leverage, liquidation
+        )
+        trade_records.append(
+            {
+                "gross_pnl": gross_pnl,
+                "net_pnl": net_pnl,
+                "fee": close_fee,
+                "liquidation": liquidation,
+            }
+        )
+        fees_paid += close_fee
+        if liquidation:
+            liquidations += 1
 
     for c in candles:
         raw_sig = signal_for_rule(c, rule, threshold)
@@ -113,20 +130,11 @@ def evaluate_rule_audited(
             accepted_signals += 1
 
         if direction == "BOTH" and sig and last_signal and sig != last_signal and positions:
-            remaining: list[dict] = []
             for p in positions:
-                cash, net_pnl, close_fee = _close_position(
-                    p, c.close, cash, fee, leverage
-                )
-                trade_pnls.append(net_pnl)
-                fees_paid += close_fee
-            positions = remaining
+                record_close(p, c.close)
+            positions = []
 
         if sig and cash > 0:
-            if direction == "BOTH" and sig == last_signal:
-                # Preserve the existing signal semantics: repeated same-side signals
-                # may add another position using currently free cash.
-                pass
             margin = cash * allocation
             notional = margin * leverage
             entry_fee = notional * fee
@@ -150,12 +158,7 @@ def evaluate_rule_audited(
             liq = _liquidation_price(p, leverage)
             hit = (c.low <= liq) if p["side"] == 1 else (c.high >= liq)
             if hit and c.timestamp > p["opened_at"]:
-                cash, net_pnl, close_fee = _close_position(
-                    p, liq, cash, fee, leverage, liquidation=True
-                )
-                trade_pnls.append(net_pnl)
-                fees_paid += close_fee
-                liquidations += 1
+                record_close(p, liq, liquidation=True)
             else:
                 still_open.append(p)
         positions = still_open
@@ -168,22 +171,26 @@ def evaluate_rule_audited(
 
     # Realize remaining positions at the final close.
     for p in positions:
-        cash, net_pnl, close_fee = _close_position(
-            p, candles[-1].close, cash, fee, leverage
-        )
-        trade_pnls.append(net_pnl)
-        fees_paid += close_fee
+        record_close(p, candles[-1].close)
 
     final_capital = max(0.0, cash)
-    wins = sum(x > 0 for x in trade_pnls)
-    losses = sum(x < 0 for x in trade_pnls)
-    gross_profit = sum(x for x in trade_pnls if x > 0)
-    gross_loss = -sum(x for x in trade_pnls if x < 0)
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0
-        else float("inf") if gross_profit > 0 else 0.0
-    )
+    gross_profits = [x["gross_pnl"] for x in trade_records if x["gross_pnl"] > 0]
+    gross_losses = [-x["gross_pnl"] for x in trade_records if x["gross_pnl"] < 0]
+    net_profits = [x["net_pnl"] for x in trade_records if x["net_pnl"] > 0]
+    net_losses = [-x["net_pnl"] for x in trade_records if x["net_pnl"] < 0]
+
+    wins = len(net_profits)
+    losses = len(net_losses)
+    gross_profit = sum(gross_profits)
+    gross_loss = sum(gross_losses)
+    net_profit = sum(net_profits)
+    net_loss = sum(net_losses)
+
+    gross_pf = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+    net_pf = net_profit / net_loss if net_loss > 0 else (float("inf") if net_profit > 0 else 0.0)
+
+    avg_win = net_profit / wins if wins else 0.0
+    avg_loss = net_loss / losses if losses else 0.0
 
     return {
         "direction": direction,
@@ -197,13 +204,19 @@ def evaluate_rule_audited(
         "buy_signals": buys,
         "sell_signals": sells,
         "hold_candles": holds,
-        "completed_trades": len(trade_pnls),
+        "completed_trades": len(trade_records),
         "wins": wins,
         "losses": losses,
-        "win_rate_pct": wins / len(trade_pnls) * 100.0 if trade_pnls else 0.0,
+        "win_rate_pct": wins / len(trade_records) * 100.0 if trade_records else 0.0,
         "gross_profit": gross_profit,
         "gross_loss": gross_loss,
-        "profit_factor": profit_factor,
+        "gross_profit_factor": gross_pf,
+        "net_profit": net_profit,
+        "net_loss": net_loss,
+        "net_profit_factor": net_pf,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "profit_per_trade": sum(x["net_pnl"] for x in trade_records) / len(trade_records) if trade_records else 0.0,
         "commission_paid": fees_paid,
         "liquidations": liquidations,
         "max_drawdown_pct": max_dd,
@@ -259,12 +272,15 @@ def main() -> None:
                         }
                     )
                     rows.append(s)
-                    pf = s["profit_factor"]
-                    pf_text = "inf" if pf == float("inf") else f"{pf:.2f}"
+                    gpf = s["gross_profit_factor"]
+                    npf = s["net_profit_factor"]
+                    gpf_text = "inf" if gpf == float("inf") else f"{gpf:.2f}"
+                    npf_text = "inf" if npf == float("inf") else f"{npf:.2f}"
                     print(
                         f"{symbol}|{tf}m|{direction}|{s['rule']}|"
                         f"return={s['return_pct']:.2f}% trades={s['completed_trades']} "
-                        f"win={s['win_rate_pct']:.1f}% PF={pf_text} "
+                        f"win={s['win_rate_pct']:.1f}% GPF={gpf_text} NPF={npf_text} "
+                        f"avgW={s['avg_win']:.4f} avgL={s['avg_loss']:.4f} "
                         f"DD={s['max_drawdown_pct']:.2f}% fees={s['commission_paid']:.2f} "
                         f"liq={s['liquidations']}"
                     )
