@@ -3,19 +3,12 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-from typing import Iterable
 
-from fast_pattern_trader.models import Candle, Signal
-from fast_pattern_trader.ohlc_rule_strategy import (
-    DEFAULT_RULE_WEIGHTS,
-    NOBITEX_TAKER_FEE_PER_SIDE if False else DEFAULT_RULE_WEIGHTS,
-    decide_movement,
-)
+from fast_pattern_trader.models import Candle
 
-# User-specified trading assumptions.
-FEE_PER_SIDE = 0.013
+FEE_PER_SIDE = 0.013          # 1.3% of leveraged notional per side
 LEVERAGE = 10.0
-DEFAULT_ALLOCATION = 0.10
+DEFAULT_ALLOCATION = 0.10     # 10% of currently free capital as margin
 DEFAULT_CAPITAL = 1000.0
 
 
@@ -45,29 +38,28 @@ def load_binance(path: Path) -> list[Candle]:
                 continue
             try:
                 ts = int(float(r[0]))
-                if ts > 10_000_000_000_000:  # Binance microseconds
+                if ts > 10_000_000_000_000:       # microseconds
                     ts //= 1_000_000
-                elif ts > 10_000_000_000:  # milliseconds
+                elif ts > 10_000_000_000:         # milliseconds
                     ts //= 1_000
                 rows.append(Candle(ts, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
             except (ValueError, TypeError):
-                # Also accept a normal OHLC CSV with a header.
                 continue
     return sorted(rows, key=lambda x: x.timestamp)
 
 
 def rule_components(c: Candle) -> dict[str, float]:
-    # Use the strategy's exact internal rule calculations, but isolate one rule at a time.
     from fast_pattern_trader.ohlc_rule_strategy import (
         evaluate_body_position,
         evaluate_body_strength,
         evaluate_close_behavior,
         evaluate_open_behavior,
         evaluate_range,
-        evaluate_rules,
         evaluate_r16,
+        evaluate_rules,
         evaluate_wick_behavior,
     )
+
     v = evaluate_rules(c)
     r = evaluate_range(c)
     ob = evaluate_open_behavior(c)
@@ -97,14 +89,23 @@ def rule_components(c: Candle) -> dict[str, float]:
 
 
 def signal_for_rule(c: Candle, rule: str, threshold: float) -> int:
-    x = rule_components(c)[rule]
-    return 1 if x >= threshold else -1 if x <= -threshold else 0
+    value = rule_components(c)[rule]
+    return 1 if value >= threshold else -1 if value <= -threshold else 0
+
+
+def _close_position(p: dict, price: float, capital: float, fee: float, leverage: float):
+    gross = (price / p["entry"] - 1.0) if p["side"] == 1 else (p["entry"] / price - 1.0)
+    pnl = p["margin"] * leverage * gross
+    close_fee = p["notional"] * fee
+    # Return reserved margin + leveraged PnL - closing commission.
+    capital += p["margin"] + pnl - close_fee
+    return capital, (pnl - close_fee) / p["margin"] if p["margin"] else 0.0, close_fee
 
 
 def evaluate_rule(candles: list[Candle], rule: str, initial_capital: float, allocation: float, threshold: float, fee: float, leverage: float):
-    capital = initial_capital
+    free_capital = initial_capital
     positions: list[dict] = []
-    trades: list[float] = []
+    trade_returns: list[float] = []
     fees = 0.0
     peak = initial_capital
     max_dd = 0.0
@@ -113,84 +114,93 @@ def evaluate_rule(candles: list[Candle], rule: str, initial_capital: float, allo
 
     for c in candles:
         sig = signal_for_rule(c, rule, threshold)
-        signals += sig != 0
-        buys += sig == 1
-        sells += sig == -1
-        holds += sig == 0
-
-        # Every signal is an independent entry. No artificial max-position cap:
-        # available equity determines how many 10%-of-equity margins can be opened.
         if sig:
-            # Opposite signal closes all positions of the opposite side; same-side signals add a position.
-            if sig != last_signal and last_signal:
-                new_positions = []
-                for p in positions:
-                    if p["side"] == -sig:
-                        gross = ((c.close / p["entry"]) - 1.0) if p["side"] == 1 else ((p["entry"] / c.close) - 1.0)
-                        pnl = p["margin"] * leverage * gross
-                        close_fee = p["notional"] * fee
-                        capital += pnl - close_fee
-                        fees += close_fee
-                        trades.append((pnl - close_fee) / p["margin"] if p["margin"] else 0.0)
-                    else:
-                        new_positions.append(p)
-                positions = new_positions
+            signals += 1
+            if sig == 1:
+                buys += 1
+            else:
+                sells += 1
+        else:
+            holds += 1
 
-            # Margin is 10% of currently available capital. Leverage determines notional.
-            margin = capital * allocation
-            if margin > 0:
-                notional = margin * leverage
-                entry_fee = notional * fee
-                capital -= entry_fee
+        # Opposite signal closes every currently open position, then reverses.
+        if sig and last_signal and sig != last_signal and positions:
+            for p in positions:
+                free_capital, tr, cf = _close_position(p, c.close, free_capital, fee, leverage)
+                trade_returns.append(tr)
+                fees += cf
+            positions = []
+
+        # Each same-side signal adds a new 10%-of-free-capital margin position.
+        # There is deliberately no max-position parameter: free capital is the constraint.
+        if sig and free_capital > 0:
+            margin = free_capital * allocation
+            notional = margin * leverage
+            entry_fee = notional * fee
+            if margin + entry_fee <= free_capital:
+                free_capital -= margin + entry_fee
                 fees += entry_fee
-                positions.append({"side": sig, "entry": c.close, "margin": margin, "notional": notional, "opened_at": c.timestamp})
+                positions.append({
+                    "side": sig,
+                    "entry": c.close,
+                    "margin": margin,
+                    "notional": notional,
+                    "opened_at": c.timestamp,
+                })
             last_signal = sig
 
-        equity = capital
+        equity = free_capital
         for p in positions:
-            gross = ((c.close / p["entry"]) - 1.0) if p["side"] == 1 else ((p["entry"] / c.close) - 1.0)
-            equity += p["margin"] * leverage * gross
+            gross = (c.close / p["entry"] - 1.0) if p["side"] == 1 else (p["entry"] / c.close - 1.0)
+            equity += p["margin"] + p["margin"] * leverage * gross
         peak = max(peak, equity)
         if peak:
             max_dd = max(max_dd, (peak - equity) / peak * 100.0)
 
-    # Mark-to-market liquidation at month end, including closing fee.
-    final_equity = capital
+    # Force-close all positions at the last candle so the monthly result is realized.
     for p in positions:
-        gross = ((candles[-1].close / p["entry"]) - 1.0) if p["side"] == 1 else ((p["entry"] / candles[-1].close) - 1.0)
-        pnl = p["margin"] * leverage * gross
-        close_fee = p["notional"] * fee
-        final_equity += pnl - close_fee
-        fees += close_fee
-        trades.append((pnl - close_fee) / p["margin"] if p["margin"] else 0.0)
+        free_capital, tr, cf = _close_position(p, candles[-1].close, free_capital, fee, leverage)
+        trade_returns.append(tr)
+        fees += cf
 
-    wins = sum(x > 0 for x in trades)
-    losses = sum(x <= 0 for x in trades)
+    final_capital = free_capital
+    wins = sum(x > 0 for x in trade_returns)
     days = max((candles[-1].timestamp - candles[0].timestamp) / 86400.0, 1 / 24)
     return {
         "rule": rule,
-        "start_utc": candles[0].timestamp,
-        "end_utc": candles[-1].timestamp,
         "candles": len(candles),
         "initial_capital": initial_capital,
-        "final_capital": final_equity,
-        "return_pct": (final_equity / initial_capital - 1.0) * 100.0,
+        "final_capital": final_capital,
+        "return_pct": (final_capital / initial_capital - 1.0) * 100.0,
         "signals": signals,
         "buy_signals": buys,
         "sell_signals": sells,
         "hold_candles": holds,
-        "completed_trades": len(trades),
+        "completed_trades": len(trade_returns),
         "wins": wins,
-        "losses": losses,
-        "win_rate_pct": wins / len(trades) * 100.0 if trades else 0.0,
+        "losses": len(trade_returns) - wins,
+        "win_rate_pct": wins / len(trade_returns) * 100.0 if trade_returns else 0.0,
         "commission_paid": fees,
         "max_drawdown_pct": max_dd,
         "calendar_days": days,
     }
 
 
+def find_month_file(input_dir: Path, symbol: str, month: str) -> Path | None:
+    exact = [
+        input_dir / f"{symbol}-1m-{month}.csv",
+        input_dir / f"{symbol}_1m_{month}.csv",
+        input_dir / f"{symbol}-{month}.csv",
+    ]
+    for p in exact:
+        if p.exists():
+            return p
+    found = list(input_dir.rglob(f"*{symbol}*{month}*.csv"))
+    return found[0] if found else None
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Isolate R1-R16 one at a time on one monthly Binance dataset.")
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")
     ap.add_argument("--month", required=True, help="YYYY-MM")
@@ -203,19 +213,9 @@ def main() -> None:
     ap.add_argument("--output", default="reports/ohlc_rule_isolation_monthly.csv")
     args = ap.parse_args()
 
-    # Binance Vision monthly naming is handled flexibly: symbol-1m-YYYY-MM.csv or symbol-1m-YYYY-MM.
-    rows = []
+    rows: list[dict] = []
     for symbol in [x.strip() for x in args.symbols.split(",") if x.strip()]:
-        candidates = [
-            Path(args.input_dir) / f"{symbol}-1m-{args.month}.csv",
-            Path(args.input_dir) / f"{symbol}_1m_{args.month}.csv",
-            Path(args.input_dir) / f"{symbol}-{args.month}.csv",
-        ]
-        path = next((p for p in candidates if p.exists()), None)
-        if path is None:
-            # Search recursively for a file containing symbol and month.
-            found = list(Path(args.input_dir).rglob(f"*{symbol}*{args.month}*.csv"))
-            path = found[0] if found else None
+        path = find_month_file(Path(args.input_dir), symbol, args.month)
         if path is None:
             print(f"MISSING {symbol} {args.month}")
             continue
@@ -223,10 +223,22 @@ def main() -> None:
         print(f"{symbol} {args.month}: loaded {len(raw):,} 1m candles from {path.name}")
         for tf in [int(x) for x in args.timeframes.split(",")]:
             candles = resample(raw, tf)
+            if not candles:
+                print(f"{symbol} {tf}m: no complete candles")
+                continue
             for i in range(1, 17):
                 rule = f"R{i}"
                 s = evaluate_rule(candles, rule, args.initial_capital, args.trade_allocation, args.threshold, args.fee_per_side, args.leverage)
-                s.update({"symbol": symbol, "timeframe_min": tf, "month": args.month, "fee_per_side_pct": args.fee_per_side * 100.0, "allocation_pct": args.trade_allocation * 100.0, "leverage": args.leverage})
+                s.update({
+                    "symbol": symbol,
+                    "month": args.month,
+                    "timeframe_min": tf,
+                    "fee_per_side_pct": args.fee_per_side * 100.0,
+                    "allocation_pct": args.trade_allocation * 100.0,
+                    "leverage": args.leverage,
+                    "start_utc": candles[0].timestamp,
+                    "end_utc": candles[-1].timestamp,
+                })
                 rows.append(s)
                 print(f"{symbol} {tf}m {rule}: return={s['return_pct']:.2f}% trades={s['completed_trades']} win={s['win_rate_pct']:.1f}% DD={s['max_drawdown_pct']:.2f}% fees={s['commission_paid']:.2f}")
 
@@ -239,7 +251,7 @@ def main() -> None:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)
-    # Ranked report: strongest return first; use win rate and lower drawdown as tie breakers.
+
     ranked = sorted(rows, key=lambda x: (float(x["return_pct"]), float(x["win_rate_pct"]), -float(x["max_drawdown_pct"])), reverse=True)
     rank_path = p.with_name(p.stem + "_ranked.csv")
     with rank_path.open("w", newline="", encoding="utf-8") as f:
