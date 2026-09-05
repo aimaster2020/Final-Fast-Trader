@@ -16,6 +16,25 @@ from ohlc_rule_isolation_monthly import (
     signal_for_rule,
 )
 
+RULE_ROLE = {
+    "R1": "بدنه: close > open",
+    "R2": "بدنه: open > close",
+    "R3": "بسته‌شدن روی سقف: close = high",
+    "R4": "بسته‌شدن روی کف: close = low",
+    "R5": "جهت کلی رنج کندل",
+    "R6": "شباهت open به high",
+    "R7": "شباهت open به low",
+    "R8": "شباهت close به high",
+    "R9": "شباهت close به low",
+    "R10": "قدرت سایه پایین",
+    "R11": "قدرت سایه بالا",
+    "R12": "موقعیت صعودی بدنه در رنج",
+    "R13": "موقعیت نزولی بدنه در رنج",
+    "R14": "قدرت صعودی بدنه",
+    "R15": "قدرت نزولی بدنه",
+    "R16": "جهت نهایی کندل/رنج",
+}
+
 
 def _mark_to_market(position: dict, price: float, leverage: float) -> float:
     gross = (
@@ -49,14 +68,9 @@ def _close_position(
     )
     gross_pnl = position["margin"] * leverage * gross_return
     close_fee = position["notional"] * fee
-
-    # Isolated margin: liquidation consumes the remaining margin.
     if liquidation:
         gross_pnl = -position["margin"]
 
-    # Net trade PnL includes BOTH entry and exit fees. Entry fee was already
-    # deducted from cash when the position was opened, so include it here only
-    # for trade-level analytics; do not deduct it from cash a second time.
     total_trade_fees = position["entry_fee"] + close_fee
     net_pnl = gross_pnl - total_trade_fees
 
@@ -75,16 +89,6 @@ def evaluate_rule_audited(
     fee: float,
     leverage: float,
 ):
-    """Audited accounting model for the existing OHLC signal semantics.
-
-    Accounting:
-    - Dollar PnL is calculated from actual isolated-margin positions.
-    - Gross PF is before trading fees.
-    - Net PF is after BOTH entry and exit fees.
-    - Each isolated-margin position cannot lose more than its margin.
-    - Intrabar liquidation is detected from candle high/low.
-    - Equity is marked to market and cannot become negative.
-    """
     cash = initial_capital
     positions: list[dict] = []
     trade_records: list[dict] = []
@@ -93,7 +97,6 @@ def evaluate_rule_audited(
     peak_equity = initial_capital
     max_dd = 0.0
     last_signal = 0
-
     signals = buys = sells = holds = accepted_signals = 0
 
     def record_close(p: dict, price: float, liquidation: bool = False) -> None:
@@ -160,7 +163,6 @@ def evaluate_rule_audited(
                 )
             last_signal = sig
 
-        # Detect isolated-margin liquidation from the candle's adverse excursion.
         still_open: list[dict] = []
         for p in positions:
             liq = _liquidation_price(p, leverage)
@@ -177,7 +179,6 @@ def evaluate_rule_audited(
         if peak_equity > 0:
             max_dd = max(max_dd, (peak_equity - equity) / peak_equity * 100.0)
 
-    # Realize remaining positions at the final close.
     for p in positions:
         record_close(p, candles[-1].close)
 
@@ -193,16 +194,34 @@ def evaluate_rule_audited(
     gross_loss = sum(gross_losses)
     net_profit = sum(net_profits)
     net_loss = sum(net_losses)
+    sum_trade_net = sum(x["net_pnl"] for x in trade_records)
+    reconciliation_error = sum_trade_net - (final_capital - initial_capital)
+    reconciliation_ok = abs(reconciliation_error) <= max(1e-8, initial_capital * 1e-10)
 
     gross_pf = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
     net_pf = net_profit / net_loss if net_loss > 0 else (float("inf") if net_profit > 0 else 0.0)
-
     avg_win = net_profit / wins if wins else 0.0
     avg_loss = net_loss / losses if losses else 0.0
+
+    # This is deliberately NOT a ranking/winner label. It describes the role
+    # the rule appears to have under the tested configuration.
+    if not reconciliation_ok:
+        utility = "INVALID_ACCOUNTING"
+    elif not trade_records:
+        utility = "INACTIVE"
+    elif liquidations > 0 or max_dd >= 80.0:
+        utility = "HIGH_RISK"
+    elif final_capital <= initial_capital:
+        utility = "NEGATIVE_IN_TEST"
+    elif net_pf >= 1.2 and max_dd <= 50.0:
+        utility = "POTENTIALLY_USEFUL"
+    else:
+        utility = "CONTEXT_DEPENDENT"
 
     return {
         "direction": direction,
         "rule": rule,
+        "rule_role": RULE_ROLE[rule],
         "candles": len(candles),
         "initial_capital": initial_capital,
         "final_capital": final_capital,
@@ -224,18 +243,23 @@ def evaluate_rule_audited(
         "net_profit_factor": net_pf,
         "avg_win": avg_win,
         "avg_loss": avg_loss,
-        "profit_per_trade": sum(x["net_pnl"] for x in trade_records) / len(trade_records) if trade_records else 0.0,
+        "profit_per_trade": sum_trade_net / len(trade_records) if trade_records else 0.0,
         "commission_paid": fees_paid,
         "liquidations": liquidations,
         "max_drawdown_pct": max_dd,
+        "sum_trade_net_pnl": sum_trade_net,
+        "account_pnl": final_capital - initial_capital,
+        "reconciliation_error": reconciliation_error,
+        "reconciliation_ok": reconciliation_ok,
+        "utility_assessment": utility,
     }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Audited accounting backtest for OHLC R1-R16.")
+    ap = argparse.ArgumentParser(description="OHLC R1-R16 accounting audit and rule utility diagnostics.")
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")
-    ap.add_argument("--month", required=True, help="YYYY-MM")
+    ap.add_argument("--month", required=True)
     ap.add_argument("--timeframes", default="5,30")
     ap.add_argument("--initial-capital", type=float, default=DEFAULT_CAPITAL)
     ap.add_argument("--trade-allocation", type=float, default=DEFAULT_ALLOCATION)
@@ -259,26 +283,19 @@ def main() -> None:
             for direction in ("BOTH", "LONG_ONLY", "SHORT_ONLY"):
                 for i in range(1, 17):
                     s = evaluate_rule_audited(
-                        candles,
-                        f"R{i}",
-                        direction,
-                        args.initial_capital,
-                        args.trade_allocation,
-                        args.threshold,
-                        args.fee_per_side,
-                        args.leverage,
+                        candles, f"R{i}", direction,
+                        args.initial_capital, args.trade_allocation,
+                        args.threshold, args.fee_per_side, args.leverage,
                     )
-                    s.update(
-                        {
-                            "symbol": symbol,
-                            "month": args.month,
-                            "timeframe_min": tf,
-                            "fee_per_side_pct": args.fee_per_side * 100.0,
-                            "allocation_pct": args.trade_allocation * 100.0,
-                            "leverage": args.leverage,
-                            "threshold": args.threshold,
-                        }
-                    )
+                    s.update({
+                        "symbol": symbol,
+                        "month": args.month,
+                        "timeframe_min": tf,
+                        "fee_per_side_pct": args.fee_per_side * 100.0,
+                        "allocation_pct": args.trade_allocation * 100.0,
+                        "leverage": args.leverage,
+                        "threshold": args.threshold,
+                    })
                     rows.append(s)
                     gpf = s["gross_profit_factor"]
                     npf = s["net_profit_factor"]
@@ -286,11 +303,11 @@ def main() -> None:
                     npf_text = "inf" if npf == float("inf") else f"{npf:.2f}"
                     print(
                         f"{symbol}|{tf}m|{direction}|{s['rule']}|"
-                        f"return={s['return_pct']:.2f}% trades={s['completed_trades']} "
-                        f"win={s['win_rate_pct']:.1f}% GPF={gpf_text} NPF={npf_text} "
-                        f"avgW={s['avg_win']:.4f} avgL={s['avg_loss']:.4f} "
-                        f"DD={s['max_drawdown_pct']:.2f}% fees={s['commission_paid']:.2f} "
-                        f"liq={s['liquidations']}"
+                        f"role={s['utility_assessment']} return={s['return_pct']:.2f}% "
+                        f"trades={s['completed_trades']} win={s['win_rate_pct']:.1f}% "
+                        f"NPF={npf_text} DD={s['max_drawdown_pct']:.2f}% "
+                        f"fees={s['commission_paid']:.2f} liq={s['liquidations']} "
+                        f"recon={'OK' if s['reconciliation_ok'] else 'FAIL'}"
                     )
 
     if not rows:
@@ -302,6 +319,61 @@ def main() -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+
+    # Human-readable rule diagnostics, deliberately without ranking.
+    diag_path = out.with_name(out.stem + "_diagnostics.csv")
+    groups: dict[tuple[str, int, str], dict[str, dict]] = {}
+    for row in rows:
+        groups.setdefault((row["symbol"], int(row["timeframe_min"]), row["rule"]), {})[row["direction"]] = row
+
+    diag_rows: list[dict] = []
+    for (symbol, tf, rule), group in groups.items():
+        both = group.get("BOTH")
+        long = group.get("LONG_ONLY")
+        short = group.get("SHORT_ONLY")
+        if not both or not long or not short:
+            continue
+        lr = float(long["return_pct"])
+        sr = float(short["return_pct"])
+        br = float(both["return_pct"])
+        if lr > 0 and sr <= 0:
+            observed_use = "LONG_BIAS"
+        elif sr > 0 and lr <= 0:
+            observed_use = "SHORT_BIAS"
+        elif lr > 0 and sr > 0:
+            observed_use = "DIRECTIONAL_SIGNAL_BOTH_SIDES"
+        else:
+            observed_use = "NO_STANDALONE_EDGE"
+
+        diag_rows.append({
+            "symbol": symbol,
+            "month": args.month,
+            "timeframe_min": tf,
+            "rule": rule,
+            "rule_role": RULE_ROLE[rule],
+            "observed_use": observed_use,
+            "both_return_pct": br,
+            "long_return_pct": lr,
+            "short_return_pct": sr,
+            "both_max_drawdown_pct": float(both["max_drawdown_pct"]),
+            "long_max_drawdown_pct": float(long["max_drawdown_pct"]),
+            "short_max_drawdown_pct": float(short["max_drawdown_pct"]),
+            "both_net_pf": both["net_profit_factor"],
+            "long_net_pf": long["net_profit_factor"],
+            "short_net_pf": short["net_profit_factor"],
+            "both_liquidations": int(both["liquidations"]),
+            "long_liquidations": int(long["liquidations"]),
+            "short_liquidations": int(short["liquidations"]),
+            "both_trades": int(both["completed_trades"]),
+            "long_trades": int(long["completed_trades"]),
+            "short_trades": int(short["completed_trades"]),
+            "reconciliation_ok": bool(both["reconciliation_ok"] and long["reconciliation_ok"] and short["reconciliation_ok"]),
+        })
+
+    with diag_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(diag_rows[0]))
+        writer.writeheader()
+        writer.writerows(diag_rows)
 
 
 if __name__ == "__main__":
