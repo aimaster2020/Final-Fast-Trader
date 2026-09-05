@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "final-fast-trader"
+version = "0.1.0"
+description = "Final Fast Trader - OHLC R1-R16 rule engine and continuous-account backtesting"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "src"]
+addopts = "-q"
+
+[tool.setuptools.packages.find]
+where = ["src"]
