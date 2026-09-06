@@ -7,13 +7,6 @@ from pathlib import Path
 from fast_pattern_trader.models import Candle
 
 RULES = [f"R{i}" for i in range(1, 17)]
-# Direction convention is fixed from the observed R definitions, not fitted to P&L.
-DIRECTION = {
-    "R1": -1, "R2": 1, "R3": -1, "R4": 1,
-    "R5": 0, "R6": 1, "R7": -1, "R8": 1,
-    "R9": -1, "R10": 1, "R11": -1, "R12": 1,
-    "R13": -1, "R14": 1, "R15": -1, "R16": 0,
-}
 THRESHOLDS = {
     "R1": 1.00, "R2": 0.25, "R3": 1.00, "R4": 1.00,
     "R5": 0.50, "R6": 0.50, "R7": 0.50, "R8": 0.50,
@@ -131,10 +124,10 @@ def composite_signal(c: Candle, weights: dict[str, float]) -> tuple[int, float, 
             continue
         active += 1
         w = weights[rule]
-        if DIRECTION[rule] == 0:
-            signed = 1 if value > 0 else -1 if value < 0 else 0
-        else:
-            signed = DIRECTION[rule] * (1 if value > 0 else -1 if value < 0 else 0)
+        # Each component is already signed by the R1-R16 definition.
+        # Do not apply a second direction map: doing so reverses R1/R3/R7/R9/R11/R13/R15
+        # and creates a structural long bias in the composite.
+        signed = 1 if value > 0 else -1 if value < 0 else 0
         total += w * signed
         used += w
     score = total / used if used else 0.0
