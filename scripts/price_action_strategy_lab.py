@@ -11,7 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.july_r_composite_walkforward import find_month_file, load_binance, resample
+from fast_pattern_trader.models import Candle
+from scripts.build_1h_direction_dataset import load_range
+from scripts.july_r_composite_walkforward import resample
 
 DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"
 DEFAULT_MONTHS = "2026-05,2026-06,2026-07,2026-08"
@@ -37,6 +39,21 @@ def month_of(ts: int) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m")
 
 
+def month_bounds(month: str) -> tuple[int, int]:
+    start = datetime.strptime(month, "%Y-%m").replace(tzinfo=timezone.utc)
+    year = start.year + (1 if start.month == 12 else 0)
+    nxt_month = 1 if start.month == 12 else start.month + 1
+    end = start.replace(year=year, month=nxt_month)
+    return int(start.timestamp()), int(end.timestamp())
+
+
+def load_month_candles(input_dir: Path, symbol: str, month: str) -> list[Candle]:
+    start_ts, end_ts = month_bounds(month)
+    raw, used = load_range(input_dir, symbol, start_ts, end_ts)
+    print(f"{symbol} {month}: raw_1m={len(raw):,} source_files={len(used)}")
+    return [Candle(ts, o, h, l, c, v) for ts, o, h, l, c, v in raw]
+
+
 def prior_range(candles, end_idx: int, lookback: int):
     if end_idx < lookback:
         return None
@@ -49,8 +66,6 @@ def candle_body_pct(c) -> float:
 
 
 def signal_breakout_retest(candles, i: int, lookback: int, retest_bars: int) -> int:
-    # A breakout happened on a completed candle within the last retest_bars.
-    # Current candle must retest the broken level and close back beyond it.
     if i < lookback + 2:
         return 0
     start = max(lookback, i - retest_bars)
@@ -60,13 +75,10 @@ def signal_breakout_retest(candles, i: int, lookback: int, retest_bars: int) -> 
             continue
         hi, lo = level
         breakout = candles[b]
-        if breakout.close > hi:
-            # Do not accept another candle as a later breakout before retest.
-            if candles[i].low <= hi and candles[i].close > hi:
-                return 1
-        if breakout.close < lo:
-            if candles[i].high >= lo and candles[i].close < lo:
-                return -1
+        if breakout.close > hi and candles[i].low <= hi and candles[i].close > hi:
+            return 1
+        if breakout.close < lo and candles[i].high >= lo and candles[i].close < lo:
+            return -1
     return 0
 
 
@@ -86,7 +98,6 @@ def signal_failed_breakout(candles, i: int, lookback: int) -> int:
 
 
 def signal_impulse_pullback(candles, i: int, impulse_pct: float, pullback_max: float) -> int:
-    # Completed impulse at i-2, pullback at i-1, confirmation at i.
     if i < 3:
         return 0
     impulse, pullback, confirm = candles[i - 2], candles[i - 1], candles[i]
@@ -116,8 +127,6 @@ def signal_for(strategy: str, candles, i: int, args) -> int:
 
 
 def run_symbol(symbol: str, candles, strategy: str, args) -> list[Trade]:
-    # New position is entered at the next candle open after a completed signal.
-    # Position exits on opposite completed signal or after hold_bars.
     trades: list[Trade] = []
     capital = args.initial_capital
     position = None
@@ -201,6 +210,7 @@ def main():
     ap.add_argument("--fee-roundtrip-pct", type=float, default=0.26)
     args = ap.parse_args()
 
+    input_dir = Path(args.input_dir)
     symbols = [x.strip().upper() for x in args.symbols.split(",") if x.strip()]
     months = [x.strip() for x in args.months.split(",") if x.strip()]
     all_trades: list[Trade] = []
@@ -210,12 +220,9 @@ def main():
         print(f"MONTH {month}")
         month_rows: list[Trade] = []
         for symbol in symbols:
-            path = find_month_file(Path(args.input_dir), symbol, month)
-            if not path:
-                print(f"MISSING {symbol} {month}")
-                continue
-            candles = resample(load_binance(path), args.timeframe)
+            candles = resample(load_month_candles(input_dir, symbol, month), args.timeframe)
             if len(candles) < args.lookback + 10:
+                print(f"INSUFFICIENT {symbol} {month} complete_{args.timeframe}m={len(candles)}")
                 continue
             for strategy in STRATEGIES:
                 ts = run_symbol(symbol, candles, strategy, args)
