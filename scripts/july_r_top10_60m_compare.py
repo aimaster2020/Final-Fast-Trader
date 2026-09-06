@@ -14,21 +14,8 @@ from scripts.july_r_composite_walkforward import (
     components, TESTS, discover_symbols, find_month_file, load_binance, resample,
 )
 
-TOP_AGG = [
-    "R16:I",
-    "R8:I",
-    "R2:N",
-    "R6:I+R8:I:S",
-    "R6:N",
-]
-
-TOP_REVERSE = [
-    "R5:N",
-    "R15:N",
-    "R6:N",
-    "R12:N",
-    "R16:I+R8:I:O+R6:I:O",
-]
+TOP_AGG = ["R16:I", "R8:I", "R2:N", "R6:I+R8:I:S", "R6:N"]
+TOP_REVERSE = ["R5:N", "R15:N", "R6:N", "R12:N", "R16:I+R8:I:O+R6:I:O"]
 
 
 def raw_sig(c: Candle, rule: str) -> int:
@@ -49,11 +36,7 @@ def parse_set(label: str) -> tuple[str, str, list[dict]]:
     selected = []
     for item in parts[1:]:
         bits = item.split(":")
-        selected.append({
-            "rule": bits[0],
-            "variant": bits[1],
-            "mode": "SAME" if bits[2].upper().startswith("S") else "OPPOSITE",
-        })
+        selected.append({"rule": bits[0], "variant": bits[1], "mode": "SAME" if bits[2].upper().startswith("S") else "OPPOSITE"})
     return trigger, variant, selected
 
 
@@ -103,6 +86,10 @@ def block_vote(preds: dict[int, int], start: int, end: int) -> int:
     return 0
 
 
+def result(final: float, initial: float, trades: int, wins: int, fees: float, dd: float) -> dict:
+    return {"final": final, "ret": 100.0 * (final / initial - 1.0), "trades": trades, "win": 100.0 * wins / trades if trades else 0.0, "dd": dd, "fees": fees}
+
+
 def run_aggregate(series: dict[str, list[Candle]], c: dict, fee_side_pct: float) -> dict:
     initial = 1000.0
     per_symbol = initial / len(series)
@@ -132,20 +119,10 @@ def run_aggregate(series: dict[str, list[Candle]], c: dict, fee_side_pct: float)
             peak = max(peak, local)
             if peak:
                 max_dd = max(max_dd, 100.0 * (peak - local) / peak)
-    total += local
-        # one symbol per loop
+            if local <= 0:
+                break
+        total += local
     return result(total, initial, trades, wins, fees, max_dd)
-
-
-def result(final: float, initial: float, trades: int, wins: int, fees: float, dd: float) -> dict:
-    return {
-        "final": final,
-        "ret": 100.0 * (final / initial - 1.0),
-        "trades": trades,
-        "win": 100.0 * wins / trades if trades else 0.0,
-        "dd": dd,
-        "fees": fees,
-    }
 
 
 def signal_times_15m(c15: list[Candle], c: dict) -> list[tuple[int, int]]:
@@ -179,6 +156,8 @@ def run_reverse(series: dict[str, list[Candle]], c: dict, fee_side_pct: float) -
                 break
             entry = c60[j].close
             exit_price = c60[j + 1].close
+            if entry <= 0 or exit_price <= 0:
+                continue
             move = (exit_price / entry - 1.0) * direction
             gross = local * move
             fee = local * 2.0 * fee_side_pct / 100.0
@@ -220,7 +199,7 @@ def main() -> None:
     series = load_series(Path(args.input_dir), args.test_month, args.symbols)
     print(f"TOP10_60M test={args.test_month} assets={len(series)} initial=1000.00")
     print("A=1m predictions -> 60m block vote | B=15m signal -> next 60m execution")
-    print("COMM=0 and COMM=1.3%/side")
+    print("FEE=0 and FEE=1.3%/side")
     print("---")
 
     rows = []
