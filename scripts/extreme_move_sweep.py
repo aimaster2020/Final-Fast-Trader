@@ -48,38 +48,51 @@ def load_month_candles(input_dir: Path, symbol: str, month: str) -> list[Candle]
 
 
 def close_change_sum(candles: list[Candle], i: int, bars: int) -> float:
-    """Sum of absolute close-to-close price changes over the M bars ending at i-1."""
-    if bars <= 0 or i < bars + 1:
+    """Sum absolute close-to-close changes over the M completed bars before i."""
+    if bars <= 0 or i < bars:
         return math.inf
-    total = 0.0
-    for j in range(i - bars, i):
-        total += abs(candles[j].close - candles[j - 1].close)
-    return total
+    return sum(abs(candles[j].close - candles[j - 1].close) for j in range(i - bars + 1, i + 1))
 
 
-def signal_extreme(candles: list[Candle], i: int, window: int, move_bars: int, multiplier: float) -> str:
+def signal_extreme(
+    candles: list[Candle],
+    i: int,
+    window: int,
+    move_bars: int,
+    multiplier: float,
+) -> str:
     """
-    LONG when the current low is the lowest low of the previous+current window
-    and the downside excursion from the previous close is at least
-    multiplier * the sum of absolute close changes over move_bars.
+    LOW:
+      - current low is below every low in the previous W completed bars
+      - excursion below the previous-window minimum is >= multiplier * movement budget
 
-    SHORT is the symmetric high condition.
+    HIGH is the exact symmetric condition.
+
+    Movement budget is the sum of absolute close-to-close changes over the M
+    completed bars immediately before the signal candle.
     """
-    if i < max(window - 1, move_bars) + 1:
+    if window <= 0 or move_bars <= 0 or multiplier <= 0:
+        return ""
+    if i < max(window, move_bars):
         return ""
 
-    xs = candles[i - window + 1 : i + 1]
+    previous = candles[i - window : i]
     prior_close = candles[i - 1].close
     movement_budget = close_change_sum(candles, i, move_bars) * multiplier
     if not math.isfinite(movement_budget):
         return ""
 
-    lowest = min(c.low for c in xs)
-    highest = max(c.high for c in xs)
+    prev_low = min(c.low for c in previous)
+    prev_high = max(c.high for c in previous)
 
-    is_low_extreme = candles[i].low <= lowest and (prior_close - candles[i].low) >= movement_budget
-    is_high_extreme = candles[i].high >= highest and (candles[i].high - prior_close) >= movement_budget
+    downside_excursion = prev_low - candles[i].low
+    upside_excursion = candles[i].high - prev_high
 
+    is_low_extreme = candles[i].low < prev_low and downside_excursion >= movement_budget
+    is_high_extreme = candles[i].high > prev_high and upside_excursion >= movement_budget
+
+    # Use strict new extremes. If a candle makes both extremes, do not create
+    # an ambiguous directional signal.
     if is_low_extreme and is_high_extreme:
         return "BOTH"
     if is_low_extreme:
@@ -95,9 +108,17 @@ def pct_return(entry: float, exit_price: float, side: int) -> float:
     return ((exit_price / entry) - 1.0) * side * 100.0
 
 
-def evaluate_symbol(symbol: str, month: str, candles: list[Candle], window: int, move_bars: int, multiplier: float, horizon: int) -> list[Signal]:
+def evaluate_symbol(
+    symbol: str,
+    month: str,
+    candles: list[Candle],
+    window: int,
+    move_bars: int,
+    multiplier: float,
+    horizon: int,
+) -> list[Signal]:
     out: list[Signal] = []
-    start = max(window - 1, move_bars) + 1
+    start = max(window, move_bars)
     for i in range(start, len(candles) - horizon):
         sig = signal_extreme(candles, i, window, move_bars, multiplier)
         if sig in ("LOW", "HIGH"):
@@ -131,30 +152,32 @@ def summarize(signals: list[Signal]) -> tuple[int, float, float, float]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Sweep extreme low/high signals over window and movement-memory sizes.")
+    ap = argparse.ArgumentParser(description="Sweep new extreme low/high signals over window, movement-memory and threshold multiplier.")
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--symbols", default=DEFAULT_SYMBOLS)
     ap.add_argument("--months", default=DEFAULT_MONTHS)
     ap.add_argument("--timeframe", type=int, default=60)
     ap.add_argument("--windows", default="5,10,15,20,30,40,60")
     ap.add_argument("--move-bars", default="1,2,3,4,5,6,8,10")
-    ap.add_argument("--multiplier", type=float, default=1.0)
+    ap.add_argument("--multipliers", default="0.5,0.75,1.0,1.25,1.5,2.0")
+    ap.add_argument("--multiplier", type=float, default=None, help="Legacy single multiplier override")
     ap.add_argument("--horizon", type=int, default=1)
     ap.add_argument("--output", default="reports/extreme_move_sweep.csv")
     args = ap.parse_args()
 
     windows = [int(x) for x in args.windows.split(",") if x.strip()]
     move_bars = [int(x) for x in args.move_bars.split(",") if x.strip()]
+    multipliers = [args.multiplier] if args.multiplier is not None else [float(x) for x in args.multipliers.split(",") if x.strip()]
     symbols = [x.strip().upper() for x in args.symbols.split(",") if x.strip()]
     months = [x.strip() for x in args.months.split(",") if x.strip()]
     cache: dict[tuple[str, str], list[Candle]] = {}
 
     print(
         f"EXTREME_MOVE_SWEEP tf={args.timeframe}m windows={windows} "
-        f"move_bars={move_bars} multiplier={args.multiplier:.2f} horizon={args.horizon}"
+        f"move_bars={move_bars} multipliers={multipliers} horizon={args.horizon}"
     )
-    print("LOW = current low is window minimum + downside excursion >= multiplier * sum(abs(close changes), M bars)")
-    print("HIGH = current high is window maximum + upside excursion >= multiplier * sum(abs(close changes), M bars)")
+    print("LOW = current low breaks previous-window minimum + excursion >= multiplier * sum(abs(close changes), M bars)")
+    print("HIGH = current high breaks previous-window maximum + excursion >= multiplier * sum(abs(close changes), M bars)")
 
     results = []
     for month in months:
@@ -164,32 +187,34 @@ def main() -> None:
 
     for window in windows:
         for bars in move_bars:
-            all_signals: list[Signal] = []
-            for (symbol, month), candles in cache.items():
-                all_signals.extend(evaluate_symbol(symbol, month, candles, window, bars, args.multiplier, args.horizon))
-            n, win, avg, pf = summarize(all_signals)
-            lows = sum(s.signal == "LOW" for s in all_signals)
-            highs = sum(s.signal == "HIGH" for s in all_signals)
-            results.append({
-                "window": window,
-                "move_bars": bars,
-                "signals": n,
-                "low_signals": lows,
-                "high_signals": highs,
-                "win_rate_pct": win,
-                "avg_forward_return_pct": avg,
-                "profit_factor": pf,
-            })
-            print(
-                f"W={window:2d} M={bars:2d} T={n:5d} LOW={lows:5d} HIGH={highs:5d} "
-                f"WIN={win:5.1f}% AVG={avg:+.4f}% PF={pf:.2f}"
-            )
+            for multiplier in multipliers:
+                all_signals: list[Signal] = []
+                for (symbol, month), candles in cache.items():
+                    all_signals.extend(evaluate_symbol(symbol, month, candles, window, bars, multiplier, args.horizon))
+                n, win, avg, pf = summarize(all_signals)
+                lows = sum(s.signal == "LOW" for s in all_signals)
+                highs = sum(s.signal == "HIGH" for s in all_signals)
+                results.append({
+                    "window": window,
+                    "move_bars": bars,
+                    "multiplier": multiplier,
+                    "signals": n,
+                    "low_signals": lows,
+                    "high_signals": highs,
+                    "win_rate_pct": win,
+                    "avg_forward_return_pct": avg,
+                    "profit_factor": pf,
+                })
+                print(
+                    f"W={window:2d} M={bars:2d} X={multiplier:4.2f} T={n:5d} LOW={lows:5d} HIGH={highs:5d} "
+                    f"WIN={win:5.1f}% AVG={avg:+.4f}% PF={pf:.2f}"
+                )
 
-    results.sort(key=lambda r: (r["avg_forward_return_pct"], r["profit_factor"]), reverse=True)
-    print("TOP10")
-    for r in results[:10]:
+    results.sort(key=lambda r: (r["avg_forward_return_pct"], r["profit_factor"], r["signals"]), reverse=True)
+    print("TOP15")
+    for r in results[:15]:
         print(
-            f"W={r['window']:2d} M={r['move_bars']:2d} T={r['signals']:5d} "
+            f"W={r['window']:2d} M={r['move_bars']:2d} X={r['multiplier']:4.2f} T={r['signals']:5d} "
             f"WIN={r['win_rate_pct']:5.1f}% AVG={r['avg_forward_return_pct']:+.4f}% PF={r['profit_factor']:.2f}"
         )
 
@@ -198,7 +223,10 @@ def main() -> None:
         out = ROOT / out
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="", encoding="utf-8") as f:
-        fields = list(results[0].keys()) if results else ["window", "move_bars", "signals", "low_signals", "high_signals", "win_rate_pct", "avg_forward_return_pct", "profit_factor"]
+        fields = list(results[0].keys()) if results else [
+            "window", "move_bars", "multiplier", "signals", "low_signals", "high_signals",
+            "win_rate_pct", "avg_forward_return_pct", "profit_factor"
+        ]
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(results)
