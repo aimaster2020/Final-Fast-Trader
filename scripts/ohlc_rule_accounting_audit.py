@@ -89,6 +89,22 @@ def evaluate_rule_audited(
     fee: float,
     leverage: float,
 ):
+    """Neutral rule diagnostic.
+
+    The purpose of this report is NOT to find a trading winner.
+    It measures what each R-rule observes/predicts on the next candle:
+      - coverage: how often the rule emits a directional signal
+      - next-candle directional agreement
+      - mean/median next-candle return
+      - mean favorable/adverse excursion
+      - optional accounting check for the existing execution model
+
+    Trading performance is retained only as an audit trail. It must not be
+    used as the rule's utility label.
+    """
+    # The direction argument is retained for compatibility with the existing
+    # 3-way output. Prediction diagnostics themselves are based on the raw
+    # rule signal, so LONG_ONLY/SHORT_ONLY cannot manufacture an edge.
     cash = initial_capital
     positions: list[dict] = []
     trade_records: list[dict] = []
@@ -98,6 +114,11 @@ def evaluate_rule_audited(
     max_dd = 0.0
     last_signal = 0
     signals = buys = sells = holds = accepted_signals = 0
+
+    next_returns: list[float] = []
+    directional_hits: list[bool] = []
+    favorable_moves: list[float] = []
+    adverse_moves: list[float] = []
 
     def record_close(p: dict, price: float, liquidation: bool = False) -> None:
         nonlocal cash, fees_paid, liquidations
@@ -118,8 +139,9 @@ def evaluate_rule_audited(
         if liquidation:
             liquidations += 1
 
-    for c in candles:
+    for i, c in enumerate(candles):
         raw_sig = signal_for_rule(c, rule, threshold)
+
         if raw_sig:
             signals += 1
             if raw_sig == 1:
@@ -139,6 +161,27 @@ def evaluate_rule_audited(
         if sig:
             accepted_signals += 1
 
+        # Prediction diagnostic: signal at candle i is evaluated only against
+        # candle i+1. The current candle is never allowed to see its future.
+        if raw_sig and i + 1 < len(candles):
+            nxt = candles[i + 1]
+            base = c.close
+            if base > 0:
+                next_ret = (nxt.close / base - 1.0) * 100.0
+                next_returns.append(next_ret)
+                directional_hits.append(
+                    (raw_sig == 1 and nxt.close > base)
+                    or (raw_sig == -1 and nxt.close < base)
+                )
+                if raw_sig == 1:
+                    favorable_moves.append(max(0.0, (nxt.high / base - 1.0) * 100.0))
+                    adverse_moves.append(max(0.0, (base - nxt.low) / base * 100.0))
+                else:
+                    favorable_moves.append(max(0.0, (base - nxt.low) / base * 100.0))
+                    adverse_moves.append(max(0.0, (nxt.high - base) / base * 100.0))
+
+        # Existing execution model is kept only to expose accounting/risk
+        # behavior; it is NOT used to decide whether a rule is useful.
         if direction == "BOTH" and sig and last_signal and sig != last_signal and positions:
             for p in positions:
                 record_close(p, c.close)
@@ -183,11 +226,11 @@ def evaluate_rule_audited(
         record_close(p, candles[-1].close)
 
     final_capital = max(0.0, cash)
+
     gross_profits = [x["gross_pnl"] for x in trade_records if x["gross_pnl"] > 0]
     gross_losses = [-x["gross_pnl"] for x in trade_records if x["gross_pnl"] < 0]
     net_profits = [x["net_pnl"] for x in trade_records if x["net_pnl"] > 0]
     net_losses = [-x["net_pnl"] for x in trade_records if x["net_pnl"] < 0]
-
     wins = len(net_profits)
     losses = len(net_losses)
     gross_profit = sum(gross_profits)
@@ -196,27 +239,66 @@ def evaluate_rule_audited(
     net_loss = sum(net_losses)
     sum_trade_net = sum(x["net_pnl"] for x in trade_records)
     reconciliation_error = sum_trade_net - (final_capital - initial_capital)
-    reconciliation_ok = abs(reconciliation_error) <= max(1e-8, initial_capital * 1e-10)
+    reconciliation_ok = abs(reconciliation_error) <= max(
+        1e-8, initial_capital * 1e-10
+    )
 
-    gross_pf = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
-    net_pf = net_profit / net_loss if net_loss > 0 else (float("inf") if net_profit > 0 else 0.0)
-    avg_win = net_profit / wins if wins else 0.0
-    avg_loss = net_loss / losses if losses else 0.0
+    gross_pf = (
+        gross_profit / gross_loss
+        if gross_loss > 0
+        else (float("inf") if gross_profit > 0 else 0.0)
+    )
+    net_pf = (
+        net_profit / net_loss
+        if net_loss > 0
+        else (float("inf") if net_profit > 0 else 0.0)
+    )
 
-    # This is deliberately NOT a ranking/winner label. It describes the role
-    # the rule appears to have under the tested configuration.
-    if not reconciliation_ok:
-        utility = "INVALID_ACCOUNTING"
-    elif not trade_records:
-        utility = "INACTIVE"
-    elif liquidations > 0 or max_dd >= 80.0:
-        utility = "HIGH_RISK"
-    elif final_capital <= initial_capital:
-        utility = "NEGATIVE_IN_TEST"
-    elif net_pf >= 1.2 and max_dd <= 50.0:
-        utility = "POTENTIALLY_USEFUL"
+    def median(values: list[float]) -> float:
+        if not values:
+            return 0.0
+        values = sorted(values)
+        n = len(values)
+        mid = n // 2
+        return values[mid] if n % 2 else (values[mid - 1] + values[mid]) / 2.0
+
+    prediction_count = len(next_returns)
+    prediction_hit_rate = (
+        sum(directional_hits) / prediction_count * 100.0
+        if prediction_count else 0.0
+    )
+    mean_next_return = (
+        sum(next_returns) / prediction_count if prediction_count else 0.0
+    )
+    median_next_return = median(next_returns)
+    mean_favorable = (
+        sum(favorable_moves) / prediction_count if prediction_count else 0.0
+    )
+    mean_adverse = (
+        sum(adverse_moves) / prediction_count if prediction_count else 0.0
+    )
+    signal_coverage_pct = (
+        signals / max(1, len(candles)) * 100.0
+    )
+
+    # Neutral interpretation. There is deliberately no "winner" or ranking.
+    # A rule is only considered directionally informative when its signal is
+    # sufficiently observable and the next-candle conditional return agrees
+    # with the sign of the rule. Otherwise we describe the observed behavior.
+    if signals == 0:
+        diagnostic = "INACTIVE_NO_SIGNAL"
+    elif prediction_count < 30:
+        diagnostic = "LOW_SAMPLE"
+    elif prediction_hit_rate >= 50.0 and mean_next_return > 0:
+        diagnostic = "UPWARD_EDGE_OBSERVED"
+    elif prediction_hit_rate >= 50.0 and mean_next_return < 0:
+        diagnostic = "DOWNWARD_EDGE_OBSERVED"
+    elif prediction_hit_rate < 50.0 and mean_next_return > 0:
+        diagnostic = "MIXED_CONTRARIAN"
+    elif prediction_hit_rate < 50.0 and mean_next_return < 0:
+        diagnostic = "MIXED_CONTRARIAN"
     else:
-        utility = "CONTEXT_DEPENDENT"
+        diagnostic = "NO_CLEAR_EDGE"
 
     return {
         "direction": direction,
@@ -231,6 +313,14 @@ def evaluate_rule_audited(
         "buy_signals": buys,
         "sell_signals": sells,
         "hold_candles": holds,
+        "signal_coverage_pct": signal_coverage_pct,
+        "prediction_samples": prediction_count,
+        "directional_hit_rate_pct": prediction_hit_rate,
+        "mean_next_candle_return_pct": mean_next_return,
+        "median_next_candle_return_pct": median_next_return,
+        "mean_favorable_excursion_pct": mean_favorable,
+        "mean_adverse_excursion_pct": mean_adverse,
+        "diagnostic": diagnostic,
         "completed_trades": len(trade_records),
         "wins": wins,
         "losses": losses,
@@ -241,9 +331,6 @@ def evaluate_rule_audited(
         "net_profit": net_profit,
         "net_loss": net_loss,
         "net_profit_factor": net_pf,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "profit_per_trade": sum_trade_net / len(trade_records) if trade_records else 0.0,
         "commission_paid": fees_paid,
         "liquidations": liquidations,
         "max_drawdown_pct": max_dd,
@@ -251,7 +338,6 @@ def evaluate_rule_audited(
         "account_pnl": final_capital - initial_capital,
         "reconciliation_error": reconciliation_error,
         "reconciliation_ok": reconciliation_ok,
-        "utility_assessment": utility,
     }
 
 
