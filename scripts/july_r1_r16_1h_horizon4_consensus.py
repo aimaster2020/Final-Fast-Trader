@@ -7,6 +7,7 @@ import io
 from pathlib import Path
 import sys
 import zipfile
+from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -22,10 +23,8 @@ DEFAULT_FEE_SIDE_PCT = 0.05
 DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"
 
 
-def _load_csv_bytes(data: bytes) -> list[Candle]:
+def _parse_rows(reader) -> list[Candle]:
     rows: list[Candle] = []
-    text = data.decode("utf-8-sig", errors="replace")
-    reader = csv.reader(io.StringIO(text))
     for r in reader:
         if len(r) < 6:
             continue
@@ -41,49 +40,61 @@ def _load_csv_bytes(data: bytes) -> list[Candle]:
     return sorted(rows, key=lambda x: x.timestamp)
 
 
-def load_month_file(path: Path, symbol: str, month: str) -> list[Candle]:
-    """Load a monthly Binance file from CSV, CSV.GZ, or ZIP."""
+def load_binance_archive(path: Path) -> list[Candle]:
+    """Load Binance CSV, CSV.GZ, or ZIP(CSV), returning normalized 1m candles."""
     suffixes = [s.lower() for s in path.suffixes]
-    if suffixes[-1:] == [".csv"]:
-        return load_binance(path)
-    if suffixes[-2:] == [".csv", ".gz"]:
-        with gzip.open(path, "rb") as f:
-            return _load_csv_bytes(f.read())
     if path.suffix.lower() == ".zip":
-        symbol_u = symbol.upper()
-        month_u = month.upper()
         with zipfile.ZipFile(path) as zf:
-            names = [n for n in zf.namelist() if not n.endswith("/")]
-            candidates = [n for n in names if n.lower().endswith(".csv")]
-            candidates = [n for n in candidates if symbol_u in n.upper() and month_u in n.upper()] or candidates
-            if not candidates:
+            members = [n for n in zf.namelist() if n.lower().endswith(".csv") and not n.endswith("/")]
+            if not members:
                 return []
-            with zf.open(sorted(candidates)[0]) as f:
-                return _load_csv_bytes(f.read())
-    return []
+            with zf.open(members[0]) as raw:
+                text = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
+                return _parse_rows(csv.reader(text))
+    if ".gz" in suffixes:
+        with gzip.open(path, "rt", encoding="utf-8-sig", newline="") as f:
+            return _parse_rows(csv.reader(f))
+    return _parse_rows(csv.reader(path.open("r", encoding="utf-8-sig", newline="")))
 
 
-def find_requested_month_file(input_dir: Path, symbol: str, month: str) -> Path | None:
-    """Find monthly Binance data recursively, including CSV/GZ/ZIP archives."""
-    exact = find_month_file(input_dir, symbol, month)
-    if exact is not None:
-        return exact
+def month_of_ts(ts: int) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m")
 
+
+def find_requested_month_files(input_dir: Path, symbol: str, month: str) -> list[Path]:
+    """Find all files for symbol/month, including Binance daily ZIP archives."""
     symbol_u = symbol.upper()
     month_u = month.upper()
     candidates: list[Path] = []
-    for pattern in ("*.csv", "*.csv.gz", "*.zip"):
-        for p in input_dir.rglob(pattern):
-            name_u = p.name.upper()
-            if symbol_u in name_u and month_u in name_u:
-                candidates.append(p)
-    if not candidates:
-        # Some archive/file naming layouts omit the symbol or month from the outer filename.
-        # Return a month-matching archive only as a last resort; load_month_file will inspect it.
-        for p in input_dir.rglob("*.zip"):
-            if month_u in p.name.upper() or symbol_u in p.name.upper():
-                candidates.append(p)
-    return sorted(candidates, key=lambda p: str(p).upper())[0] if candidates else None
+    for p in input_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        name_u = p.name.upper()
+        if symbol_u not in name_u or month_u not in name_u:
+            continue
+        if not (name_u.endswith(".CSV") or name_u.endswith(".CSV.GZ") or name_u.endswith(".ZIP")):
+            continue
+        candidates.append(p)
+    return sorted(candidates, key=lambda p: str(p).upper())
+
+
+def load_requested_month(input_dir: Path, symbol: str, month: str) -> tuple[list[Candle], list[str]]:
+    """Load all matching archive files and keep only candles whose UTC timestamp belongs to month."""
+    files = find_requested_month_files(input_dir, symbol, month)
+    candles: list[Candle] = []
+    used: list[str] = []
+    for path in files:
+        try:
+            raw = load_binance_archive(path)
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            print(f"SKIP {symbol} {path.name}: {exc}")
+            continue
+        matched = [c for c in raw if month_of_ts(c.timestamp) == month]
+        if matched:
+            candles.extend(matched)
+            used.append(path.name)
+    candles.sort(key=lambda c: c.timestamp)
+    return candles, used
 
 
 def signal(c: Candle, rule: str, inverted: bool) -> int:
@@ -97,6 +108,7 @@ def frame_prediction(candles: list[Candle], i: int, rule: str, inverted: bool, m
     if mode == "CURRENT":
         return signal(candles[i], rule, inverted)
 
+    # Four latest completed 1h candles: current candle + previous 3.
     votes = [signal(candles[j], rule, inverted) for j in range(i - 3, i + 1)]
     votes = [x for x in votes if x]
     if not votes:
@@ -221,30 +233,26 @@ def main() -> None:
 
     series: dict[str, list[Candle]] = {}
     missing: list[str] = []
-    loaded_files: dict[str, str] = {}
+    loaded_files: dict[str, list[str]] = {}
     for symbol in symbols:
-        p = find_requested_month_file(data_root, symbol, args.test_month)
-        if not p:
-            missing.append(symbol)
-            continue
-        raw = load_month_file(p, symbol, args.test_month)
+        raw, files = load_requested_month(data_root, symbol, args.test_month)
         if len(raw) >= 10:
             series[symbol] = resample(raw, 60)
-            loaded_files[symbol] = p.name
+            loaded_files[symbol] = files
         else:
             missing.append(symbol)
 
     if not series:
         raise RuntimeError(
             f"No 1m data found for test month {args.test_month} and symbols {','.join(symbols)}. "
-            "Supported inputs: CSV, CSV.GZ, or ZIP monthly Binance files under --input-dir."
+            "Check that the monthly/daily Binance CSV, CSV.GZ, or ZIP files exist under --input-dir."
         )
 
     print(
         f"R1_R16_1H_H4_CONSENSUS test={args.test_month} assets={len(series)} "
         f"initial={args.initial_capital:.2f} fee={args.fee_side_pct:.3f}%/side"
     )
-    print("FILES " + " | ".join(f"{s}:{loaded_files[s]}" for s in sorted(loaded_files)))
+    print("FILES " + " | ".join(f"{s}:{','.join(loaded_files[s])}" for s in sorted(loaded_files)))
     if missing:
         print("MISSING " + ",".join(missing))
     print("HORIZON=4h | SIGNAL=1h | CURRENT=1 candle | 2OF4=majority | 3OF4=at least 3 agree | 4OF4=all 4 agree")
