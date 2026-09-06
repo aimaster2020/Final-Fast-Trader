@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import csv
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TRADES = ROOT / "reports" / "july_r1_r16_single_nonoverlap_detail" / "r1_r16_single_nonoverlap_all_trades.csv"
-
 RULES = [("R16", "N"), ("R6", "N")]
 FEES = [0.0, 0.05]
 
@@ -17,14 +17,16 @@ def load_rows(path: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def pct(v: float) -> str:
-    return f"{v:+.2f}%"
-
-
 def week_label(ts: str) -> str:
-    # ISO timestamps are used by the existing trade report.
-    from datetime import datetime
-    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    """Return ISO week for either epoch seconds/ms or ISO timestamp."""
+    s = str(ts).strip()
+    try:
+        value = float(s)
+        if value > 10_000_000_000:
+            value /= 1000.0
+        dt = datetime.fromtimestamp(value, tz=timezone.utc)
+    except ValueError:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
     return f"W{dt.isocalendar().week:02d}"
 
 
@@ -34,7 +36,7 @@ def aggregate(rows: list[dict], fee_side: float) -> dict:
     capital = 250.0
     wins = 0
     move_sum = 0.0
-    for r in sorted(rows, key=lambda x: x["entry_ts"]):
+    for r in sorted(rows, key=lambda x: float(x["entry_ts"])):
         move = float(r["move_pct"]) / 100.0
         move_sum += move * 100.0
         wins += int(r["win"])
@@ -53,7 +55,8 @@ def print_symbol(rows: list[dict]) -> None:
     print("RULE SYMBOL T WIN MOVE_SUM RET")
     print("---- ------ - --- -------- ---")
     for rule, variant in RULES:
-        for symbol in sorted({r["symbol"] for r in rows if r["rule"] == rule and r["variant"] == variant}):
+        symbols = sorted({r["symbol"] for r in rows if r["rule"] == rule and r["variant"] == variant})
+        for symbol in symbols:
             x = [r for r in rows if r["rule"] == rule and r["variant"] == variant and r["symbol"] == symbol]
             a = aggregate(x, 0.0)
             print(f"{rule:>3} {symbol:>6} {a['t']:>3} {100*a['wins']/a['t']:>5.2f}% {a['move']:>+8.2f} {a['ret']:>+6.2f}%")
@@ -106,7 +109,6 @@ def main() -> None:
     rows = [r for r in rows if (r["rule"], r["variant"]) in RULES]
     if not rows:
         raise RuntimeError("No R16N/R6N trades found")
-
     print("R16_R6_STABILITY_ANALYSIS")
     print(f"TRADES={len(rows)} SOURCE={Path(args.trades).as_posix()}")
     print("Architecture inherited from frozen non-overlap report: 15m signal -> 60m entry -> next 60m exit")
