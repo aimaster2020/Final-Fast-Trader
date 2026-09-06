@@ -28,11 +28,12 @@ def stats(values: list[float], side: str, fee: float) -> dict:
 
 
 def bucket(value: float, cuts: list[float]) -> str:
-    for c in cuts:
+    for c in sorted(cuts, reverse=True):
         if value >= c:
             label = str(c).replace(".", "p")
             return f">={label}"
-    return f"<{str(cuts[-1]).replace('.', 'p')}"
+    label = str(min(cuts)).replace(".", "p")
+    return f"<{label}"
 
 
 def main() -> None:
@@ -102,7 +103,7 @@ def main() -> None:
 
     ranked.sort(key=lambda x: (-x[0], -x[6]["net"], -x[6]["fav"], x[1]))
     for score, code, body_b, range_b, pos_b, side, s, pos_months, month_parts in ranked[: args.top]:
-        print(f"{code:>7} {body_b:>4} {range_b:>5} {pos_b:>3} {side:>5} {s['n']:>3} {s['avg']:>+5.3f} {s['med']:>+5.3f} {s['net']:>+5.3f} {s['fav']:>5.1f}% {pos_months:>3}/{len(month_parts):<3} {' '.join(month_parts)}")
+        print(f"{code:>7} {body_b:>5} {range_b:>5} {pos_b:>3} {side:>5} {s['n']:>3} {s['avg']:>+5.3f} {s['med']:>+5.3f} {s['net']:>+5.3f} {s['fav']:>5.1f}% {pos_months:>3}/{len(month_parts):<3} {' '.join(month_parts)}")
 
     print("TOP_ACTIONABLE")
     if not ranked:
