@@ -17,66 +17,239 @@ from ohlc_rule_isolation_monthly import (
 )
 
 RULE_ROLE = {
-    "R1": "بدنه: close > open",
-    "R2": "بدنه: open > close",
-    "R3": "بسته‌شدن روی سقف: close = high",
-    "R4": "بسته‌شدن روی کف: close = low",
-    "R5": "جهت کلی رنج کندل",
-    "R6": "شباهت open به high",
-    "R7": "شباهت open به low",
-    "R8": "شباهت close به high",
-    "R9": "شباهت close به low",
-    "R10": "قدرت سایه پایین",
-    "R11": "قدرت سایه بالا",
-    "R12": "موقعیت صعودی بدنه در رنج",
-    "R13": "موقعیت نزولی بدنه در رنج",
-    "R14": "قدرت صعودی بدنه",
-    "R15": "قدرت نزولی بدنه",
-    "R16": "جهت نهایی کندل/رنج",
+    "R1": "Bullish body: close > open",
+    "R2": "Bearish body: open > close",
+    "R3": "Close at high",
+    "R4": "Close at low",
+    "R5": "Range direction",
+    "R6": "Open near high",
+    "R7": "Open near low",
+    "R8": "Close near high",
+    "R9": "Close near low",
+    "R10": "Lower-wick strength",
+    "R11": "Upper-wick strength",
+    "R12": "Bullish body position in range",
+    "R13": "Bearish body position in range",
+    "R14": "Bullish body strength",
+    "R15": "Bearish body strength",
+    "R16": "Final candle/range direction",
+}
+
+RULE_USE = {
+    "R1": "body direction / bullish-vs-bearish state",
+    "R2": "body direction / bearish-vs-bullish state",
+    "R3": "strong close-at-high / buying-pressure confirmation",
+    "R4": "strong close-at-low / selling-pressure confirmation",
+    "R5": "range direction / broad candle state",
+    "R6": "opening-location structure",
+    "R7": "opening-location structure",
+    "R8": "closing-location strength / buying-pressure context",
+    "R9": "closing-location weakness / selling-pressure context",
+    "R10": "lower-price rejection / possible buying-pressure context",
+    "R11": "upper-price rejection / possible selling-pressure context",
+    "R12": "where the bullish body sits inside the range",
+    "R13": "where the bearish body sits inside the range",
+    "R14": "bullish body strength / impulse magnitude",
+    "R15": "bearish body strength / impulse magnitude",
+    "R16": "aggregate candle direction state",
 }
 
 
-def _mark_to_market(position: dict, price: float, leverage: float) -> float:
-    gross = (
-        price / position["entry"] - 1.0
-        if position["side"] == 1
-        else position["entry"] / price - 1.0
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    x = sorted(values)
+    n = len(x)
+    m = n // 2
+    return x[m] if n % 2 else (x[m - 1] + x[m]) / 2.0
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float:
+    n = min(len(xs), len(ys))
+    if n < 2:
+        return 0.0
+    xs, ys = xs[:n], ys[:n]
+    mx, my = _mean(xs), _mean(ys)
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    dx = sum((x - mx) ** 2 for x in xs)
+    dy = sum((y - my) ** 2 for y in ys)
+    den = (dx * dy) ** 0.5
+    return num / den if den else 0.0
+
+
+def _forward_metrics(candles: list[Candle], i: int, side: int, horizon: int) -> tuple[float, float, float]:
+    if i + horizon >= len(candles):
+        return 0.0, 0.0, 0.0
+    base = candles[i].close
+    if base <= 0:
+        return 0.0, 0.0, 0.0
+    end = candles[i + horizon].close
+    signed_close = ((end / base - 1.0) * 100.0) * side
+    highs = [c.high for c in candles[i + 1:i + horizon + 1]]
+    lows = [c.low for c in candles[i + 1:i + horizon + 1]]
+    favorable = ((max(highs) / base - 1.0) * 100.0) if side == 1 else ((base - min(lows)) / base * 100.0)
+    adverse = ((base - min(lows)) / base * 100.0) if side == 1 else ((max(highs) / base - 1.0) * 100.0)
+    return signed_close, max(0.0, favorable), max(0.0, adverse)
+
+
+def evaluate_rule_diagnostic(
+    candles: list[Candle],
+    rule: str,
+    threshold: float,
+) -> dict:
+    """Pure rule diagnostic.
+
+    No capital, leverage, fees, positions, wins, profit factor or ranking are
+    used to judge the rule. Each rule is treated as an observable numeric
+    feature and its conditional relationship with future candles is measured.
+    """
+    values: list[float] = []
+    signed_values: list[float] = []
+    next_returns: list[float] = []
+    signal_returns: list[float] = []
+    signal_favorable_1: list[float] = []
+    signal_adverse_1: list[float] = []
+    signal_favorable_3: list[float] = []
+    signal_adverse_3: list[float] = []
+    signal_favorable_6: list[float] = []
+    signal_adverse_6: list[float] = []
+    signal_hits_1: list[bool] = []
+    signal_hits_3: list[bool] = []
+    signal_hits_6: list[bool] = []
+    signal_abs_values: list[float] = []
+    all_abs_values: list[float] = []
+
+    positive = negative = zero = 0
+    signal_count = 0
+    buy_count = sell_count = 0
+
+    for i, c in enumerate(candles):
+        value = float(__import__("ohlc_rule_isolation_monthly", fromlist=["rule_components"]).rule_components(c)[rule])
+        values.append(value)
+        all_abs_values.append(abs(value))
+
+        if value > 0:
+            positive += 1
+        elif value < 0:
+            negative += 1
+        else:
+            zero += 1
+
+        if i + 1 < len(candles) and c.close > 0:
+            nr = (candles[i + 1].close / c.close - 1.0) * 100.0
+            next_returns.append(nr)
+
+        if value >= threshold:
+            side = 1
+            buy_count += 1
+        elif value <= -threshold:
+            side = -1
+            sell_count += 1
+        else:
+            continue
+
+        if i + 1 >= len(candles):
+            continue
+
+        signal_count += 1
+        signal_abs_values.append(abs(value))
+        m1, f1, a1 = _forward_metrics(candles, i, side, 1)
+        signal_returns.append(m1)
+        signal_favorable_1.append(f1)
+        signal_adverse_1.append(a1)
+        if m1 > 0:
+            signal_hits_1.append(True)
+        else:
+            signal_hits_1.append(False)
+
+        for horizon, favs, advs, hits in (
+            (3, signal_favorable_3, signal_adverse_3, signal_hits_3),
+            (6, signal_favorable_6, signal_adverse_6, signal_hits_6),
+        ):
+            if i + horizon < len(candles):
+                m, f, a = _forward_metrics(candles, i, side, horizon)
+                favs.append(f)
+                advs.append(a)
+                hits.append(m > 0)
+
+    # Feature-vs-future relationship uses the signed rule value, not a trading
+    # account. This is intentionally independent of threshold.
+    usable = min(len(values) - 1, len(next_returns))
+    corr = _pearson(values[:usable], next_returns[:usable]) if usable else 0.0
+
+    samples = len(signal_returns)
+    hit1 = _mean([1.0 if x else 0.0 for x in signal_hits_1]) * 100.0
+    hit3 = _mean([1.0 if x else 0.0 for x in signal_hits_3]) * 100.0
+    hit6 = _mean([1.0 if x else 0.0 for x in signal_hits_6]) * 100.0
+
+    if signal_count == 0:
+        observed = "NO_SIGNAL_AT_THRESHOLD"
+    elif samples < 30:
+        observed = "INSUFFICIENT_CONDITIONAL_SAMPLE"
+    elif corr >= 0.05:
+        observed = "POSITIVE_ASSOCIATION"
+    elif corr <= -0.05:
+        observed = "NEGATIVE_ASSOCIATION"
+    elif hit1 >= 55.0 or hit3 >= 55.0 or hit6 >= 55.0:
+        observed = "DIRECTIONAL_ASSOCIATION"
+    elif max(hit1, hit3, hit6) <= 45.0:
+        observed = "CONTRARIAN_ASSOCIATION"
+    else:
+        observed = "NO_CLEAR_DIRECTIONAL_ASSOCIATION"
+
+    continuation = (
+        "FOLLOW_THROUGH_OBSERVED"
+        if hit3 >= 55.0 or hit6 >= 55.0
+        else "NO_CLEAR_FOLLOW_THROUGH"
     )
-    return position["margin"] + position["margin"] * leverage * gross
-
-
-def _liquidation_price(position: dict, leverage: float) -> float:
-    if leverage <= 0:
-        return float("inf")
-    if position["side"] == 1:
-        return position["entry"] * (1.0 - 1.0 / leverage)
-    return position["entry"] * (1.0 + 1.0 / leverage)
-
-
-def _close_position(
-    position: dict,
-    price: float,
-    cash: float,
-    fee: float,
-    leverage: float,
-    liquidation: bool = False,
-) -> tuple[float, float, float, float]:
-    gross_return = (
-        price / position["entry"] - 1.0
-        if position["side"] == 1
-        else position["entry"] / price - 1.0
+    excursion = (
+        "FAVORABLE_EXCURSION_DOMINATES"
+        if _mean(signal_favorable_3) > _mean(signal_adverse_3) * 1.10
+        else "ADVERSE_EXCURSION_DOMINATES"
+        if _mean(signal_adverse_3) > _mean(signal_favorable_3) * 1.10
+        else "BALANCED_EXCURSION"
     )
-    gross_pnl = position["margin"] * leverage * gross_return
-    close_fee = position["notional"] * fee
-    if liquidation:
-        gross_pnl = -position["margin"]
 
-    total_trade_fees = position["entry_fee"] + close_fee
-    net_pnl = gross_pnl - total_trade_fees
-
-    cash += position["margin"] + gross_pnl - close_fee
-    cash = max(0.0, cash)
-    return cash, gross_pnl, net_pnl, close_fee
+    return {
+        "rule": rule,
+        "rule_role": RULE_ROLE[rule],
+        "what_it_is_good_for": RULE_USE[rule],
+        "candles": len(candles),
+        "threshold": threshold,
+        "positive_value_candles": positive,
+        "negative_value_candles": negative,
+        "zero_value_candles": zero,
+        "mean_value": _mean(values),
+        "median_value": _median(values),
+        "mean_abs_value": _mean(all_abs_values),
+        "signal_count": signal_count,
+        "signal_coverage_pct": signal_count / max(1, len(candles)) * 100.0,
+        "buy_signal_count": buy_count,
+        "sell_signal_count": sell_count,
+        "conditional_samples": samples,
+        "conditional_hit_rate_1_pct": hit1,
+        "conditional_hit_rate_3_pct": hit3,
+        "conditional_hit_rate_6_pct": hit6,
+        "mean_next_return_all_pct": _mean(next_returns),
+        "median_next_return_all_pct": _median(next_returns),
+        "mean_signed_return_1_pct": _mean(signal_returns),
+        "median_signed_return_1_pct": _median(signal_returns),
+        "mean_favorable_1_pct": _mean(signal_favorable_1),
+        "mean_adverse_1_pct": _mean(signal_adverse_1),
+        "mean_favorable_3_pct": _mean(signal_favorable_3),
+        "mean_adverse_3_pct": _mean(signal_adverse_3),
+        "mean_favorable_6_pct": _mean(signal_favorable_6),
+        "mean_adverse_6_pct": _mean(signal_adverse_6),
+        "feature_next_return_correlation": corr,
+        "observed_behavior": observed,
+        "follow_through_observed": continuation,
+        "excursion_behavior": excursion,
+        "standalone_trading_value": "NOT_TESTED_BY_PROFIT",
+    }
 
 
 def evaluate_rule_audited(
@@ -89,270 +262,57 @@ def evaluate_rule_audited(
     fee: float,
     leverage: float,
 ):
-    """Neutral rule diagnostic.
+    """Compatibility wrapper.
 
-    The purpose of this report is NOT to find a trading winner.
-    It measures what each R-rule observes/predicts on the next candle:
-      - coverage: how often the rule emits a directional signal
-      - next-candle directional agreement
-      - mean/median next-candle return
-      - mean favorable/adverse excursion
-      - optional accounting check for the existing execution model
-
-    Trading performance is retained only as an audit trail. It must not be
-    used as the rule's utility label.
+    The old account model is deliberately no longer used as a utility test.
+    Direction is retained only so existing callers can still request the three
+    legacy views; the returned diagnostics are identical for all directions.
     """
-    # The direction argument is retained for compatibility with the existing
-    # 3-way output. Prediction diagnostics themselves are based on the raw
-    # rule signal, so LONG_ONLY/SHORT_ONLY cannot manufacture an edge.
-    cash = initial_capital
-    positions: list[dict] = []
-    trade_records: list[dict] = []
-    fees_paid = 0.0
-    liquidations = 0
-    peak_equity = initial_capital
-    max_dd = 0.0
-    last_signal = 0
-    signals = buys = sells = holds = accepted_signals = 0
-
-    next_returns: list[float] = []
-    directional_hits: list[bool] = []
-    favorable_moves: list[float] = []
-    adverse_moves: list[float] = []
-
-    def record_close(p: dict, price: float, liquidation: bool = False) -> None:
-        nonlocal cash, fees_paid, liquidations
-        cash, gross_pnl, net_pnl, close_fee = _close_position(
-            p, price, cash, fee, leverage, liquidation
-        )
-        trade_records.append(
-            {
-                "gross_pnl": gross_pnl,
-                "net_pnl": net_pnl,
-                "entry_fee": p["entry_fee"],
-                "exit_fee": close_fee,
-                "fee": p["entry_fee"] + close_fee,
-                "liquidation": liquidation,
-            }
-        )
-        fees_paid += close_fee
-        if liquidation:
-            liquidations += 1
-
-    for i, c in enumerate(candles):
-        raw_sig = signal_for_rule(c, rule, threshold)
-
-        if raw_sig:
-            signals += 1
-            if raw_sig == 1:
-                buys += 1
-            else:
-                sells += 1
-        else:
-            holds += 1
-
-        if direction == "LONG_ONLY" and raw_sig != 1:
-            sig = 0
-        elif direction == "SHORT_ONLY" and raw_sig != -1:
-            sig = 0
-        else:
-            sig = raw_sig
-
-        if sig:
-            accepted_signals += 1
-
-        # Prediction diagnostic: signal at candle i is evaluated only against
-        # candle i+1. The current candle is never allowed to see its future.
-        if raw_sig and i + 1 < len(candles):
-            nxt = candles[i + 1]
-            base = c.close
-            if base > 0:
-                next_ret = (nxt.close / base - 1.0) * 100.0
-                next_returns.append(next_ret)
-                directional_hits.append(
-                    (raw_sig == 1 and nxt.close > base)
-                    or (raw_sig == -1 and nxt.close < base)
-                )
-                if raw_sig == 1:
-                    favorable_moves.append(max(0.0, (nxt.high / base - 1.0) * 100.0))
-                    adverse_moves.append(max(0.0, (base - nxt.low) / base * 100.0))
-                else:
-                    favorable_moves.append(max(0.0, (base - nxt.low) / base * 100.0))
-                    adverse_moves.append(max(0.0, (nxt.high - base) / base * 100.0))
-
-        # Existing execution model is kept only to expose accounting/risk
-        # behavior; it is NOT used to decide whether a rule is useful.
-        if direction == "BOTH" and sig and last_signal and sig != last_signal and positions:
-            for p in positions:
-                record_close(p, c.close)
-            positions = []
-
-        if sig and cash > 0:
-            margin = cash * allocation
-            notional = margin * leverage
-            entry_fee = notional * fee
-            if margin > 0 and margin + entry_fee <= cash:
-                cash -= margin + entry_fee
-                fees_paid += entry_fee
-                positions.append(
-                    {
-                        "side": sig,
-                        "entry": c.close,
-                        "margin": margin,
-                        "notional": notional,
-                        "entry_fee": entry_fee,
-                        "opened_at": c.timestamp,
-                    }
-                )
-            last_signal = sig
-
-        still_open: list[dict] = []
-        for p in positions:
-            liq = _liquidation_price(p, leverage)
-            hit = (c.low <= liq) if p["side"] == 1 else (c.high >= liq)
-            if hit and c.timestamp > p["opened_at"]:
-                record_close(p, liq, liquidation=True)
-            else:
-                still_open.append(p)
-        positions = still_open
-
-        equity = cash + sum(_mark_to_market(p, c.close, leverage) for p in positions)
-        equity = max(0.0, equity)
-        peak_equity = max(peak_equity, equity)
-        if peak_equity > 0:
-            max_dd = max(max_dd, (peak_equity - equity) / peak_equity * 100.0)
-
-    for p in positions:
-        record_close(p, candles[-1].close)
-
-    final_capital = max(0.0, cash)
-
-    gross_profits = [x["gross_pnl"] for x in trade_records if x["gross_pnl"] > 0]
-    gross_losses = [-x["gross_pnl"] for x in trade_records if x["gross_pnl"] < 0]
-    net_profits = [x["net_pnl"] for x in trade_records if x["net_pnl"] > 0]
-    net_losses = [-x["net_pnl"] for x in trade_records if x["net_pnl"] < 0]
-    wins = len(net_profits)
-    losses = len(net_losses)
-    gross_profit = sum(gross_profits)
-    gross_loss = sum(gross_losses)
-    net_profit = sum(net_profits)
-    net_loss = sum(net_losses)
-    sum_trade_net = sum(x["net_pnl"] for x in trade_records)
-    reconciliation_error = sum_trade_net - (final_capital - initial_capital)
-    reconciliation_ok = abs(reconciliation_error) <= max(
-        1e-8, initial_capital * 1e-10
-    )
-
-    gross_pf = (
-        gross_profit / gross_loss
-        if gross_loss > 0
-        else (float("inf") if gross_profit > 0 else 0.0)
-    )
-    net_pf = (
-        net_profit / net_loss
-        if net_loss > 0
-        else (float("inf") if net_profit > 0 else 0.0)
-    )
-
-    def median(values: list[float]) -> float:
-        if not values:
-            return 0.0
-        values = sorted(values)
-        n = len(values)
-        mid = n // 2
-        return values[mid] if n % 2 else (values[mid - 1] + values[mid]) / 2.0
-
-    prediction_count = len(next_returns)
-    prediction_hit_rate = (
-        sum(directional_hits) / prediction_count * 100.0
-        if prediction_count else 0.0
-    )
-    mean_next_return = (
-        sum(next_returns) / prediction_count if prediction_count else 0.0
-    )
-    median_next_return = median(next_returns)
-    mean_favorable = (
-        sum(favorable_moves) / prediction_count if prediction_count else 0.0
-    )
-    mean_adverse = (
-        sum(adverse_moves) / prediction_count if prediction_count else 0.0
-    )
-    signal_coverage_pct = (
-        signals / max(1, len(candles)) * 100.0
-    )
-
-    # Neutral interpretation. There is deliberately no "winner" or ranking.
-    # A rule is only considered directionally informative when its signal is
-    # sufficiently observable and the next-candle conditional return agrees
-    # with the sign of the rule. Otherwise we describe the observed behavior.
-    if signals == 0:
-        diagnostic = "INACTIVE_NO_SIGNAL"
-    elif prediction_count < 30:
-        diagnostic = "LOW_SAMPLE"
-    elif prediction_hit_rate >= 50.0 and mean_next_return > 0:
-        diagnostic = "UPWARD_EDGE_OBSERVED"
-    elif prediction_hit_rate >= 50.0 and mean_next_return < 0:
-        diagnostic = "DOWNWARD_EDGE_OBSERVED"
-    elif prediction_hit_rate < 50.0 and mean_next_return > 0:
-        diagnostic = "MIXED_CONTRARIAN"
-    elif prediction_hit_rate < 50.0 and mean_next_return < 0:
-        diagnostic = "MIXED_CONTRARIAN"
-    else:
-        diagnostic = "NO_CLEAR_EDGE"
-
-    return {
+    d = evaluate_rule_diagnostic(candles, rule, threshold)
+    d.update({
         "direction": direction,
-        "rule": rule,
-        "rule_role": RULE_ROLE[rule],
-        "candles": len(candles),
         "initial_capital": initial_capital,
-        "final_capital": final_capital,
-        "return_pct": (final_capital / initial_capital - 1.0) * 100.0,
-        "signals": signals,
-        "accepted_signals": accepted_signals,
-        "buy_signals": buys,
-        "sell_signals": sells,
-        "hold_candles": holds,
-        "signal_coverage_pct": signal_coverage_pct,
-        "prediction_samples": prediction_count,
-        "directional_hit_rate_pct": prediction_hit_rate,
-        "mean_next_candle_return_pct": mean_next_return,
-        "median_next_candle_return_pct": median_next_return,
-        "mean_favorable_excursion_pct": mean_favorable,
-        "mean_adverse_excursion_pct": mean_adverse,
-        "diagnostic": diagnostic,
-        "completed_trades": len(trade_records),
-        "wins": wins,
-        "losses": losses,
-        "win_rate_pct": wins / len(trade_records) * 100.0 if trade_records else 0.0,
-        "gross_profit": gross_profit,
-        "gross_loss": gross_loss,
-        "gross_profit_factor": gross_pf,
-        "net_profit": net_profit,
-        "net_loss": net_loss,
-        "net_profit_factor": net_pf,
-        "commission_paid": fees_paid,
-        "liquidations": liquidations,
-        "max_drawdown_pct": max_dd,
-        "sum_trade_net_pnl": sum_trade_net,
-        "account_pnl": final_capital - initial_capital,
-        "reconciliation_error": reconciliation_error,
-        "reconciliation_ok": reconciliation_ok,
-    }
+        "final_capital": initial_capital,
+        "return_pct": 0.0,
+        "accepted_signals": d["signal_count"],
+        "buy_signals": d["buy_signal_count"],
+        "sell_signals": d["sell_signal_count"],
+        "hold_candles": len(candles) - d["signal_count"],
+        "completed_trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "win_rate_pct": 0.0,
+        "gross_profit_factor": 0.0,
+        "net_profit_factor": 0.0,
+        "commission_paid": 0.0,
+        "liquidations": 0,
+        "max_drawdown_pct": 0.0,
+        "sum_trade_net_pnl": 0.0,
+        "account_pnl": 0.0,
+        "reconciliation_error": 0.0,
+        "reconciliation_ok": True,
+    })
+    return d
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="OHLC R1-R16 accounting audit and rule utility diagnostics.")
+    ap = argparse.ArgumentParser(
+        description="Neutral OHLC R1-R16 feature diagnostics. No winners, ranking or profit scoring."
+    )
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")
     ap.add_argument("--month", required=True)
     ap.add_argument("--timeframes", default="5,30")
-    ap.add_argument("--initial-capital", type=float, default=DEFAULT_CAPITAL)
-    ap.add_argument("--trade-allocation", type=float, default=DEFAULT_ALLOCATION)
-    ap.add_argument("--leverage", type=float, default=LEVERAGE)
-    ap.add_argument("--fee-per-side", type=float, default=FEE_PER_SIDE)
+    ap.add_argument("--initial-capital", type=float, default=DEFAULT_CAPITAL,
+                    help="retained for CLI compatibility; not used to score rules")
+    ap.add_argument("--trade-allocation", type=float, default=DEFAULT_ALLOCATION,
+                    help="retained for CLI compatibility; not used to score rules")
+    ap.add_argument("--leverage", type=float, default=LEVERAGE,
+                    help="retained for CLI compatibility; not used to score rules")
+    ap.add_argument("--fee-per-side", type=float, default=FEE_PER_SIDE,
+                    help="retained for CLI compatibility; not used to score rules")
     ap.add_argument("--threshold", type=float, default=1.0)
-    ap.add_argument("--output", default="reports/ohlc_rule_accounting_audit.csv")
+    ap.add_argument("--output", default="reports/ohlc_rule_diagnostics.csv")
     args = ap.parse_args()
 
     rows: list[dict] = []
@@ -365,36 +325,31 @@ def main() -> None:
         for tf in [int(x) for x in args.timeframes.split(",")]:
             candles = resample(raw, tf)
             if not candles:
+                print(f"{symbol}|{tf}m|NO_COMPLETE_CANDLES")
                 continue
-            for direction in ("BOTH", "LONG_ONLY", "SHORT_ONLY"):
-                for i in range(1, 17):
-                    s = evaluate_rule_audited(
-                        candles, f"R{i}", direction,
-                        args.initial_capital, args.trade_allocation,
-                        args.threshold, args.fee_per_side, args.leverage,
-                    )
-                    s.update({
-                        "symbol": symbol,
-                        "month": args.month,
-                        "timeframe_min": tf,
-                        "fee_per_side_pct": args.fee_per_side * 100.0,
-                        "allocation_pct": args.trade_allocation * 100.0,
-                        "leverage": args.leverage,
-                        "threshold": args.threshold,
-                    })
-                    rows.append(s)
-                    gpf = s["gross_profit_factor"]
-                    npf = s["net_profit_factor"]
-                    gpf_text = "inf" if gpf == float("inf") else f"{gpf:.2f}"
-                    npf_text = "inf" if npf == float("inf") else f"{npf:.2f}"
-                    print(
-                        f"{symbol}|{tf}m|{direction}|{s['rule']}|"
-                        f"diagnostic={s['diagnostic']} return_ref={s['return_pct']:.2f}% "
-                        f"trades={s['completed_trades']} win={s['win_rate_pct']:.1f}% "
-                        f"NPF={npf_text} DD={s['max_drawdown_pct']:.2f}% "
-                        f"fees={s['commission_paid']:.2f} liq={s['liquidations']} "
-                        f"recon={'OK' if s['reconciliation_ok'] else 'FAIL'}"
-                    )
+
+            for i in range(1, 17):
+                rule = f"R{i}"
+                d = evaluate_rule_diagnostic(candles, rule, args.threshold)
+                d.update({
+                    "symbol": symbol,
+                    "month": args.month,
+                    "timeframe_min": tf,
+                })
+                rows.append(d)
+                print(
+                    f"{symbol}|{tf}m|{rule}|"
+                    f"purpose={d['what_it_is_good_for']}|"
+                    f"coverage={d['signal_coverage_pct']:.2f}%|"
+                    f"samples={d['conditional_samples']}|"
+                    f"h1={d['conditional_hit_rate_1_pct']:.1f}%|"
+                    f"h3={d['conditional_hit_rate_3_pct']:.1f}%|"
+                    f"h6={d['conditional_hit_rate_6_pct']:.1f}%|"
+                    f"corr={d['feature_next_return_correlation']:.4f}|"
+                    f"obs={d['observed_behavior']}|"
+                    f"follow={d['follow_through_observed']}|"
+                    f"excursion={d['excursion_behavior']}"
+                )
 
     if not rows:
         raise SystemExit("No input data found")
@@ -406,57 +361,43 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    # Human-readable rule diagnostics. No ranking and no "winner" field.
-    # This report explains the observed behavior of each rule instead.
-    groups: dict[tuple[str, int, str], dict[str, dict]] = {}
-    for row in rows:
-        groups.setdefault(
-            (row["symbol"], int(row["timeframe_min"]), row["rule"]), {}
-        )[row["direction"]] = row
+    # A second file groups each rule by timeframe without ranking it.
+    summary: list[dict] = []
+    for symbol in sorted({r["symbol"] for r in rows}):
+        for tf in sorted({int(r["timeframe_min"]) for r in rows if r["symbol"] == symbol}):
+            subset = [r for r in rows if r["symbol"] == symbol and int(r["timeframe_min"]) == tf]
+            for r in subset:
+                summary.append({
+                    "symbol": symbol,
+                    "month": args.month,
+                    "timeframe_min": tf,
+                    "rule": r["rule"],
+                    "rule_role": r["rule_role"],
+                    "what_it_is_good_for": r["what_it_is_good_for"],
+                    "observed_behavior": r["observed_behavior"],
+                    "follow_through_observed": r["follow_through_observed"],
+                    "excursion_behavior": r["excursion_behavior"],
+                    "signal_coverage_pct": r["signal_coverage_pct"],
+                    "conditional_samples": r["conditional_samples"],
+                    "conditional_hit_rate_1_pct": r["conditional_hit_rate_1_pct"],
+                    "conditional_hit_rate_3_pct": r["conditional_hit_rate_3_pct"],
+                    "conditional_hit_rate_6_pct": r["conditional_hit_rate_6_pct"],
+                    "mean_signed_return_1_pct": r["mean_signed_return_1_pct"],
+                    "mean_favorable_3_pct": r["mean_favorable_3_pct"],
+                    "mean_adverse_3_pct": r["mean_adverse_3_pct"],
+                    "feature_next_return_correlation": r["feature_next_return_correlation"],
+                    "standalone_trading_value": r["standalone_trading_value"],
+                })
 
-    diag_rows: list[dict] = []
-    for (symbol, tf, rule), group in groups.items():
-        both = group.get("BOTH")
-        if not both:
-            continue
+    summary_path = out.with_name(out.stem + "_summary.csv")
+    with summary_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(summary[0]))
+        writer.writeheader()
+        writer.writerows(summary)
 
-        diag_rows.append({
-            "symbol": symbol,
-            "month": args.month,
-            "timeframe_min": tf,
-            "rule": rule,
-            "rule_role": RULE_ROLE[rule],
-            "diagnostic": both["diagnostic"],
-            "what_it_is_good_for": (
-                "UP/DOWN directional signal"
-                if both["diagnostic"] in {"UPWARD_EDGE_OBSERVED", "DOWNWARD_EDGE_OBSERVED"}
-                else "NO_STANDALONE_USE_FOUND"
-            ),
-            "signals": int(both["signals"]),
-            "signal_coverage_pct": float(both["signal_coverage_pct"]),
-            "prediction_samples": int(both["prediction_samples"]),
-            "directional_hit_rate_pct": float(both["directional_hit_rate_pct"]),
-            "mean_next_candle_return_pct": float(both["mean_next_candle_return_pct"]),
-            "median_next_candle_return_pct": float(both["median_next_candle_return_pct"]),
-            "mean_favorable_excursion_pct": float(both["mean_favorable_excursion_pct"]),
-            "mean_adverse_excursion_pct": float(both["mean_adverse_excursion_pct"]),
-            "buy_signals": int(both["buy_signals"]),
-            "sell_signals": int(both["sell_signals"]),
-            "hold_candles": int(both["hold_candles"]),
-            "accounting_reconciliation_ok": bool(both["reconciliation_ok"]),
-            "execution_return_pct_reference_only": float(both["return_pct"]),
-            "execution_max_drawdown_pct_reference_only": float(both["max_drawdown_pct"]),
-            "execution_liquidations_reference_only": int(both["liquidations"]),
-        })
-
-    diag_path = out.with_name(out.stem + "_diagnostics.csv")
-    if diag_rows:
-        with diag_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(diag_rows[0]))
-            writer.writeheader()
-            writer.writerows(diag_rows)
-
-
+    print(f"Saved diagnostics: {out}")
+    print(f"Saved neutral summary: {summary_path}")
+    print("IMPORTANT: no rule winner/rank, capital return, win rate or profit factor is used as utility.")
 
 if __name__ == "__main__":
     main()
