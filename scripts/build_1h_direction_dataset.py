@@ -4,25 +4,17 @@ import argparse
 import csv
 import gzip
 import io
-import re
-import sys
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from fast_pattern_trader.models import Candle
-from scripts.july_r_composite_walkforward import resample
-
-DATE_RE = re.compile(r"(?<!\d)(20\d{2})[-_](0[1-9]|1[0-2])(?:[-_](0[1-9]|[12]\d|3[01]))?(?!\d)")
+DATE_FMT = "%Y-%m-%d %H:%M:%S"
 DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"
 
 
-def _parse_rows(reader) -> list[Candle]:
-    rows: list[Candle] = []
+def parse_rows(reader):
+    out = []
     for r in reader:
         if len(r) < 6:
             continue
@@ -32,177 +24,160 @@ def _parse_rows(reader) -> list[Candle]:
                 ts //= 1_000_000
             elif ts > 10_000_000_000:
                 ts //= 1_000
-            rows.append(Candle(ts, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
+            out.append((ts, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
         except (ValueError, TypeError):
             continue
-    return rows
+    return out
 
 
-def load_binance_archive(path: Path) -> list[Candle]:
+def load_binance_archive(path: Path):
     if path.suffix.lower() == ".zip":
-        with zipfile.ZipFile(path) as zf:
-            members = [n for n in zf.namelist() if n.lower().endswith(".csv") and not n.endswith("/")]
-            if not members:
+        with zipfile.ZipFile(path) as z:
+            names = [n for n in z.namelist() if n.lower().endswith(".csv") and not n.endswith("/")]
+            if not names:
                 return []
-            with zf.open(members[0]) as raw:
-                text = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
-                return _parse_rows(csv.reader(text))
-    if ".gz" in [s.lower() for s in path.suffixes]:
+            with z.open(names[0]) as raw:
+                return parse_rows(csv.reader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")))
+    if path.name.lower().endswith(".csv.gz"):
         with gzip.open(path, "rt", encoding="utf-8-sig", newline="") as f:
-            return _parse_rows(csv.reader(f))
+            return parse_rows(csv.reader(f))
     with path.open("r", encoding="utf-8-sig", newline="") as f:
-        return _parse_rows(csv.reader(f))
+        return parse_rows(csv.reader(f))
 
 
-def month_of_ts(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m")
-
-
-def candidate_files(input_dir: Path, symbol: str) -> list[Path]:
+def candidate_files(input_dir: Path, symbol: str):
     su = symbol.upper()
-    out: list[Path] = []
-    for p in input_dir.rglob("*"):
-        if not p.is_file():
-            continue
-        nu = p.name.upper()
-        if su not in nu:
-            continue
-        if nu.endswith(".CSV") or nu.endswith(".CSV.GZ") or nu.endswith(".ZIP"):
-            out.append(p)
-    return sorted(out, key=lambda x: str(x).upper())
+    return sorted(
+        [
+            p for p in input_dir.rglob("*")
+            if p.is_file()
+            and su in p.name.upper()
+            and (p.suffix.lower() == ".zip" or p.suffix.lower() == ".csv" or p.name.lower().endswith(".csv.gz"))
+        ],
+        key=lambda p: str(p).upper(),
+    )
 
 
-def load_range(input_dir: Path, symbol: str, start_ts: int, end_ts: int) -> tuple[list[Candle], list[str]]:
-    candles: list[Candle] = []
-    used: list[str] = []
+def load_range(input_dir: Path, symbol: str, start_ts: int, end_ts: int):
+    merged = {}
+    used = []
     for path in candidate_files(input_dir, symbol):
         try:
             raw = load_binance_archive(path)
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
             print(f"SKIP {symbol} {path.name}: {exc}")
             continue
-        if not raw:
-            continue
-        matched = [c for c in raw if start_ts <= c.timestamp < end_ts]
+        matched = [r for r in raw if start_ts <= r[0] < end_ts]
         if matched:
-            candles.extend(matched)
             used.append(path.name)
-    by_ts = {c.timestamp: c for c in candles}
-    return [by_ts[k] for k in sorted(by_ts)], used
+            for r in matched:
+                merged[r[0]] = r
+    return [merged[k] for k in sorted(merged)], used
+
+
+def resample_1h(rows):
+    buckets = {}
+    for ts, o, h, l, c, v in rows:
+        hour = (ts // 3600) * 3600
+        buckets.setdefault(hour, []).append((ts, o, h, l, c, v))
+    out = []
+    for hour in sorted(buckets):
+        x = sorted(buckets[hour])
+        out.append({
+            "timestamp": hour,
+            "open": x[0][1],
+            "high": max(r[2] for r in x),
+            "low": min(r[3] for r in x),
+            "close": x[-1][4],
+            "volume": sum(r[5] for r in x),
+        })
+    return out
+
+
+def direction(o: float, c: float) -> str:
+    return "UP" if c > o else "DOWN" if c < o else "FLAT"
+
+
+def code(d: str) -> str:
+    return "U" if d == "UP" else "D" if d == "DOWN" else "F"
 
 
 def fmt_ts(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(ts, timezone.utc).strftime(DATE_FMT)
 
 
-def direction(c: Candle) -> str:
-    if c.close > c.open:
-        return "UP"
-    if c.close < c.open:
-        return "DOWN"
-    return "FLAT"
-
-
-def signed_dir(c: Candle) -> int:
-    if c.close > c.open:
-        return 1
-    if c.close < c.open:
-        return -1
-    return 0
-
-
-def build_rows(symbol: str, candles_1h: list[Candle], lookback: int = 4, lookforward: int = 4) -> list[dict]:
-    dirs = [direction(c) for c in candles_1h]
-    sdirs = [signed_dir(c) for c in candles_1h]
-    rows: list[dict] = []
-    start = lookback
-    stop = len(candles_1h) - lookforward
-    for i in range(start, stop):
-        c = candles_1h[i]
-        prev_dirs = dirs[i - lookback:i]
-        next_dirs = dirs[i + 1:i + 1 + lookforward]
-        prev_signed = sdirs[i - lookback:i]
-        next_signed = sdirs[i + 1:i + 1 + lookforward]
-        four_past = ">".join(prev_dirs + [dirs[i]])
-        four_next = ">".join([dirs[i]] + next_dirs)
-        past_code = "".join("U" if x == 1 else "D" if x == -1 else "F" for x in prev_signed + [sdirs[i]])
-        next_code = "".join("U" if x == 1 else "D" if x == -1 else "F" for x in [sdirs[i]] + next_signed)
-        body = abs(c.close - c.open)
-        rng = c.high - c.low
-        close_pos = (c.close - c.low) / rng if rng > 0 else 0.5
+def build_rows(symbol: str, candles):
+    dirs = [direction(c["open"], c["close"]) for c in candles]
+    rows = []
+    for i in range(4, len(candles) - 4):
+        c = candles[i]
+        prev = dirs[i - 4:i]
+        future = dirs[i + 1:i + 5]
+        current = dirs[i]
+        past5 = prev + [current]
+        future5 = [current] + future
         rows.append({
-            "timestamp_utc": fmt_ts(c.timestamp),
-            "timestamp_ms": c.timestamp,
             "symbol": symbol,
-            "open": c.open,
-            "high": c.high,
-            "low": c.low,
-            "close": c.close,
-            "volume": c.volume,
-            "direction": dirs[i],
-            "direction_code": sdirs[i],
-            "prev_dir_1": prev_dirs[-1],
-            "prev_dir_2": prev_dirs[-2],
-            "prev_dir_3": prev_dirs[-3],
-            "prev_dir_4": prev_dirs[-4],
-            "four_direction_past": four_past,
-            "four_direction_past_code": past_code,
-            "next_dir_1": next_dirs[0],
-            "next_dir_2": next_dirs[1],
-            "next_dir_3": next_dirs[2],
-            "next_dir_4": next_dirs[3],
-            "four_direction_future": four_next,
-            "four_direction_future_code": next_code,
-            "body_pct": (body / c.open * 100.0) if c.open else 0.0,
-            "range_pct": (rng / c.open * 100.0) if c.open else 0.0,
-            "close_position": close_pos,
-            "future_1_return_pct": (candles_1h[i + 1].close / c.close - 1.0) * 100.0 if c.close else 0.0,
-            "future_2_return_pct": (candles_1h[i + 2].close / c.close - 1.0) * 100.0 if c.close else 0.0,
-            "future_3_return_pct": (candles_1h[i + 3].close / c.close - 1.0) * 100.0 if c.close else 0.0,
-            "future_4_return_pct": (candles_1h[i + 4].close / c.close - 1.0) * 100.0 if c.close else 0.0,
-            "future_4h_direction": next_dirs[3],
+            "time_utc": fmt_ts(c["timestamp"]),
+            "open": c["open"],
+            "high": c["high"],
+            "low": c["low"],
+            "close": c["close"],
+            "volume": c["volume"],
+            "direction": current,
+            "prev_4": "".join(code(x) for x in reversed(prev)),
+            "prev_d4": prev[0],
+            "prev_d3": prev[1],
+            "prev_d2": prev[2],
+            "prev_d1": prev[3],
+            "seq_5_past_to_current": ">".join(past5),
+            "seq_5_past_code": "".join(code(x) for x in past5),
+            "next_d1": future[0],
+            "next_d2": future[1],
+            "next_d3": future[2],
+            "next_d4": future[3],
+            "seq_5_current_to_future": ">".join(future5),
+            "seq_5_future_code": "".join(code(x) for x in future5),
+            "future_1h_return_pct": (candles[i + 1]["close"] / c["close"] - 1) * 100,
+            "future_2h_return_pct": (candles[i + 2]["close"] / c["close"] - 1) * 100,
+            "future_3h_return_pct": (candles[i + 3]["close"] / c["close"] - 1) * 100,
+            "future_4h_return_pct": (candles[i + 4]["close"] / c["close"] - 1) * 100,
         })
     return rows
 
 
-def parse_date(s: str) -> datetime:
-    return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Build a 1H OHLC direction/sequence dataset from Binance 1m archives.")
+def main():
+    ap = argparse.ArgumentParser(description="Build 1H direction-sequence dataset and preview rows in console.")
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--symbols", default=DEFAULT_SYMBOLS)
     ap.add_argument("--start-date", default="2026-05-01")
     ap.add_argument("--end-date", default="2026-09-01", help="Exclusive UTC date")
     ap.add_argument("--output", default=None)
+    ap.add_argument("--show", type=int, default=50, help="Rows to print to console")
+    ap.add_argument("--view", choices=["head", "tail"], default="tail")
+    ap.add_argument("--symbol-view", default=None, help="Only print this symbol, e.g. BTCUSDT")
     args = ap.parse_args()
 
-    start = parse_date(args.start_date)
-    end = parse_date(args.end_date)
-    if end <= start:
-        raise ValueError("end-date must be after start-date")
-
+    start = int(datetime.strptime(args.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+    end = int(datetime.strptime(args.end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    input_dir = Path(args.input_dir)
-    all_rows: list[dict] = []
-    print(f"BUILD_1H_DIRECTION_DATASET range={args.start_date}..{args.end_date} exclusive symbols={','.join(symbols)}")
-    print("SCHEMA: OHLC + current direction + previous 4 directions + next 4 directions + sequence codes + forward returns")
+    all_rows = []
+
+    print(f"BUILD_1H_DIRECTION_DATASET range={args.start_date}..{args.end_date} exclusive")
+    print("U=UP(close>open) D=DOWN(close<open) F=FLAT(close=open)")
+    print("PAST sequence = previous 4 candles -> current | FUTURE sequence = current -> next 4 candles")
 
     for symbol in symbols:
-        raw, used = load_range(input_dir, symbol, int(start.timestamp()), int(end.timestamp()))
-        if len(raw) < 20:
-            print(f"MISSING {symbol} raw_1m={len(raw)}")
-            continue
-        candles_1h = resample(raw, 60)
-        rows = build_rows(symbol, candles_1h)
+        raw, used = load_range(Path(args.input_dir), symbol, start, end)
+        candles = resample_1h(raw)
+        rows = build_rows(symbol, candles)
         all_rows.extend(rows)
-        print(f"OK {symbol} raw_1m={len(raw)} candles_1h={len(candles_1h)} rows={len(rows)} files={len(used)}")
+        print(f"{symbol}: raw_1m={len(raw)} 1h={len(candles)} dataset_rows={len(rows)} files={len(used)}")
 
     if not all_rows:
         raise RuntimeError("No rows generated.")
 
-    all_rows.sort(key=lambda r: (r["timestamp_ms"], r["symbol"]))
+    all_rows.sort(key=lambda r: (r["time_utc"], r["symbol"]))
     out = Path(args.output) if args.output else ROOT / "reports" / f"direction_dataset_1h_{args.start_date}_{args.end_date}.csv"
     if not out.is_absolute():
         out = ROOT / out
@@ -213,10 +188,19 @@ def main() -> None:
         w.writeheader()
         w.writerows(all_rows)
 
+    view_rows = [r for r in all_rows if not args.symbol_view or r["symbol"] == args.symbol_view]
+    sample = view_rows[:args.show] if args.view == "head" else view_rows[-args.show:]
     print(f"SAVED {out.relative_to(ROOT)} rows={len(all_rows)}")
-    print("DIRECTION_CODES U=close>open D=close<open F=close==open")
-    print("4-DIRECTION ORDER prev_dir_4,prev_dir_3,prev_dir_2,prev_dir_1,direction")
-    print("FUTURE ORDER direction,next_dir_1,next_dir_2,next_dir_3,next_dir_4")
+    print(f"CONSOLE_VIEW {args.view} rows={len(sample)} symbol={args.symbol_view or 'ALL'}")
+    print("SYMBOL | UTC TIME           | DIR | PAST4 | CURRENT | FUTURE4 | 5-CODE(PAST->NOW) | 5-CODE(NOW->FUT) | R1H | R4H")
+    print("-" * 125)
+    for r in sample:
+        print(
+            f"{r['symbol']:7} | {r['time_utc']} | {r['direction']:4} | "
+            f"{r['prev_4']:5} | {code(r['direction']):7} | {''.join(code(r['x']) for x in []) if False else r['seq_5_future_code'][1:]:7} | "
+            f"{r['seq_5_past_code']:17} | {r['seq_5_future_code']:17} | "
+            f"{r['future_1h_return_pct']:+6.2f}% | {r['future_4h_return_pct']:+6.2f}%"
+        )
 
 
 if __name__ == "__main__":
