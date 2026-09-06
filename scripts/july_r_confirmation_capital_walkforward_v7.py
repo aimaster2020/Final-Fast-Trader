@@ -55,43 +55,18 @@ def load_series(root: Path, symbols: list[str], month: str, tf: int) -> dict[str
     return out
 
 
-def variant_stats(cs_list: list[list[Candle]], rule: str) -> dict[str, tuple[int, int]]:
-    out = {"N": [0, 0], "I": [0, 0]}
-    for cs in cs_list:
-        for i in range(len(cs) - 1):
-            y = next_direction(cs, i)
-            if not y:
-                continue
-            for v in ("N", "I"):
-                s = variant_sig(cs[i], rule, v)
-                if not s:
-                    continue
-                out[v][1] += 1
-                out[v][0] += int(s == y)
-    return {v: (int(a), int(n)) for v, (a, n) in out.items()}
-
-
-def choose_variant(cs_list: list[list[Candle]], rule: str, min_n: int) -> str:
-    st = variant_stats(cs_list, rule)
-    nacc = pct(*st["N"])
-    iacc = pct(*st["I"])
-    if st["N"][1] < min_n and st["I"][1] < min_n:
-        return "N" if nacc >= iacc else "I"
-    if st["N"][1] < min_n:
-        return "I"
-    if st["I"][1] < min_n:
-        return "N"
-    return "N" if nacc >= iacc else "I"
-
-
 def chain_pass(cs: list[Candle], i: int, trigger: tuple[str, str], selected: list[tuple[str, str, str]]) -> tuple[bool, int]:
     tr, tv = trigger
+    if i >= len(cs):
+        return False, 0
     s0 = variant_sig(cs[i], tr, tv)
     if not s0:
         return False, 0
     for k, (rule, variant, mode) in enumerate(selected, 1):
         j = i + k
-        s = variant_sig(cs[j], rule, variant) if j < len(cs) else 0
+        if j >= len(cs):
+            return False, s0
+        s = variant_sig(cs[j], rule, variant)
         if not s:
             return False, s0
         expected = s0 if mode == "SAME" else -s0
@@ -100,9 +75,7 @@ def chain_pass(cs: list[Candle], i: int, trigger: tuple[str, str], selected: lis
     return True, s0
 
 
-def chain_train_accuracy(
-    train: list[list[Candle]], trigger: tuple[str, str], selected: list[tuple[str, str, str]]
-) -> tuple[int, int]:
+def chain_accuracy(train: list[list[Candle]], trigger: tuple[str, str], selected: list[tuple[str, str, str]]) -> tuple[int, int]:
     depth = len(selected)
     correct = n = 0
     for cs in train:
@@ -119,7 +92,11 @@ def chain_train_accuracy(
 
 
 def rank_confirmations(
-    train: list[list[Candle]], trigger: tuple[str, str], selected: list[tuple[str, str, str]], min_n: int, threshold: float
+    train: list[list[Candle]],
+    trigger: tuple[str, str],
+    selected: list[tuple[str, str, str]],
+    min_n: int,
+    threshold: float,
 ) -> list[tuple[str, str, str, float, int]]:
     ranked: list[tuple[str, str, str, float, int]] = []
     used = {x[0] for x in selected} | {trigger[0]}
@@ -129,7 +106,7 @@ def rank_confirmations(
         for variant in ("N", "I"):
             for mode in ("SAME", "OPPOSITE"):
                 cand = selected + [(rule, variant, mode)]
-                correct, n = chain_train_accuracy(train, trigger, cand)
+                correct, n = chain_accuracy(train, trigger, cand)
                 acc = pct(correct, n)
                 if n >= min_n and acc >= threshold:
                     ranked.append((rule, variant, mode, acc, n))
@@ -137,38 +114,31 @@ def rank_confirmations(
     return ranked
 
 
-def select_strategy(train: list[list[Candle]], threshold: float, min_n: int, max_levels: int) -> tuple[tuple[str, str], list[tuple[str, str, str]], float, int]:
-    best: tuple[tuple[str, str], list[tuple[str, str, str]], float, int] | None = None
+def select_strategy(
+    train: list[list[Candle]], threshold: float, min_n: int, max_levels: int
+) -> tuple[tuple[str, str], list[tuple[str, str, str]], float, int] | None:
+    best = None
     for rule in RULES:
         for variant in ("N", "I"):
-            trig = (rule, variant)
-            correct, n = chain_train_accuracy(train, trig, [])
+            trigger = (rule, variant)
+            correct, n = chain_accuracy(train, trigger, [])
             acc = pct(correct, n)
             if n < min_n or acc < threshold:
                 continue
-            current = (trig, [], acc, n)
+            candidate = (trigger, [], acc, n)
             if best is None or (acc, n) > (best[2], best[3]):
-                best = current
+                best = candidate
 
             selected: list[tuple[str, str, str]] = []
-            for _level in range(max_levels):
-                ranked = rank_confirmations(train, trig, selected, min_n, threshold)
+            for _ in range(max_levels):
+                ranked = rank_confirmations(train, trigger, selected, min_n, threshold)
                 if not ranked:
                     break
                 selected.append(ranked[0][:3])
-                c, nn = chain_train_accuracy(train, trig, selected)
+                c, nn = chain_accuracy(train, trigger, selected)
                 a = pct(c, nn)
                 if nn >= min_n and a >= threshold and (best is None or (a, nn) > (best[2], best[3])):
-                    best = (trig, selected.copy(), a, nn)
-    if best is None:
-        # Fall back to the highest-accuracy trigger even if it is below threshold.
-        candidates = []
-        for rule in RULES:
-            for variant in ("N", "I"):
-                trig = (rule, variant)
-                c, n = chain_train_accuracy(train, trig, [])
-                candidates.append((trig, [], pct(c, n), n))
-        best = max(candidates, key=lambda x: (x[2], x[3]))
+                    best = (trigger, selected.copy(), a, nn)
     return best
 
 
@@ -184,13 +154,12 @@ class Equity:
     fee_sum: float = 0.0
 
     def apply(self, direction: int, entry: float, exit_price: float, fee_rate: float) -> None:
-        if entry <= 0 or exit_price <= 0:
+        if entry <= 0 or exit_price <= 0 or self.capital <= 0:
             return
         move = (exit_price / entry - 1.0) * direction
         gross_pnl = self.capital * move
         fee = self.capital * fee_rate * 2.0
-        self.capital += gross_pnl - fee
-        self.capital = max(self.capital, 0.0)
+        self.capital = max(self.capital + gross_pnl - fee, 0.0)
         self.trades += 1
         self.wins += int(gross_pnl > 0)
         self.losses += int(gross_pnl <= 0)
@@ -212,41 +181,41 @@ def evaluate_walkforward(
     max_levels: int,
 ) -> dict:
     eq = Equity(capital, capital)
-    sorted_items = list(series.items())
-    if not sorted_items:
-        return {"initial": capital, "final": capital, "return_pct": 0.0, "trades": 0, "win_rate_pct": 0.0, "max_dd_pct": 0.0}
+    items = list(series.items())
+    if not items:
+        return {"initial": capital, "final": capital, "return_pct": 0.0, "trades": 0, "wins": 0, "losses": 0, "win_rate_pct": 0.0, "max_dd_pct": 0.0, "gross_sum_pct": 0.0, "fees_paid": 0.0, "qualified_retrains": 0, "no_trade_retrains": 0}
 
-    # Each symbol is evaluated independently. Training uses only candles strictly
-    # before the current test candle; after each trade's outcome, future training
-    # can include that newly observed history at the next retraining point.
-    total_test_bars = max(len(cs) for _, cs in sorted_items)
-    next_retrain = 0
+    total_bars = max(len(cs) for _, cs in items)
+    next_retrain = train_bars
     strategy = None
-    for step in range(total_test_bars - 1):
-        if step < train_bars:
-            continue
+    qualified = no_trade = 0
+
+    for step in range(train_bars, total_bars - 1):
         if strategy is None or step >= next_retrain:
-            train_sets = []
-            for _, cs in sorted_items:
+            train_sets: list[list[Candle]] = []
+            for _, cs in items:
                 end = min(step, len(cs))
                 start = max(0, end - train_bars)
-                if end - start > 32:
+                if end - start >= min_n:
                     train_sets.append(cs[start:end])
-            if train_sets:
-                strategy = select_strategy(train_sets, threshold, min_n, max_levels)
+            strategy = select_strategy(train_sets, threshold, min_n, max_levels) if train_sets else None
+            if strategy is None:
+                no_trade += 1
+            else:
+                qualified += 1
             next_retrain = step + retrain_every
+
         if strategy is None:
             continue
-        trigger, selected, _, _ = strategy
-        for _, cs in sorted_items:
+        trigger, selected, train_acc, train_n = strategy
+        for _, cs in items:
             if step >= len(cs) - 1:
                 continue
             ok, direction = chain_pass(cs, step, trigger, selected)
             if not ok:
                 continue
-            entry = cs[step].close
-            exit_price = cs[step + 1].close
-            eq.apply(direction, entry, exit_price, fee_rate)
+            eq.apply(direction, cs[step].close, cs[step + 1].close, fee_rate)
+
     return {
         "initial": capital,
         "final": eq.capital,
@@ -258,6 +227,8 @@ def evaluate_walkforward(
         "max_dd_pct": 100.0 * eq.max_dd,
         "gross_sum_pct": 100.0 * eq.gross_sum,
         "fees_paid": eq.fee_sum,
+        "qualified_retrains": qualified,
+        "no_trade_retrains": no_trade,
     }
 
 
@@ -286,7 +257,7 @@ def main() -> None:
 
     rows: list[dict] = []
     print(f"R_CONFIRM_CAPITAL_WF_V7 train={args.train_month} test={args.test_month} threshold={args.threshold:.1f}% min_n={args.min_samples} capital={args.initial_capital}")
-    print("Each rebalance point trains only on past candles; qualifying strategy requires train accuracy >= threshold. Test runs with fee=0 and fee=1.3%% per side.")
+    print("No qualified >= threshold strategy => NO TRADE. Walk-forward uses only candles strictly before each retraining point.")
 
     for tf in tfs:
         test_series = load_series(root, symbols, args.test_month, tf)
@@ -306,7 +277,8 @@ def main() -> None:
             )
             print(
                 f"FEE={fee_pct:.1f}%/side FINAL={res['final']:.2f} RETURN={res['return_pct']:.2f}% "
-                f"TRADES={res['trades']} WIN={res['win_rate_pct']:.2f}% DD={res['max_dd_pct']:.2f}% FEES={res['fees_paid']:.2f}"
+                f"TRADES={res['trades']} WIN={res['win_rate_pct']:.2f}% DD={res['max_dd_pct']:.2f}% "
+                f"QUAL={res['qualified_retrains']} NO_TRADE_RETRAIN={res['no_trade_retrains']} FEES={res['fees_paid']:.2f}"
             )
             rows.append({"timeframe_min": tf, "fee_per_side_pct": fee_pct, **res})
 
