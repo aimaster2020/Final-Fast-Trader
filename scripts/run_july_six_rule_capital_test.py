@@ -6,6 +6,7 @@ from pathlib import Path
 from ohlc_rule_isolation_monthly import (
     DEFAULT_ALLOCATION,
     DEFAULT_CAPITAL,
+    DEFAULT_MAX_HOLD_BARS,
     FEE_PER_SIDE,
     LEVERAGE,
     evaluate_rule,
@@ -47,6 +48,7 @@ def main() -> None:
     ap.add_argument("--trade-allocation", type=float, default=DEFAULT_ALLOCATION)
     ap.add_argument("--leverage", type=float, default=LEVERAGE)
     ap.add_argument("--fee-per-side", type=float, default=FEE_PER_SIDE)
+    ap.add_argument("--max-hold-bars", type=int, default=DEFAULT_MAX_HOLD_BARS, help="maximum bars a position may remain open")
     args = ap.parse_args()
 
     path = find_month_file(Path(args.input_dir), args.symbol, args.month)
@@ -57,7 +59,7 @@ def main() -> None:
     if not candles:
         raise SystemExit("NO_COMPLETE_CANDLES")
 
-    print(f"{args.symbol} {args.month} {args.timeframe}m candles={len(candles)} direction={args.direction}")
+    print(f"{args.symbol} {args.month} {args.timeframe}m candles={len(candles)} direction={args.direction} exit={args.max_hold_bars}bars")
     for rule, threshold in TESTS.items():
         s = evaluate_rule(
             candles,
@@ -68,6 +70,7 @@ def main() -> None:
             threshold,
             args.fee_per_side,
             args.leverage,
+            args.max_hold_bars,
         )
         pf = s["profit_factor"]
         pf_text = f"{pf:.2f}" if pf != float("inf") else "INF"
