@@ -389,7 +389,7 @@ def main() -> None:
                     npf_text = "inf" if npf == float("inf") else f"{npf:.2f}"
                     print(
                         f"{symbol}|{tf}m|{direction}|{s['rule']}|"
-                        f"role={s['utility_assessment']} return={s['return_pct']:.2f}% "
+                        f"diagnostic={s['diagnostic']} return_ref={s['return_pct']:.2f}% "
                         f"trades={s['completed_trades']} win={s['win_rate_pct']:.1f}% "
                         f"NPF={npf_text} DD={s['max_drawdown_pct']:.2f}% "
                         f"fees={s['commission_paid']:.2f} liq={s['liquidations']} "
