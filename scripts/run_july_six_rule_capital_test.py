@@ -9,32 +9,12 @@ from ohlc_rule_isolation_monthly import (
     DEFAULT_MAX_HOLD_BARS,
     FEE_PER_SIDE,
     LEVERAGE,
+    TESTS,
     evaluate_rule,
     find_month_file,
     load_binance,
     resample,
 )
-
-# Baseline thresholds by rule type. Binary direction rules require full vote;
-# continuous strength/location rules use the established 0.50/0.75 cutoffs.
-TESTS = {
-    "R1": 1.00,
-    "R2": 0.25,
-    "R3": 1.00,
-    "R4": 1.00,
-    "R5": 0.50,
-    "R6": 0.50,
-    "R7": 0.50,
-    "R8": 0.50,
-    "R9": 0.50,
-    "R10": 0.50,
-    "R11": 0.50,
-    "R12": 0.50,
-    "R13": 0.50,
-    "R14": 0.75,
-    "R15": 0.75,
-    "R16": 1.00,
-}
 
 
 def main() -> None:
@@ -46,7 +26,6 @@ def main() -> None:
     ap.add_argument("--direction", choices=["LONG_ONLY", "SHORT_ONLY", "BOTH"], default="LONG_ONLY")
     ap.add_argument("--initial-capital", type=float, default=DEFAULT_CAPITAL)
     ap.add_argument("--trade-allocation", type=float, default=DEFAULT_ALLOCATION)
-    ap.add_argument("--leverage", type=float, default=LEVERAGE)
     ap.add_argument("--fee-per-side", type=float, default=FEE_PER_SIDE)
     ap.add_argument("--max-hold-bars", type=int, default=DEFAULT_MAX_HOLD_BARS, help="maximum bars a position may remain open")
     args = ap.parse_args()
@@ -59,7 +38,7 @@ def main() -> None:
     if not candles:
         raise SystemExit("NO_COMPLETE_CANDLES")
 
-    print(f"{args.symbol} {args.month} {args.timeframe}m candles={len(candles)} direction={args.direction} exit={args.max_hold_bars}bars")
+    print(f"{args.symbol} {args.month} {args.timeframe}m candles={len(candles)} direction={args.direction} leverage=1x fee={args.fee_per_side*100:.2f}%/side exit={args.max_hold_bars}bars")
     for rule, threshold in TESTS.items():
         s = evaluate_rule(
             candles,
@@ -69,7 +48,7 @@ def main() -> None:
             args.trade_allocation,
             threshold,
             args.fee_per_side,
-            args.leverage,
+            LEVERAGE,
             args.max_hold_bars,
         )
         pf = s["profit_factor"]
