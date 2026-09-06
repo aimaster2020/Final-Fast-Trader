@@ -51,7 +51,8 @@ def close_change_sum(candles: list[Candle], i: int, bars: int) -> float:
     """Sum absolute close-to-close changes over the M completed bars before i."""
     if bars <= 0 or i < bars:
         return math.inf
-    return sum(abs(candles[j].close - candles[j - 1].close) for j in range(i - bars + 1, i + 1))
+    # IMPORTANT: only completed bars BEFORE the signal candle.
+    return sum(abs(candles[j].close - candles[j - 1].close) for j in range(i - bars, i))
 
 
 def signal_extreme(
@@ -77,7 +78,6 @@ def signal_extreme(
         return ""
 
     previous = candles[i - window : i]
-    prior_close = candles[i - 1].close
     movement_budget = close_change_sum(candles, i, move_bars) * multiplier
     if not math.isfinite(movement_budget):
         return ""
@@ -91,8 +91,6 @@ def signal_extreme(
     is_low_extreme = candles[i].low < prev_low and downside_excursion >= movement_budget
     is_high_extreme = candles[i].high > prev_high and upside_excursion >= movement_budget
 
-    # Use strict new extremes. If a candle makes both extremes, do not create
-    # an ambiguous directional signal.
     if is_low_extreme and is_high_extreme:
         return "BOTH"
     if is_low_extreme:
@@ -178,6 +176,7 @@ def main() -> None:
     )
     print("LOW = current low breaks previous-window minimum + excursion >= multiplier * sum(abs(close changes), M bars)")
     print("HIGH = current high breaks previous-window maximum + excursion >= multiplier * sum(abs(close changes), M bars)")
+    print("Movement sum uses ONLY completed candles before the signal candle.")
 
     results = []
     for month in months:
