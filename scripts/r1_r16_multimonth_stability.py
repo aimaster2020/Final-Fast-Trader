@@ -21,6 +21,8 @@ from scripts.july_r1_r16_1h_horizon4_consensus import (
 DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"
 DEFAULT_FEE_SIDE_PCT = 0.13
 DEFAULT_MONTHS = "2026-05,2026-06,2026-07,2026-08"
+DEFAULT_MIN_TOTAL_TRADES = 20
+DEFAULT_MIN_POSITIVE_MONTHS = 2
 
 
 def load_month_compat(input_dir: Path, symbol: str, month: str):
@@ -30,9 +32,6 @@ def load_month_compat(input_dir: Path, symbol: str, month: str):
         filename_months = []
     else:
         raw, files, filename_months = result
-
-    # May-July can contain both CSV and ZIP copies of the same month.
-    # De-duplicate by candle timestamp so the same market data is never counted twice.
     by_ts = {c.timestamp: c for c in raw}
     deduped = [by_ts[k] for k in sorted(by_ts)]
     return deduped, files, filename_months
@@ -82,7 +81,7 @@ def test_month(input_dir: Path, month: str, symbols: list[str], fee_side_pct: fl
     return rows, loaded_files
 
 
-def summarize(monthly_rows, months):
+def summarize(monthly_rows, months, min_total_trades: int, min_positive_months: int):
     grouped = {}
     for r in monthly_rows:
         grouped.setdefault((r["rule"], r["variant"], r["mode"]), []).append(r)
@@ -97,17 +96,22 @@ def summarize(monthly_rows, months):
         dds = [float(by_month[m]["max_dd_pct"]) for m in months if m in by_month]
         positive = sum(x > 0 for x in returns)
         nonnegative = sum(x >= 0 for x in returns)
+        total_trades = sum(trades)
         mean_ret = sum(returns) / len(returns) if returns else 0.0
         worst = min(returns) if returns else 0.0
         best = max(returns) if returns else 0.0
         volatility = (sum((x - mean_ret) ** 2 for x in returns) / len(returns)) ** 0.5 if returns else 0.0
-
         coverage = len(returns) / n_months if n_months else 0.0
         positive_rate = positive / len(returns) if returns else 0.0
         consistency = max(0.0, 1.0 - volatility / 20.0)
         drawdown_quality = max(0.0, 1.0 - (sum(dds) / len(dds)) / 30.0) if dds else 0.0
-        stability_score = 100.0 * (0.45 * positive_rate + 0.20 * coverage + 0.20 * consistency + 0.15 * drawdown_quality)
-
+        stability_score = 100.0 * (
+            0.45 * positive_rate
+            + 0.20 * coverage
+            + 0.20 * consistency
+            + 0.15 * drawdown_quality
+        )
+        eligible = positive >= min_positive_months and total_trades >= min_total_trades
         out.append({
             "rule": key[0], "variant": key[1], "mode": key[2],
             "months_tested": len(returns), "positive_months": positive, "nonnegative_months": nonnegative,
@@ -115,20 +119,27 @@ def summarize(monthly_rows, months):
             "best_month_pct": best, "worst_month_pct": worst, "return_std_pct": volatility,
             "mean_accuracy_pct": sum(accuracies) / len(accuracies) if accuracies else 0.0,
             "mean_trades": sum(trades) / len(trades) if trades else 0.0,
+            "total_trades": total_trades,
             "mean_dd_pct": sum(dds) / len(dds) if dds else 0.0,
             "stability_score": stability_score,
+            "eligible": "YES" if eligible else "NO",
             "monthly_returns": ",".join(f"{by_month[m]['return_pct']:+.2f}" if m in by_month else "NA" for m in months),
         })
-    return sorted(out, key=lambda r: (-float(r["stability_score"]), -float(r["mean_return_pct"]), -float(r["positive_rate_pct"]), float(r["mean_dd_pct"])))
+
+    eligible_rows = [r for r in out if r["eligible"] == "YES"]
+    eligible_rows.sort(key=lambda r: (-float(r["stability_score"]), -float(r["mean_return_pct"]), -float(r["total_trades"]), float(r["mean_dd_pct"])))
+    return eligible_rows, out
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="R1-R16 multi-month stability ranking at fixed fee with timestamp de-duplication.")
+    ap = argparse.ArgumentParser(description="R1-R16 multi-month stability ranking at fixed fee with timestamp de-duplication and practical-sample filtering.")
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--months", default=DEFAULT_MONTHS)
     ap.add_argument("--symbols", default=DEFAULT_SYMBOLS)
     ap.add_argument("--initial-capital", type=float, default=1000.0)
     ap.add_argument("--fee-side-pct", type=float, default=DEFAULT_FEE_SIDE_PCT)
+    ap.add_argument("--min-total-trades", type=int, default=DEFAULT_MIN_TOTAL_TRADES)
+    ap.add_argument("--min-positive-months", type=int, default=DEFAULT_MIN_POSITIVE_MONTHS)
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
 
@@ -138,6 +149,7 @@ def main() -> None:
 
     monthly_rows: list[dict] = []
     print(f"R1_R16_MULTIMONTH_STABILITY months={','.join(months)} fee={args.fee_side_pct:.3f}%/side assets={','.join(symbols)}")
+    print(f"FILTER min_total_trades={args.min_total_trades} min_positive_months={args.min_positive_months}")
 
     successful_months: list[str] = []
     for month in months:
@@ -153,18 +165,30 @@ def main() -> None:
     if not monthly_rows:
         raise RuntimeError("No monthly data could be tested.")
 
-    summary = summarize(monthly_rows, successful_months)
+    eligible, all_rows = summarize(monthly_rows, successful_months, args.min_total_trades, args.min_positive_months)
     print(f"TESTED_MONTHS {','.join(successful_months)}")
-    print("RANK RULE MODE POS/ALL MEAN% BEST% WORST% ACC% TRADES DD% SCORE RETURNS")
-    print("---- ---- ---- ------- ------ ------ ------ ----- ------ ----- ----- -------")
-    for r in summary[:20]:
+    if eligible:
+        print("ELIGIBLE RANK RULE MODE POS/ALL MEAN% BEST% WORST% ACC% TRADES DD% SCORE RETURNS")
+        print("-------- ---- ---- ------- ------ ------ ------ ----- ------ ----- ----- -------")
+        for r in eligible[:20]:
+            print(
+                f"{r['eligible']:>8} {r['rule']:>4} {r['mode']:>4} {r['variant']:>3} "
+                f"{r['positive_months']}/{r['months_tested']:<3} "
+                f"{float(r['mean_return_pct']):>+6.2f} {float(r['best_month_pct']):>+6.2f} "
+                f"{float(r['worst_month_pct']):>+6.2f} {float(r['mean_accuracy_pct']):>6.2f} "
+                f"{float(r['total_trades']):>6.0f} {float(r['mean_dd_pct']):>6.2f} "
+                f"{float(r['stability_score']):>6.2f} {r['monthly_returns']}"
+            )
+    else:
+        print("NO_ELIGIBLE_STRATEGIES")
+
+    all_sorted = sorted(all_rows, key=lambda r: (-float(r["mean_return_pct"]), -float(r["positive_rate_pct"]), -float(r["total_trades"]), float(r["mean_dd_pct"])))
+    print("TOP_BY_MEAN_RETURN (diagnostic)")
+    for r in all_sorted[:10]:
         print(
-            f"{r['rule']:>4} {r['mode']:>4} {r['variant']:>3} "
-            f"{r['positive_months']}/{r['months_tested']:<3} "
-            f"{float(r['mean_return_pct']):>+6.2f} {float(r['best_month_pct']):>+6.2f} "
-            f"{float(r['worst_month_pct']):>+6.2f} {float(r['mean_accuracy_pct']):>6.2f} "
-            f"{float(r['mean_trades']):>6.1f} {float(r['mean_dd_pct']):>6.2f} "
-            f"{float(r['stability_score']):>6.2f} {r['monthly_returns']}"
+            f"{r['rule']:>4} {r['mode']:>4} {r['variant']:>3} {r['positive_months']}/{r['months_tested']} "
+            f"mean={float(r['mean_return_pct']):+.2f}% total_trades={int(r['total_trades'])} eligible={r['eligible']} "
+            f"returns={r['monthly_returns']}"
         )
 
     out = Path(args.output) if args.output else ROOT / "reports" / f"r1_r16_multimonth_stability_{'-'.join(successful_months)}.csv"
@@ -172,8 +196,8 @@ def main() -> None:
         out = ROOT / out
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="", encoding="utf-8") as f:
-        fields = list(summary[0].keys())
-        w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(summary)
+        fields = list(all_rows[0].keys())
+        w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(all_rows)
 
     raw_out = out.with_name(out.stem + "_monthly.csv")
     with raw_out.open("w", newline="", encoding="utf-8") as f:
