@@ -38,9 +38,9 @@ def load_binance(path: Path) -> list[Candle]:
                 continue
             try:
                 ts = int(float(r[0]))
-                if ts > 10_000_000_000_000:       # microseconds
+                if ts > 10_000_000_000_000:
                     ts //= 1_000_000
-                elif ts > 10_000_000_000:         # milliseconds
+                elif ts > 10_000_000_000:
                     ts //= 1_000
                 rows.append(Candle(ts, float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])))
             except (ValueError, TypeError):
@@ -97,8 +97,10 @@ def _close_position(p: dict, price: float, capital: float, fee: float, leverage:
     gross = (price / p["entry"] - 1.0) if p["side"] == 1 else (p["entry"] / price - 1.0)
     pnl = p["margin"] * leverage * gross
     close_fee = p["notional"] * fee
+    entry_fee = p["entry_fee"]
+    trade_net_pnl = pnl - entry_fee - close_fee
     capital += p["margin"] + pnl - close_fee
-    return capital, (pnl - close_fee) / p["margin"] if p["margin"] else 0.0, close_fee
+    return capital, trade_net_pnl, close_fee
 
 
 def evaluate_rule(
@@ -111,15 +113,10 @@ def evaluate_rule(
     fee: float,
     leverage: float,
 ):
-    """Run one rule in BOTH, LONG_ONLY or SHORT_ONLY mode.
-
-    LONG_ONLY: only +1 signals open/add long positions; -1 signals are ignored.
-    SHORT_ONLY: only -1 signals open/add short positions; +1 signals are ignored.
-    BOTH: original behavior, opposite signals close and reverse.
-    """
+    """Run one rule in BOTH, LONG_ONLY or SHORT_ONLY mode."""
     free_capital = initial_capital
     positions: list[dict] = []
-    trade_returns: list[float] = []
+    trade_pnls: list[float] = []
     fees = 0.0
     peak = initial_capital
     max_dd = 0.0
@@ -138,7 +135,6 @@ def evaluate_rule(
         else:
             holds += 1
 
-        # Direction-specific tests ignore the opposite direction completely.
         if direction == "LONG_ONLY" and raw_sig != 1:
             sig = 0
         elif direction == "SHORT_ONLY" and raw_sig != -1:
@@ -150,12 +146,11 @@ def evaluate_rule(
             accepted_signals += 1
 
         if direction == "BOTH":
-            # Original behavior: opposite signal closes all positions, then reverses.
             if sig and last_signal and sig != last_signal and positions:
                 for p in positions:
-                    free_capital, tr, cf = _close_position(p, c.close, free_capital, fee, leverage)
-                    trade_returns.append(tr)
-                    fees += cf
+                    free_capital, trade_pnl, cf = _close_position(p, c.close, free_capital, fee, leverage)
+                    trade_pnls.append(trade_pnl)
+                    fees += cf + p["entry_fee"]
                 positions = []
 
             if sig and free_capital > 0:
@@ -170,12 +165,11 @@ def evaluate_rule(
                         "entry": c.close,
                         "margin": margin,
                         "notional": notional,
+                        "entry_fee": entry_fee,
                         "opened_at": c.timestamp,
                     })
                 last_signal = sig
         else:
-            # Isolated direction test: same-side signals add positions; no opposite
-            # signal can close them. All positions are realized at month end.
             if sig and free_capital > 0:
                 margin = free_capital * allocation
                 notional = margin * leverage
@@ -188,6 +182,7 @@ def evaluate_rule(
                         "entry": c.close,
                         "margin": margin,
                         "notional": notional,
+                        "entry_fee": entry_fee,
                         "opened_at": c.timestamp,
                     })
 
@@ -199,17 +194,17 @@ def evaluate_rule(
         if peak:
             max_dd = max(max_dd, (peak - equity) / peak * 100.0)
 
-    # Force-close all open positions at the last candle so the monthly result is realized.
     for p in positions:
-        free_capital, tr, cf = _close_position(p, candles[-1].close, free_capital, fee, leverage)
-        trade_returns.append(tr)
-        fees += cf
+        free_capital, trade_pnl, cf = _close_position(p, candles[-1].close, free_capital, fee, leverage)
+        trade_pnls.append(trade_pnl)
+        fees += cf + p["entry_fee"]
 
     final_capital = free_capital
-    wins = sum(x > 0 for x in trade_returns)
-    gross_profit = sum(x for x in trade_returns if x > 0)
-    gross_loss = -sum(x for x in trade_returns if x < 0)
+    wins = sum(x > 0 for x in trade_pnls)
+    gross_profit = sum(x for x in trade_pnls if x > 0)
+    gross_loss = -sum(x for x in trade_pnls if x < 0)
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
+    net_pnl = sum(trade_pnls)
     days = max((candles[-1].timestamp - candles[0].timestamp) / 86400.0, 1 / 24)
     return {
         "direction": direction,
@@ -217,16 +212,20 @@ def evaluate_rule(
         "candles": len(candles),
         "initial_capital": initial_capital,
         "final_capital": final_capital,
+        "net_pnl": net_pnl,
+        "accounting_check": final_capital - initial_capital - net_pnl,
         "return_pct": (final_capital / initial_capital - 1.0) * 100.0,
         "signals": signals,
         "accepted_signals": accepted_signals,
         "buy_signals": buys,
         "sell_signals": sells,
         "hold_candles": holds,
-        "completed_trades": len(trade_returns),
+        "completed_trades": len(trade_pnls),
         "wins": wins,
-        "losses": len(trade_returns) - wins,
-        "win_rate_pct": wins / len(trade_returns) * 100.0 if trade_returns else 0.0,
+        "losses": len(trade_pnls) - wins,
+        "win_rate_pct": wins / len(trade_pnls) * 100.0 if trade_pnls else 0.0,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
         "profit_factor": profit_factor,
         "commission_paid": fees,
         "max_drawdown_pct": max_dd,
@@ -279,16 +278,7 @@ def main() -> None:
             for direction in directions:
                 for i in range(1, 17):
                     rule = f"R{i}"
-                    s = evaluate_rule(
-                        candles,
-                        rule,
-                        direction,
-                        args.initial_capital,
-                        args.trade_allocation,
-                        args.threshold,
-                        args.fee_per_side,
-                        args.leverage,
-                    )
+                    s = evaluate_rule(candles, rule, direction, args.initial_capital, args.trade_allocation, args.threshold, args.fee_per_side, args.leverage)
                     s.update({
                         "symbol": symbol,
                         "month": args.month,
@@ -319,23 +309,13 @@ def main() -> None:
         w.writeheader()
         w.writerows(rows)
 
-    ranked = sorted(
-        rows,
-        key=lambda x: (
-            float(x["return_pct"]),
-            float(x["profit_factor"]) if x["profit_factor"] != "inf" else 1e99,
-            float(x["win_rate_pct"]),
-            -float(x["max_drawdown_pct"]),
-        ),
-        reverse=True,
-    )
+    ranked = sorted(rows, key=lambda x: (float(x["return_pct"]), float(x["profit_factor"]) if x["profit_factor"] != "inf" else 1e99, float(x["win_rate_pct"]), -float(x["max_drawdown_pct"])), reverse=True)
     rank_path = p.with_name(p.stem + "_ranked.csv")
     with rank_path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(ranked)
 
-    # Direction-focused summary: for each symbol/timeframe/rule, compare long vs short.
     summary: list[dict] = []
     grouped: dict[tuple[str, int, str], dict[str, dict]] = {}
     for row in rows:
@@ -349,12 +329,7 @@ def main() -> None:
             continue
         long_ret = float(long_row["return_pct"])
         short_ret = float(short_row["return_pct"])
-        if long_ret > short_ret:
-            preferred = "LONG"
-        elif short_ret > long_ret:
-            preferred = "SHORT"
-        else:
-            preferred = "TIE"
+        preferred = "LONG" if long_ret > short_ret else "SHORT" if short_ret > long_ret else "TIE"
         summary.append({
             "symbol": symbol,
             "timeframe_min": tf,
