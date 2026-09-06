@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from fast_pattern_trader.models import Candle
 from scripts.prepared_market_loader import load_prepared
 
 
@@ -37,28 +38,25 @@ class Position:
         return self.notional * self.gross_ret - self.fee
 
 
-def movement_budget(rows: list[dict], i: int, bars: int) -> float:
+def movement_budget(rows: list[Candle], i: int, bars: int) -> float:
     if bars <= 0 or i < bars:
         return float("inf")
-    return sum(
-        abs(float(rows[j]["close"]) - float(rows[j - 1]["close"]))
-        for j in range(i - bars, i)
-    )
+    return sum(rows[j].close - rows[j - 1].close if False else abs(rows[j].close - rows[j - 1].close) for j in range(i - bars, i))
 
 
 def extreme_signal(
-    rows: list[dict], i: int, window: int, move_bars: int, multiplier: float
+    rows: list[Candle], i: int, window: int, move_bars: int, multiplier: float
 ) -> str:
     if i < max(window, move_bars):
         return ""
-    previous = rows[i - window : i]
-    prev_low = min(float(r["low"]) for r in previous)
-    prev_high = max(float(r["high"]) for r in previous)
+    previous = rows[i - window:i]
+    prev_low = min(c.low for c in previous)
+    prev_high = max(c.high for c in previous)
     budget = movement_budget(rows, i, move_bars) * multiplier
-    low_break = float(rows[i]["low"]) < prev_low
-    high_break = float(rows[i]["high"]) > prev_high
-    low = low_break and (prev_low - float(rows[i]["low"])) >= budget
-    high = high_break and (float(rows[i]["high"]) - prev_high) >= budget
+    low_break = rows[i].low < prev_low
+    high_break = rows[i].high > prev_high
+    low = low_break and (prev_low - rows[i].low) >= budget
+    high = high_break and (rows[i].high - prev_high) >= budget
     if low and high:
         return ""
     if low:
@@ -70,7 +68,7 @@ def extreme_signal(
 
 def build_candidates(
     symbol: str,
-    rows: list[dict],
+    rows: list[Candle],
     window: int,
     move_bars: int,
     multiplier: float,
@@ -89,16 +87,16 @@ def build_candidates(
         exit_i = i + 1 + horizon
         if exit_i >= len(rows):
             continue
-        entry = float(rows[entry_i]["open"])
-        exit_price = float(rows[exit_i]["close"])
+        entry = rows[entry_i].open
+        exit_price = rows[exit_i].close
         if entry <= 0:
             continue
         out.append(
             {
                 "symbol": symbol,
                 "signal": sig,
-                "entry_ts": int(rows[entry_i]["timestamp"]),
-                "exit_ts": int(rows[exit_i]["timestamp"]),
+                "entry_ts": rows[entry_i].timestamp,
+                "exit_ts": rows[exit_i].timestamp,
                 "entry": entry,
                 "exit": exit_price,
             }
@@ -139,7 +137,6 @@ def run_portfolio(
         )
 
     for cand in candidates:
-        # Close positions whose scheduled exit is at or before this entry time.
         for symbol, pos in list(active.items()):
             if pos.exit_ts <= cand["entry_ts"]:
                 close_position(pos)
@@ -227,10 +224,10 @@ def main() -> None:
     for horizon in horizons:
         candidates: list[dict] = []
         for symbol in symbols:
-            rows: list[dict] = []
+            rows: list[Candle] = []
             for month in months:
                 rows.extend(prepared.get((symbol, month), []))
-            rows.sort(key=lambda r: int(r["timestamp"]))
+            rows.sort(key=lambda c: c.timestamp)
             candidates.extend(build_candidates(symbol, rows, args.window, args.move_bars, args.multiplier, horizon, args.side))
 
         summary, trades = run_portfolio(
