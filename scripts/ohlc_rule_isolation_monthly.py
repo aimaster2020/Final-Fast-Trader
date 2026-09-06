@@ -6,9 +6,9 @@ from pathlib import Path
 
 from fast_pattern_trader.models import Candle
 
-FEE_PER_SIDE = 0.013          # 1.3% of leveraged notional per side
-LEVERAGE = 10.0
-DEFAULT_ALLOCATION = 0.10     # 10% of currently free capital as margin
+FEE_PER_SIDE = 0.013          # 1.3% per side on spot notional; no leverage
+LEVERAGE = 1.0
+DEFAULT_ALLOCATION = 0.10     # 10% of currently free capital
 DEFAULT_CAPITAL = 1000.0
 DEFAULT_MAX_HOLD_BARS = 10
 
@@ -112,7 +112,7 @@ def evaluate_rule(
     allocation: float,
     threshold: float,
     fee: float,
-    leverage: float,
+    leverage: float = LEVERAGE,
     max_hold_bars: int = DEFAULT_MAX_HOLD_BARS,
 ):
     """Run one rule with at most one active position and a maximum holding period."""
@@ -122,14 +122,12 @@ def evaluate_rule(
     fees = 0.0
     peak = initial_capital
     max_dd = 0.0
-    last_signal = 0
     signals = buys = sells = holds = 0
     accepted_signals = 0
     time_exits = 0
     signal_exits = 0
 
     for i, c in enumerate(candles):
-        # Hard time-based exit: close after max_hold_bars completed bars.
         if positions and i - positions[0]["entry_index"] >= max_hold_bars:
             p = positions.pop(0)
             free_capital, trade_pnl, cf = _close_position(p, c.close, free_capital, fee, leverage)
@@ -157,7 +155,6 @@ def evaluate_rule(
         if sig:
             accepted_signals += 1
 
-        # With one active position, an opposite signal exits it in BOTH mode.
         if direction == "BOTH" and sig and positions and sig != positions[0]["side"]:
             p = positions.pop(0)
             free_capital, trade_pnl, cf = _close_position(p, c.close, free_capital, fee, leverage)
@@ -165,7 +162,6 @@ def evaluate_rule(
             fees += cf + p["entry_fee"]
             signal_exits += 1
 
-        # Enter only when flat. Repeated same-side signals do not pyramid.
         if sig and not positions and free_capital > 0:
             margin = free_capital * allocation
             notional = margin * leverage
@@ -182,7 +178,6 @@ def evaluate_rule(
                     "opened_at": c.timestamp,
                     "entry_index": i,
                 })
-            last_signal = sig
 
         equity = free_capital
         for p in positions:
@@ -252,10 +247,9 @@ def main() -> None:
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT")
     ap.add_argument("--month", required=True, help="YYYY-MM")
-    ap.add_argument("--timeframes", default="5,30")
+    ap.add_argument("--timeframes", default="5,15,30,60")
     ap.add_argument("--initial-capital", type=float, default=DEFAULT_CAPITAL)
     ap.add_argument("--trade-allocation", type=float, default=DEFAULT_ALLOCATION)
-    ap.add_argument("--leverage", type=float, default=LEVERAGE)
     ap.add_argument("--fee-per-side", type=float, default=FEE_PER_SIDE, help="decimal; 1.3%% = 0.013")
     ap.add_argument("--threshold", type=float, default=1.0)
     ap.add_argument("--max-hold-bars", type=int, default=DEFAULT_MAX_HOLD_BARS)
@@ -280,15 +274,15 @@ def main() -> None:
             for direction in directions:
                 for i in range(1, 17):
                     rule = f"R{i}"
-                    s = evaluate_rule(candles, rule, direction, args.initial_capital, args.trade_allocation, args.threshold, args.fee_per_side, args.leverage, args.max_hold_bars)
+                    s = evaluate_rule(candles, rule, direction, args.initial_capital, args.trade_allocation, TESTS.get(rule, args.threshold), args.fee_per_side, LEVERAGE, args.max_hold_bars)
                     s.update({
                         "symbol": symbol,
                         "month": args.month,
                         "timeframe_min": tf,
                         "fee_per_side_pct": args.fee_per_side * 100.0,
                         "allocation_pct": args.trade_allocation * 100.0,
-                        "leverage": args.leverage,
-                        "threshold": args.threshold,
+                        "leverage": LEVERAGE,
+                        "threshold": TESTS.get(rule, args.threshold),
                         "start_utc": candles[0].timestamp,
                         "end_utc": candles[-1].timestamp,
                     })
@@ -347,6 +341,26 @@ def main() -> None:
         w = csv.DictWriter(f, fieldnames=fields2)
         w.writeheader()
         w.writerows(summary)
+
+
+TESTS = {
+    "R1": 1.00,
+    "R2": 0.25,
+    "R3": 1.00,
+    "R4": 1.00,
+    "R5": 0.50,
+    "R6": 0.50,
+    "R7": 0.50,
+    "R8": 0.50,
+    "R9": 0.50,
+    "R10": 0.50,
+    "R11": 0.50,
+    "R12": 0.50,
+    "R13": 0.50,
+    "R14": 0.75,
+    "R15": 0.75,
+    "R16": 1.00,
+}
 
 
 if __name__ == "__main__":
