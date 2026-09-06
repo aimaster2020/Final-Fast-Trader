@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 import sys
@@ -15,6 +15,15 @@ from scripts.july_time_horizon_oracle_fee_hold import load_series
 
 HORIZONS = [("30m", 30), ("1h", 60), ("2h", 120), ("4h", 240)]
 DEFAULT_FEE_SIDE_PCT = 0.13
+
+
+@dataclass
+class Frame:
+    start_i: int
+    end_i: int
+    direction: int
+    entry_price: float
+    exit_price: float
 
 
 @dataclass
@@ -33,8 +42,9 @@ class Run:
         return self.entry_price / self.exit_price - 1.0
 
 
-def build_runs(raw: list, minutes: int, horizon: str, symbol: str) -> list[Run]:
-    frames: list[tuple[int, int, float, float]] = []
+def build_directional_frames(raw: list, minutes: int) -> list[Frame]:
+    """Build the exact same non-overlapping directional frames as run_lengths.py."""
+    frames: list[Frame] = []
     i = 0
     while i < len(raw):
         entry = raw[i].close
@@ -42,39 +52,54 @@ def build_runs(raw: list, minutes: int, horizon: str, symbol: str) -> list[Run]:
         j = i + 1
         while j < len(raw) and raw[j].timestamp < target_ts:
             j += 1
-        if j >= len(raw) or entry <= 0 or raw[j].close <= 0:
+
+        if j >= len(raw) or entry <= 0:
             break
-        move = raw[j].close / entry - 1.0
+
+        exit_price = raw[j].close
+        if exit_price <= 0:
+            break
+
+        move = exit_price / entry - 1.0
         if move > 0:
-            frames.append((i, j, 1, entry))
+            frames.append(Frame(i, j, 1, entry, exit_price))
         elif move < 0:
-            frames.append((i, j, -1, entry))
+            frames.append(Frame(i, j, -1, entry, exit_price))
+
+        # Keep flats ignored and preserve the exact frame stepping semantics.
         i = j
 
+    return frames
+
+
+def build_runs(raw: list, minutes: int, horizon: str, symbol: str) -> tuple[list[Run], Counter[int]]:
+    """Group the canonical directional frames into continuous same-direction runs."""
+    frames = build_directional_frames(raw, minutes)
+    counts: Counter[int] = Counter()
     runs: list[Run] = []
     if not frames:
-        return runs
+        return runs, counts
 
-    start_i, prev_j, current_dir, start_price = frames[0]
+    current_dir = frames[0].direction
     length = 1
-    exit_price = raw[prev_j].close
+    start_price = frames[0].entry_price
+    exit_price = frames[0].exit_price
 
-    for i, j, direction, entry_price in frames[1:]:
-        if direction == current_dir:
+    for frame in frames[1:]:
+        if frame.direction == current_dir:
             length += 1
-            prev_j = j
-            exit_price = raw[j].close
+            exit_price = frame.exit_price
         else:
             runs.append(Run(horizon, symbol, length, current_dir, start_price, exit_price))
-            start_i = i
-            prev_j = j
-            current_dir = direction
-            start_price = entry_price
-            exit_price = raw[j].close
+            counts[length] += 1
+            current_dir = frame.direction
             length = 1
+            start_price = frame.entry_price
+            exit_price = frame.exit_price
 
     runs.append(Run(horizon, symbol, length, current_dir, start_price, exit_price))
-    return runs
+    counts[length] += 1
+    return runs, counts
 
 
 def net_return(gross_return: float, fee_side_pct: float) -> float:
@@ -101,12 +126,29 @@ def main() -> None:
     rows: list[dict] = []
     for horizon, minutes in HORIZONS:
         all_runs: list[Run] = []
-        for symbol, raw in series.items():
-            all_runs.extend(build_runs(raw, minutes, horizon, symbol))
+        canonical_counts: Counter[int] = Counter()
 
+        for symbol, raw in series.items():
+            runs, counts = build_runs(raw, minutes, horizon, symbol)
+            all_runs.extend(runs)
+            canonical_counts.update(counts)
+
+        # The profit buckets are now derived from the same canonical frame/run
+        # construction. This prevents the previous off-by-one bucket mismatch.
         grouped: dict[int, list[Run]] = defaultdict(list)
         for run in all_runs:
             grouped[run.length].append(run)
+
+        actual_counts = Counter({length: len(bucket) for length, bucket in grouped.items()})
+        if actual_counts != canonical_counts:
+            raise RuntimeError(
+                f"RUN_BUCKET_CHECK_FAILED horizon={horizon} "
+                f"canonical={dict(sorted(canonical_counts.items()))} "
+                f"actual={dict(sorted(actual_counts.items()))}"
+            )
+
+        total_runs = sum(canonical_counts.values())
+        print(f"CHECK {horizon} runs={total_runs} buckets=PASS")
 
         for length in sorted(grouped):
             bucket = grouped[length]
