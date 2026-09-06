@@ -16,6 +16,25 @@ from scripts.ohlc_rule_isolation_monthly import TESTS
 RULES = [f"R{i}" for i in range(1, 17)]
 MODES = ["CURRENT", "2OF4", "3OF4", "4OF4"]
 DEFAULT_FEE_SIDE_PCT = 0.05
+DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT"
+
+
+def find_requested_month_file(input_dir: Path, symbol: str, month: str) -> Path | None:
+    """Find a monthly CSV robustly regardless of the exact filename separator/case."""
+    exact = find_month_file(input_dir, symbol, month)
+    if exact is not None:
+        return exact
+
+    symbol_u = symbol.upper()
+    month_u = month.upper()
+    candidates: list[Path] = []
+    for p in input_dir.rglob("*.csv"):
+        name_u = p.name.upper()
+        if symbol_u in name_u and month_u in name_u:
+            candidates.append(p)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda p: str(p).upper())[0]
 
 
 def signal(c: Candle, rule: str, inverted: bool) -> int:
@@ -37,7 +56,6 @@ def frame_prediction(candles: list[Candle], i: int, rule: str, inverted: bool, m
     up = sum(v == 1 for v in votes)
     down = sum(v == -1 for v in votes)
     if mode == "2OF4":
-        # Simple majority: 2-2 is HOLD; with sparse zero signals, any strict side majority wins.
         return 1 if up > down else -1 if down > up else 0
     if mode == "3OF4":
         return 1 if up >= 3 else -1 if down >= 3 else 0
@@ -124,33 +142,61 @@ def backtest_symbol(candles: list[Candle], rule: str, inverted: bool, mode: str,
         peak = max(peak, capital)
         max_dd = max(max_dd, 100.0 * (peak - capital) / peak if peak else 0.0)
 
-    return {"final": capital, "return_pct": 100.0 * (capital / 250.0 - 1.0), "trades": trades, "wins": wins, "win_rate_pct": 100.0 * wins / trades if trades else 0.0, "fees": fees, "max_dd_pct": max_dd}
+    return {
+        "final": capital,
+        "return_pct": 100.0 * (capital / 250.0 - 1.0),
+        "trades": trades,
+        "wins": wins,
+        "win_rate_pct": 100.0 * wins / trades if trades else 0.0,
+        "fees": fees,
+        "max_dd_pct": max_dd,
+    }
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="R1-R16/inverses: 1h signal, 4h horizon, consensus strength comparison.")
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--test-month", default="2026-07")
-    ap.add_argument("--symbols", default="ALL")
+    ap.add_argument("--symbols", default=DEFAULT_SYMBOLS)
     ap.add_argument("--initial-capital", type=float, default=1000.0)
     ap.add_argument("--fee-side-pct", type=float, default=DEFAULT_FEE_SIDE_PCT)
-    ap.add_argument("--output", default="reports/july_r1_r16_1h_horizon4_consensus.csv")
+    ap.add_argument("--output", default=None, help="CSV output path; defaults to reports/r1_r16_1h_horizon4_consensus_<month>.csv")
     args = ap.parse_args()
 
     data_root = Path(args.input_dir)
-    symbols = discover_symbols(data_root, args.test_month) if args.symbols.upper() == "ALL" else [x.strip().upper() for x in args.symbols.split(",") if x.strip()]
+    if args.symbols.upper() == "ALL":
+        symbols = discover_symbols(data_root, args.test_month)
+        if not symbols:
+            symbols = [x.strip().upper() for x in DEFAULT_SYMBOLS.split(",") if x.strip()]
+    else:
+        symbols = [x.strip().upper() for x in args.symbols.split(",") if x.strip()]
+
     series: dict[str, list[Candle]] = {}
+    missing: list[str] = []
+    loaded_files: dict[str, str] = {}
     for symbol in symbols:
-        p = find_month_file(data_root, symbol, args.test_month)
+        p = find_requested_month_file(data_root, symbol, args.test_month)
         if not p:
+            missing.append(symbol)
             continue
         raw = load_binance(p)
         if len(raw) >= 10:
             series[symbol] = resample(raw, 60)
-    if not series:
-        raise RuntimeError("No 1m July data found for requested symbols.")
+            loaded_files[symbol] = p.name
 
-    print(f"JULY_R1_R16_1H_H4_CONSENSUS test={args.test_month} assets={len(series)} initial={args.initial_capital:.2f} fee={args.fee_side_pct:.3f}%/side")
+    if not series:
+        raise RuntimeError(
+            f"No 1m data found for test month {args.test_month} and symbols {','.join(symbols)}. "
+            "Check that the monthly CSV files exist under --input-dir."
+        )
+
+    print(
+        f"R1_R16_1H_H4_CONSENSUS test={args.test_month} assets={len(series)} "
+        f"initial={args.initial_capital:.2f} fee={args.fee_side_pct:.3f}%/side"
+    )
+    print("FILES " + " | ".join(f"{s}:{loaded_files[s]}" for s in sorted(loaded_files)))
+    if missing:
+        print("MISSING " + ",".join(missing))
     print("HORIZON=4h | SIGNAL=1h | CURRENT=1 candle | 2OF4=majority | 3OF4=at least 3 agree | 4OF4=all 4 agree")
     print("4-frame window=current + previous 3 completed 1h candles | NO indicators | NO ML | frozen R1-R16 | non-overlap, one position/symbol")
     print("RULE MODE VAR FINAL RET% ACC% TRADES WIN% DD% FEES")
@@ -183,15 +229,33 @@ def main() -> None:
                 acc = 100.0 * acc_num / acc_den if acc_den else 0.0
                 win = 100.0 * wins / trades if trades else 0.0
                 print(f"{rule:>4} {mode:>4} {variant:>3} {total_final:>7.2f} {ret:>+6.2f} {acc:>5.2f} {trades:>6} {win:>6.2f} {dd:>5.2f} {fees:>7.2f}")
-                rows.append({"rule": rule, "mode": mode, "variant": variant, "initial_capital": args.initial_capital, "final_capital": total_final, "return_pct": ret, "directional_accuracy_pct": acc, "trades": trades, "win_rate_pct": win, "max_dd_pct": dd, "fees_paid": fees, "test_month": args.test_month, "fee_side_pct": args.fee_side_pct})
+                rows.append({
+                    "rule": rule,
+                    "mode": mode,
+                    "variant": variant,
+                    "initial_capital": args.initial_capital,
+                    "final_capital": total_final,
+                    "return_pct": ret,
+                    "directional_accuracy_pct": acc,
+                    "trades": trades,
+                    "win_rate_pct": win,
+                    "max_dd_pct": dd,
+                    "fees_paid": fees,
+                    "test_month": args.test_month,
+                    "fee_side_pct": args.fee_side_pct,
+                })
 
-    out = Path(args.output)
+    if args.output:
+        out = Path(args.output)
+    else:
+        out = ROOT / "reports" / f"r1_r16_1h_horizon4_consensus_{args.test_month}.csv"
     if not out.is_absolute():
         out = ROOT / out
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        w.writeheader(); w.writerows(rows)
+        w.writeheader()
+        w.writerows(rows)
     print(f"SAVED {out.relative_to(ROOT)} rows={len(rows)}")
 
 
