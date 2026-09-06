@@ -72,7 +72,7 @@ def extreme_signal(candles: list[Candle], i: int, window: int, move_bars: int, m
         return "HIGH"
     return ""
 
-def run_symbol(symbol: str, month: str, candles: list[Candle], window: int, move_bars: int, multiplier: float, horizon: int, capital: float, allocation: float, fee_roundtrip_pct: float) -> tuple[list[Trade], float, float]:
+def run_symbol(symbol: str, month: str, candles: list[Candle], window: int, move_bars: int, multiplier: float, horizon: int, capital: float, allocation: float, fee_roundtrip_pct: float, signal_filter: str = "ALL") -> tuple[list[Trade], float, float]:
     trades: list[Trade] = []
     peak = capital
     max_dd = 0.0
@@ -82,6 +82,8 @@ def run_symbol(symbol: str, month: str, candles: list[Candle], window: int, move
             continue
         sig = extreme_signal(candles, i, window, move_bars, multiplier)
         if sig not in ("LOW", "HIGH"):
+            continue
+        if signal_filter != "ALL" and sig != signal_filter:
             continue
         entry_idx = i + 1
         exit_idx = i + 1 + horizon
@@ -126,6 +128,7 @@ def main() -> None:
     ap.add_argument("--initial-capital", type=float, default=1000.0)
     ap.add_argument("--allocation", type=float, default=0.30)
     ap.add_argument("--fee-roundtrip-pct", type=float, default=0.26)
+    ap.add_argument("--side", choices=("ALL", "LOW", "HIGH"), default="ALL")
     ap.add_argument("--output", default="reports/extreme_move_backtest_trades.csv")
     args = ap.parse_args()
 
@@ -148,8 +151,8 @@ def main() -> None:
         ap.error("provide --prepared-file or --input-dir")
         return
 
-    print(f"EXTREME_MOVE_BACKTEST source={source_mode} tf={args.timeframe}m W={args.window} M={args.move_bars} X={args.multiplier:.2f} alloc={args.allocation:.0%} fee={args.fee_roundtrip_pct:.2f}%")
-    print("LOW -> LONG | HIGH -> SHORT | entry=next candle open | exit=close after H bars | one active trade per symbol")
+    print(f"EXTREME_MOVE_BACKTEST source={source_mode} tf={args.timeframe}m W={args.window} M={args.move_bars} X={args.multiplier:.2f} SIDE={args.side} alloc={args.allocation:.0%} fee={args.fee_roundtrip_pct:.2f}%")
+    print("LOW -> LONG | HIGH -> SHORT | entry=next candle open | exit=close after H bars | one active trade per symbol | capital carries month-to-month")
 
     all_rows: list[dict] = []
     for horizon in horizons:
@@ -164,7 +167,7 @@ def main() -> None:
                 candles = cache[(symbol, month)]
                 if not candles:
                     continue
-                trades, symbol_final, dd = run_symbol(symbol, month, candles, args.window, args.move_bars, args.multiplier, horizon, symbol_final, args.allocation, args.fee_roundtrip_pct)
+                trades, symbol_final, dd = run_symbol(symbol, month, candles, args.window, args.move_bars, args.multiplier, horizon, symbol_final, args.allocation, args.fee_roundtrip_pct, args.side)
                 symbol_trades.extend(trades)
                 all_trades.extend(trades)
                 symbol_dd = max(symbol_dd, dd)
