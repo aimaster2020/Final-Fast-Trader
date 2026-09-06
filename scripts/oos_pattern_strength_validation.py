@@ -175,7 +175,7 @@ def main() -> None:
         total_n = sum(r["n"] for r in rs)
         ranked.append((pos, mean, total_n, key, rs))
     for pos, mean, total_n, key, rs in sorted(ranked, key=lambda x: (-x[0], -x[1], -x[2]))[: args.top]:
-        print(f"{key[0]}|BODY={key[1]}|RANGE={key[2]}|POS={key[3]} {key[1] if False else ''} side={rs[0]['side']} positive_targets={pos}/{len(rs)} mean_oos_net={mean:+.3f}% total_test_n={total_n}")
+        print(f"{key[0]}|BODY={key[1]}|RANGE={key[2]}|POS={key[3]} side={rs[0]['side']} positive_targets={pos}/{len(rs)} mean_oos_net={mean:+.3f}% total_test_n={total_n}")
 
 
 if __name__ == "__main__":
