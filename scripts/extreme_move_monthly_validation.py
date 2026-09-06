@@ -30,8 +30,8 @@ def signal(rows: list[dict], i: int, window: int, move_bars: int, multiplier: fl
     return "LOW" if low else "HIGH" if high else ""
 
 
-def run(rows: list[dict], window: int, move_bars: int, multiplier: float, horizon: int, allocation: float, fee_rt: float):
-    capital = 1000.0
+def run(rows: list[dict], window: int, move_bars: int, multiplier: float, horizon: int, allocation: float, fee_rt: float, initial_capital: float, side_filter: str):
+    capital = initial_capital
     peak = capital
     max_dd = 0.0
     trades = []
@@ -41,7 +41,9 @@ def run(rows: list[dict], window: int, move_bars: int, multiplier: float, horizo
         if i <= active_until:
             continue
         sig = signal(rows, i, window, move_bars, multiplier)
-        if not sig:
+        if sig not in ("LOW", "HIGH"):
+            continue
+        if side_filter != "ALL" and sig != side_filter:
             continue
         entry_i = i + 1
         exit_i = i + 1 + horizon
@@ -75,6 +77,8 @@ def main() -> None:
     ap.add_argument("--horizon", type=int, default=3)
     ap.add_argument("--allocation", type=float, default=0.30)
     ap.add_argument("--fee-roundtrip-pct", type=float, default=0.26)
+    ap.add_argument("--side", choices=("ALL", "LOW", "HIGH"), default="ALL")
+    ap.add_argument("--initial-capital", type=float, default=1000.0)
     ap.add_argument("--output", default="reports/extreme_move_monthly_validation.csv")
     args = ap.parse_args()
 
@@ -91,22 +95,27 @@ def main() -> None:
     for rows in grouped.values():
         rows.sort(key=lambda r: int(r["timestamp"]))
 
-    print(f"EXTREME_MOVE_MONTHLY_VALIDATION W={args.window} M={args.move_bars} X={args.multiplier:.2f} H={args.horizon} alloc={args.allocation:.0%} fee={args.fee_roundtrip_pct:.2f}%")
+    print(f"EXTREME_MOVE_MONTHLY_VALIDATION W={args.window} M={args.move_bars} X={args.multiplier:.2f} H={args.horizon} SIDE={args.side} alloc={args.allocation:.0%} fee={args.fee_roundtrip_pct:.2f}%")
     print("SYMBOL MONTH       T    WIN       PNL     FINAL     PF     DD    FEES")
     print("-----------------------------------------------------------------------")
     combined = []
+    combined_initial = args.initial_capital * len(grouped)
+    combined_final = combined_initial
     for symbol in sorted(grouped):
         by_month: dict[str, list[dict]] = defaultdict(list)
         for r in grouped[symbol]:
             by_month[r["month"]].append(r)
-        symbol_capital = 1000.0
+        symbol_capital = args.initial_capital
         for month in sorted(by_month):
-            final, dd, n, win, pf, fees, trades = run(by_month[month], args.window, args.move_bars, args.multiplier, args.horizon, args.allocation, args.fee_roundtrip_pct)
-            pnl = final - 1000.0
-            symbol_capital += pnl
+            month_initial = symbol_capital
+            final, dd, n, win, pf, fees, trades = run(by_month[month], args.window, args.move_bars, args.multiplier, args.horizon, args.allocation, args.fee_roundtrip_pct, month_initial, args.side)
+            symbol_capital = final
             combined.extend((symbol, month, t["signal"], t["pnl"], t["fee"]) for t in trades)
-            print(f"{symbol:7} {month:10} {n:4d} {win:6.1f}% {pnl:+9.2f} {symbol_capital:9.2f} {pf:6.2f} {dd:6.2f}% {fees:7.2f}")
+            print(f"{symbol:7} {month:10} {n:4d} {win:6.1f}% {final-month_initial:+9.2f} {symbol_capital:9.2f} {pf:6.2f} {dd:6.2f}% {fees:7.2f}")
+        combined_final += symbol_capital - args.initial_capital
 
+    total_pnl = combined_final - combined_initial
+    print(f"TOTAL PNL={total_pnl:+.2f} FINAL={combined_final:.2f} RET={(combined_final/combined_initial-1)*100:+.2f}% SIDE={args.side}")
     print("DONE")
     out = Path(args.output)
     if not out.is_absolute():
