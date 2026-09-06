@@ -41,7 +41,7 @@ def _parse_rows(reader) -> list[Candle]:
 
 
 def load_binance_archive(path: Path) -> list[Candle]:
-    """Load Binance CSV, CSV.GZ, or ZIP(CSV), returning normalized 1m candles."""
+    """Load Binance CSV, CSV.GZ, or ZIP(CSV), returning normalized candles."""
     suffixes = [s.lower() for s in path.suffixes]
     if path.suffix.lower() == ".zip":
         with zipfile.ZipFile(path) as zf:
@@ -54,45 +54,63 @@ def load_binance_archive(path: Path) -> list[Candle]:
     if ".gz" in suffixes:
         with gzip.open(path, "rt", encoding="utf-8-sig", newline="") as f:
             return _parse_rows(csv.reader(f))
-    return _parse_rows(csv.reader(path.open("r", encoding="utf-8-sig", newline="")))
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        return _parse_rows(csv.reader(f))
 
 
 def month_of_ts(ts: int) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m")
 
 
-def find_requested_month_files(input_dir: Path, symbol: str, month: str) -> list[Path]:
-    """Find all files for symbol/month, including Binance daily ZIP archives."""
+def _candidate_files(input_dir: Path, symbol: str) -> list[Path]:
+    """Find all plausible Binance files for a symbol, independent of filename date."""
     symbol_u = symbol.upper()
-    month_u = month.upper()
     candidates: list[Path] = []
     for p in input_dir.rglob("*"):
         if not p.is_file():
             continue
         name_u = p.name.upper()
-        if symbol_u not in name_u or month_u not in name_u:
+        if symbol_u not in name_u:
             continue
-        if not (name_u.endswith(".CSV") or name_u.endswith(".CSV.GZ") or name_u.endswith(".ZIP")):
-            continue
-        candidates.append(p)
+        if name_u.endswith(".CSV") or name_u.endswith(".CSV.GZ") or name_u.endswith(".ZIP"):
+            candidates.append(p)
     return sorted(candidates, key=lambda p: str(p).upper())
 
 
+def find_requested_month_files(input_dir: Path, symbol: str, month: str) -> list[Path]:
+    """Prefer filename matches, then fall back to all symbol archives."""
+    symbol_u = symbol.upper()
+    month_u = month.upper()
+    all_files = _candidate_files(input_dir, symbol)
+    direct = [p for p in all_files if month_u in p.name.upper()]
+    return direct + [p for p in all_files if p not in direct]
+
+
 def load_requested_month(input_dir: Path, symbol: str, month: str) -> tuple[list[Candle], list[str]]:
-    """Load all matching archive files and keep only candles whose UTC timestamp belongs to month."""
+    """Load candidate archives and keep only candles whose UTC timestamp belongs to month."""
     files = find_requested_month_files(input_dir, symbol, month)
     candles: list[Candle] = []
     used: list[str] = []
+
     for path in files:
         try:
             raw = load_binance_archive(path)
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
             print(f"SKIP {symbol} {path.name}: {exc}")
             continue
+
+        if not raw:
+            continue
         matched = [c for c in raw if month_of_ts(c.timestamp) == month]
         if matched:
             candles.extend(matched)
             used.append(path.name)
+
+        # Daily/monthly Binance archives are normally self-contained. Once we have
+        # substantial coverage for the requested month, do not keep scanning old files.
+        if matched and len(candles) >= 100_000:
+            break
+
     candles.sort(key=lambda c: c.timestamp)
     return candles, used
 
@@ -108,7 +126,6 @@ def frame_prediction(candles: list[Candle], i: int, rule: str, inverted: bool, m
     if mode == "CURRENT":
         return signal(candles[i], rule, inverted)
 
-    # Four latest completed 1h candles: current candle + previous 3.
     votes = [signal(candles[j], rule, inverted) for j in range(i - 3, i + 1)]
     votes = [x for x in votes if x]
     if not votes:
