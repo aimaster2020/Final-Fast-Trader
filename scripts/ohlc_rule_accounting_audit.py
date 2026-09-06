@@ -311,10 +311,15 @@ def main() -> None:
                     help="retained for CLI compatibility; not used to score rules")
     ap.add_argument("--fee-per-side", type=float, default=FEE_PER_SIDE,
                     help="retained for CLI compatibility; not used to score rules")
-    ap.add_argument("--threshold", type=float, default=1.0)
+    ap.add_argument("--threshold", type=float, default=0.5, help="single threshold; used when --thresholds is omitted")
+    ap.add_argument("--thresholds", default=None, help="comma-separated thresholds, e.g. 0.25,0.5,0.75,1.0")
     ap.add_argument("--output", default="reports/ohlc_rule_diagnostics.csv")
     args = ap.parse_args()
 
+    thresholds = (
+        [float(x) for x in args.thresholds.split(",") if x.strip()]
+        if args.thresholds else [args.threshold]
+    )
     rows: list[dict] = []
     for symbol in [x.strip() for x in args.symbols.split(",") if x.strip()]:
         path = find_month_file(Path(args.input_dir), symbol, args.month)
@@ -328,28 +333,29 @@ def main() -> None:
                 print(f"{symbol}|{tf}m|NO_COMPLETE_CANDLES")
                 continue
 
-            for i in range(1, 17):
-                rule = f"R{i}"
-                d = evaluate_rule_diagnostic(candles, rule, args.threshold)
-                d.update({
-                    "symbol": symbol,
-                    "month": args.month,
-                    "timeframe_min": tf,
-                })
-                rows.append(d)
-                print(
-                    f"{symbol}|{tf}m|{rule}|"
-                    f"purpose={d['what_it_is_good_for']}|"
-                    f"coverage={d['signal_coverage_pct']:.2f}%|"
-                    f"samples={d['conditional_samples']}|"
-                    f"h1={d['conditional_hit_rate_1_pct']:.1f}%|"
-                    f"h3={d['conditional_hit_rate_3_pct']:.1f}%|"
-                    f"h6={d['conditional_hit_rate_6_pct']:.1f}%|"
-                    f"corr={d['feature_next_return_correlation']:.4f}|"
-                    f"obs={d['observed_behavior']}|"
-                    f"follow={d['follow_through_observed']}|"
-                    f"excursion={d['excursion_behavior']}"
-                )
+            for threshold in thresholds:
+                for i in range(1, 17):
+                    rule = f"R{i}"
+                    d = evaluate_rule_diagnostic(candles, rule, threshold)
+                    d.update({
+                        "symbol": symbol,
+                        "month": args.month,
+                        "timeframe_min": tf,
+                    })
+                    rows.append(d)
+                    print(
+                        f"{symbol}|{tf}m|threshold={threshold:g}|{rule}|"
+                        f"purpose={d['what_it_is_good_for']}|"
+                        f"coverage={d['signal_coverage_pct']:.2f}%|"
+                        f"samples={d['conditional_samples']}|"
+                        f"h1={d['conditional_hit_rate_1_pct']:.1f}%|"
+                        f"h3={d['conditional_hit_rate_3_pct']:.1f}%|"
+                        f"h6={d['conditional_hit_rate_6_pct']:.1f}%|"
+                        f"corr={d['feature_next_return_correlation']:.4f}|"
+                        f"obs={d['observed_behavior']}|"
+                        f"follow={d['follow_through_observed']}|"
+                        f"excursion={d['excursion_behavior']}"
+                    )
 
     if not rows:
         raise SystemExit("No input data found")
@@ -372,6 +378,7 @@ def main() -> None:
                     "month": args.month,
                     "timeframe_min": tf,
                     "rule": r["rule"],
+                    "threshold": r["threshold"],
                     "rule_role": r["rule_role"],
                     "what_it_is_good_for": r["what_it_is_good_for"],
                     "observed_behavior": r["observed_behavior"],
