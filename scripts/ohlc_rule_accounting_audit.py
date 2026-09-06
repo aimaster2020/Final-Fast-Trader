@@ -406,30 +406,19 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    # Human-readable rule diagnostics, deliberately without ranking.
-    diag_path = out.with_name(out.stem + "_diagnostics.csv")
+    # Human-readable rule diagnostics. No ranking and no "winner" field.
+    # This report explains the observed behavior of each rule instead.
     groups: dict[tuple[str, int, str], dict[str, dict]] = {}
     for row in rows:
-        groups.setdefault((row["symbol"], int(row["timeframe_min"]), row["rule"]), {})[row["direction"]] = row
+        groups.setdefault(
+            (row["symbol"], int(row["timeframe_min"]), row["rule"]), {}
+        )[row["direction"]] = row
 
     diag_rows: list[dict] = []
     for (symbol, tf, rule), group in groups.items():
         both = group.get("BOTH")
-        long = group.get("LONG_ONLY")
-        short = group.get("SHORT_ONLY")
-        if not both or not long or not short:
+        if not both:
             continue
-        lr = float(long["return_pct"])
-        sr = float(short["return_pct"])
-        br = float(both["return_pct"])
-        if lr > 0 and sr <= 0:
-            observed_use = "LONG_BIAS"
-        elif sr > 0 and lr <= 0:
-            observed_use = "SHORT_BIAS"
-        elif lr > 0 and sr > 0:
-            observed_use = "DIRECTIONAL_SIGNAL_BOTH_SIDES"
-        else:
-            observed_use = "NO_STANDALONE_EDGE"
 
         diag_rows.append({
             "symbol": symbol,
@@ -437,29 +426,36 @@ def main() -> None:
             "timeframe_min": tf,
             "rule": rule,
             "rule_role": RULE_ROLE[rule],
-            "observed_use": observed_use,
-            "both_return_pct": br,
-            "long_return_pct": lr,
-            "short_return_pct": sr,
-            "both_max_drawdown_pct": float(both["max_drawdown_pct"]),
-            "long_max_drawdown_pct": float(long["max_drawdown_pct"]),
-            "short_max_drawdown_pct": float(short["max_drawdown_pct"]),
-            "both_net_pf": both["net_profit_factor"],
-            "long_net_pf": long["net_profit_factor"],
-            "short_net_pf": short["net_profit_factor"],
-            "both_liquidations": int(both["liquidations"]),
-            "long_liquidations": int(long["liquidations"]),
-            "short_liquidations": int(short["liquidations"]),
-            "both_trades": int(both["completed_trades"]),
-            "long_trades": int(long["completed_trades"]),
-            "short_trades": int(short["completed_trades"]),
-            "reconciliation_ok": bool(both["reconciliation_ok"] and long["reconciliation_ok"] and short["reconciliation_ok"]),
+            "diagnostic": both["diagnostic"],
+            "what_it_is_good_for": (
+                "UP/DOWN directional signal"
+                if both["diagnostic"] in {"UPWARD_EDGE_OBSERVED", "DOWNWARD_EDGE_OBSERVED"}
+                else "NO_STANDALONE_USE_FOUND"
+            ),
+            "signals": int(both["signals"]),
+            "signal_coverage_pct": float(both["signal_coverage_pct"]),
+            "prediction_samples": int(both["prediction_samples"]),
+            "directional_hit_rate_pct": float(both["directional_hit_rate_pct"]),
+            "mean_next_candle_return_pct": float(both["mean_next_candle_return_pct"]),
+            "median_next_candle_return_pct": float(both["median_next_candle_return_pct"]),
+            "mean_favorable_excursion_pct": float(both["mean_favorable_excursion_pct"]),
+            "mean_adverse_excursion_pct": float(both["mean_adverse_excursion_pct"]),
+            "buy_signals": int(both["buy_signals"]),
+            "sell_signals": int(both["sell_signals"]),
+            "hold_candles": int(both["hold_candles"]),
+            "accounting_reconciliation_ok": bool(both["reconciliation_ok"]),
+            "execution_return_pct_reference_only": float(both["return_pct"]),
+            "execution_max_drawdown_pct_reference_only": float(both["max_drawdown_pct"]),
+            "execution_liquidations_reference_only": int(both["liquidations"]),
         })
 
-    with diag_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(diag_rows[0]))
-        writer.writeheader()
-        writer.writerows(diag_rows)
+    diag_path = out.with_name(out.stem + "_diagnostics.csv")
+    if diag_rows:
+        with diag_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(diag_rows[0]))
+            writer.writeheader()
+            writer.writerows(diag_rows)
+
 
 
 if __name__ == "__main__":
