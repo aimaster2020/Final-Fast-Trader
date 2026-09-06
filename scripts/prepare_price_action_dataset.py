@@ -28,11 +28,12 @@ def month_bounds(month: str) -> tuple[int, int]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Prepare a compact reusable 1H OHLC dataset from Binance archives.")
+    ap = argparse.ArgumentParser(description="Prepare a compact reusable OHLC dataset from Binance archives.")
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--symbols", default=DEFAULT_SYMBOLS)
     ap.add_argument("--months", default=DEFAULT_MONTHS)
-    ap.add_argument("--output", default="reports/prepared_price_action_1h.csv")
+    ap.add_argument("--timeframe", type=int, default=60, help="Target timeframe in minutes, e.g. 5 or 60.")
+    ap.add_argument("--output", default=None)
     args = ap.parse_args()
 
     symbols = [x.strip().upper() for x in args.symbols.split(",") if x.strip()]
@@ -40,12 +41,17 @@ def main() -> None:
     input_dir = Path(args.input_dir)
     rows: list[dict] = []
 
+    if args.timeframe <= 0:
+        ap.error("--timeframe must be positive")
+
+    output = args.output or f"reports/prepared_price_action_{args.timeframe}m.csv"
+
     for month in months:
         start_ts, end_ts = month_bounds(month)
         for symbol in symbols:
             raw, used = load_range(input_dir, symbol, start_ts, end_ts)
-            candles = resample([Candle(ts, o, h, l, c, v) for ts, o, h, l, c, v in raw], 60)
-            print(f"{symbol} {month}: raw_1m={len(raw):,} 1h={len(candles):,} files={len(used)}")
+            candles = resample([Candle(ts, o, h, l, c, v) for ts, o, h, l, c, v in raw], args.timeframe)
+            print(f"{symbol} {month}: raw_1m={len(raw):,} tf={args.timeframe}m={len(candles):,} files={len(used)}")
             for c in candles:
                 rows.append({
                     "symbol": symbol,
@@ -59,7 +65,7 @@ def main() -> None:
                 })
 
     rows.sort(key=lambda r: (r["timestamp"], r["symbol"]))
-    out = Path(args.output)
+    out = Path(output)
     if not out.is_absolute():
         out = ROOT / out
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -69,7 +75,7 @@ def main() -> None:
         w.writeheader()
         w.writerows(rows)
 
-    print(f"PREPARED {out.relative_to(ROOT)} rows={len(rows):,}")
+    print(f"PREPARED {out.relative_to(ROOT)} rows={len(rows):,} timeframe={args.timeframe}m")
 
 
 if __name__ == "__main__":
