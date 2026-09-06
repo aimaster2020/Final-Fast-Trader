@@ -37,99 +37,133 @@ def direction_name(d: int) -> str:
     return "LONG" if d == 1 else "SHORT" if d == -1 else "HOLD"
 
 
-def evaluate_dataset(candles: list[Candle]) -> tuple[list[dict], dict]:
-    """Sequential confirmation: R1 at t, R2 at t+1, ... Rn at t+n-1.
+def next_direction(candles: list[Candle], i: int) -> int:
+    if i + 1 >= len(candles):
+        return 0
+    if candles[i + 1].close > candles[i].close:
+        return 1
+    if candles[i + 1].close < candles[i].close:
+        return -1
+    return 0
 
-    A chain is valid only when every rule in the prefix emits the same
-    direction. Entry is taken on the candle where the last rule confirms.
-    For every completed chain, all 16 R signals on the entry candle are also
-    scored against the next candle direction.
+
+def evaluate_dataset(candles: list[Candle]) -> tuple[list[dict], dict]:
+    """Trigger -> entry -> independent confirmation attribution.
+
+    R1 is the trigger. When R1 is active at t, its signed direction opens a
+    virtual trade. R2..R16 are then evaluated independently on t+1..t+15.
+    A disagreement never cancels the trade and never removes earlier results.
+
+    For every stage we measure two different things:
+      - confirm_pct: did Rn agree with the original trade direction?
+      - accuracy_pct: did Rn predict the next candle correctly?
+
+    We also track conditional accuracy: Rn's prediction accuracy after all
+    previous stages happened to confirm the original trade direction.
     """
     signs = [rule_signs(c) for c in candles]
     rows: list[dict] = []
-    step_stats = {
-        step: {"entries": 0, "correct": 0}
+    stage_stats = {
+        step: {
+            "opportunities": 0,
+            "active": 0,
+            "confirm": 0,
+            "correct": 0,
+            "cond_active": 0,
+            "cond_correct": 0,
+        }
         for step in range(1, len(RULES) + 1)
     }
-    rule_stats = {
-        rule: {"active": 0, "correct": 0, "long": 0, "short": 0}
-        for rule in RULES
-    }
+    trigger_entries = 0
 
-    # Step k means R1..Rk confirmed sequentially on consecutive candles.
-    for start in range(len(candles) - len(RULES)):
-        direction = 0
-        valid = True
-        completed_steps: list[int] = []
-        for j, rule in enumerate(RULES):
-            s = signs[start + j][rule]
-            if not s:
-                valid = False
-                break
-            if direction == 0:
-                direction = s
-            elif s != direction:
-                valid = False
-                break
-            completed_steps.append(j + 1)
+    # R1 at t is the trigger. Rn is evaluated at t+(n-1).
+    for entry_i in range(len(candles) - len(RULES)):
+        trigger = signs[entry_i]["R1"]
+        if not trigger:
+            continue
 
-        # Record each prefix independently. A failed later filter does not
-        # erase the accuracy of earlier confirmations.
-        for step in completed_steps:
-            entry_i = start + step - 1
-            if entry_i >= len(candles) - 1:
-                continue
-            realized = 1 if candles[entry_i + 1].close > candles[entry_i].close else -1 if candles[entry_i + 1].close < candles[entry_i].close else 0
+        trigger_entries += 1
+        prior_confirmations = True
+
+        for step, rule in enumerate(RULES, start=1):
+            i = entry_i + step - 1
+            if i >= len(candles) - 1:
+                break
+
+            s = signs[i][rule]
+            realized = next_direction(candles, i)
             if not realized:
                 continue
-            s = direction
-            step_stats[step]["entries"] += 1
-            step_stats[step]["correct"] += int(s == realized)
 
-            # Snapshot of every R at the actual entry candle for attribution.
-            entry_signs = signs[entry_i]
-            for rule in RULES:
-                rs = entry_signs[rule]
-                if not rs:
-                    continue
-                rule_stats[rule]["active"] += 1
-                rule_stats[rule]["correct"] += int(rs == realized)
-                rule_stats[rule]["long"] += int(rs == 1)
-                rule_stats[rule]["short"] += int(rs == -1)
+            st = stage_stats[step]
+            st["opportunities"] += 1
 
-            rows.append({
-                "entry_index": entry_i,
-                "chain_step": step,
-                "direction": direction_name(direction),
-                "realized": direction_name(realized),
-                "correct": int(direction == realized),
-            })
+            if s:
+                st["active"] += 1
+                st["confirm"] += int(s == trigger)
+                st["correct"] += int(s == realized)
 
-    return rows, {"step": step_stats, "rule": rule_stats}
+                if prior_confirmations:
+                    st["cond_active"] += 1
+                    st["cond_correct"] += int(s == realized)
+
+                rows.append({
+                    "entry_index": entry_i,
+                    "stage": step,
+                    "rule": rule,
+                    "stage_index": i,
+                    "trigger_direction": direction_name(trigger),
+                    "rule_direction": direction_name(s),
+                    "realized_next": direction_name(realized),
+                    "confirmed": int(s == trigger),
+                    "correct": int(s == realized),
+                    "prior_confirmed": int(prior_confirmations),
+                })
+
+            # A rejection does not kill the trade, but it means later
+            # conditional results are no longer "after all prior confirms".
+            if s != trigger:
+                prior_confirmations = False
+
+    return rows, {"trigger_entries": trigger_entries, "stage": stage_stats}
 
 
 def aggregate(datasets: list[list[Candle]]) -> tuple[list[dict], dict]:
     all_rows: list[dict] = []
-    total_step = {step: {"entries": 0, "correct": 0} for step in range(1, 17)}
-    total_rule = {rule: {"active": 0, "correct": 0, "long": 0, "short": 0} for rule in RULES}
+    total = {
+        "trigger_entries": 0,
+        "stage": {
+            step: {
+                "opportunities": 0,
+                "active": 0,
+                "confirm": 0,
+                "correct": 0,
+                "cond_active": 0,
+                "cond_correct": 0,
+            }
+            for step in range(1, 17)
+        },
+    }
+
     for candles in datasets:
         rows, stats = evaluate_dataset(candles)
         all_rows.extend(rows)
-        for step in total_step:
-            for k in total_step[step]:
-                total_step[step][k] += stats["step"][step][k]
-        for rule in RULES:
-            for k in total_rule[rule]:
-                total_rule[rule][k] += stats["rule"][rule][k]
-    return all_rows, {"step": total_step, "rule": total_rule}
+        total["trigger_entries"] += stats["trigger_entries"]
+        for step in total["stage"]:
+            for key in total["stage"][step]:
+                total["stage"][step][key] += stats["stage"][step][key]
+
+    return all_rows, total
 
 
-def pct(correct: int, n: int) -> float:
-    return correct / n * 100.0 if n else 0.0
+def pct(n: int, d: int) -> float:
+    return n / d * 100.0 if d else 0.0
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Sequential R1->R16 confirmation-chain accuracy test.")
+    ap = argparse.ArgumentParser(
+        description="July R1-triggered sequential confirmation attribution test."
+    )
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--test-month", default="2026-07")
     ap.add_argument("--symbols", default="ALL")
@@ -145,7 +179,7 @@ def main() -> None:
         symbols = [x.strip().upper() for x in args.symbols.split(",") if x.strip()]
 
     rows_out: list[dict] = []
-    print(f"R_CHAIN month={args.test_month} assets={len(symbols)} tfs={','.join(map(str,tfs))}")
+    print(f"R_CONFIRM month={args.test_month} assets={len(symbols)} tfs={','.join(map(str,tfs))}")
 
     for tf in tfs:
         datasets: list[list[Candle]] = []
@@ -164,25 +198,37 @@ def main() -> None:
             r["timeframe_min"] = tf
         rows_out.extend(rows)
 
-        print(f"\nTF={tf}m STEP_CONFIRMATION")
+        print(f"\nTF={tf}m TRIGGER_ENTRIES={stats['trigger_entries']}")
+        print("STEP RULE OPPORT ACTIVE CONFIRM% ACCURACY% COND_ACC%")
         for step in range(1, 17):
-            s = stats["step"][step]
-            print(f"S{step:<2} R1..R{step:<2} {pct(s['correct'],s['entries']):6.2f}% / {s['entries']}")
-
-        print(f"TF={tf}m ENTRY_SNAPSHOT_R_ACCURACY")
-        parts = []
-        for rule in RULES:
-            s = stats["rule"][rule]
-            parts.append(f"{rule}:{pct(s['correct'],s['active']):.2f}%/{s['active']}")
-        print(" | ".join(parts))
+            s = stats["stage"][step]
+            print(
+                f"S{step:<2} {RULES[step-1]:<3} {s['opportunities']:<10} "
+                f"{s['active']:<6} {pct(s['confirm'],s['active']):6.2f} "
+                f"{pct(s['correct'],s['active']):7.2f} "
+                f"{pct(s['cond_correct'],s['cond_active']):7.2f}"
+            )
 
     p = Path(args.output)
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("w", newline="", encoding="utf-8") as f:
-        fields = ["timeframe_min", "entry_index", "chain_step", "direction", "realized", "correct"]
+        fields = [
+            "timeframe_min",
+            "entry_index",
+            "stage",
+            "rule",
+            "stage_index",
+            "trigger_direction",
+            "rule_direction",
+            "realized_next",
+            "confirmed",
+            "correct",
+            "prior_confirmed",
+        ]
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows_out)
+
     print(f"SAVED {p} rows={len(rows_out)}")
 
 
