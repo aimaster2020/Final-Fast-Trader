@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
 from collections import defaultdict
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from fast_pattern_trader.models import Candle
 from scripts.ohlc_rule_isolation_monthly import (
