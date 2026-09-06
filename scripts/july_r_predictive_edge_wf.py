@@ -125,7 +125,12 @@ def main():
         (name, s) for name, s in train.items() if s["signals"] >= args.min_train_signals
     ]
     ranked = sorted(eligible, key=lambda x: (metric(x[1]), x[1]["signals"]), reverse=True)
-    selected = dict(ranked[: args.top_n])
+
+    # Keep candidate definitions separate from their train statistics.
+    # The previous version accidentally passed the stats dict as the rule tuple,
+    # which caused KeyError: 'signals' during the test evaluation.
+    selected_names = [name for name, _ in ranked[: args.top_n]]
+    selected = {name: candidates[name] for name in selected_names}
 
     test = aggregate_eval([x[2] for x in test_sets], selected)
     rows = []
