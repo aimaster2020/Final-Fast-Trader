@@ -55,13 +55,13 @@ def run(rows: list[dict], window: int, move_bars: int, multiplier: float, horizo
         capital += pnl
         peak = max(peak, capital)
         max_dd = max(max_dd, (peak - capital) / peak * 100.0)
-        trades.append((rows[i]["month"], sig, pnl, fee))
+        trades.append({"month": rows[i]["month"], "signal": sig, "pnl": pnl, "fee": fee})
         active_until = exit_i
-    wins = sum(p > 0 for _, _, p, _ in trades)
-    gross_profit = sum(p for _, _, p, _ in trades if p > 0)
-    gross_loss = -sum(p for _, _, p, _ in trades if p < 0)
+    wins = sum(t["pnl"] > 0 for t in trades)
+    gross_profit = sum(t["pnl"] for t in trades if t["pnl"] > 0)
+    gross_loss = -sum(t["pnl"] for t in trades if t["pnl"] < 0)
     pf = gross_profit / gross_loss if gross_loss else (float("inf") if gross_profit else 0.0)
-    return capital, max_dd, len(trades), wins / len(trades) * 100 if trades else 0.0, pf, sum(f for _, _, _, f in trades), trades
+    return capital, max_dd, len(trades), wins / len(trades) * 100 if trades else 0.0, pf, sum(t["fee"] for t in trades), trades
 
 
 def main() -> None:
@@ -103,9 +103,8 @@ def main() -> None:
         for month in sorted(by_month):
             final, dd, n, win, pf, fees, trades = run(by_month[month], args.window, args.move_bars, args.multiplier, args.horizon, args.allocation, args.fee_roundtrip_pct)
             pnl = final - 1000.0
-            # Carry monthly P&L onto the symbol's running capital for a separate compact view.
             symbol_capital += pnl
-            combined.extend((symbol, month, *x) for x in trades)
+            combined.extend((symbol, month, t["signal"], t["pnl"], t["fee"]) for t in trades)
             print(f"{symbol:7} {month:10} {n:4d} {win:6.1f}% {pnl:+9.2f} {symbol_capital:9.2f} {pf:6.2f} {dd:6.2f}% {fees:7.2f}")
 
     print("DONE")
