@@ -79,8 +79,8 @@ def parse_set(label: str) -> tuple[str, str, list[dict]]:
 def load_frozen_candidates(path: Path) -> list[dict]:
     if not path.exists():
         raise FileNotFoundError(
-            f"Frozen V6 candidate file not found: {path}. Run the original V6 characterization first "
-            "or pass --candidates with its CSV path."
+            f"Frozen V6 candidate file not found: {path}. "
+            "Expected the V6 characterization CSV produced before this aggregate test."
         )
     out = []
     seen = set()
@@ -197,18 +197,27 @@ def main():
     ap.add_argument("--output", default="reports/july_r_confirmation_v6_1m_aggregate_capital_v3.csv")
     args = ap.parse_args()
 
-    root = Path(args.input_dir)
+    data_root = Path(args.input_dir)
     tfs = [int(x) for x in args.timeframes.split(",") if x.strip()]
-    symbols = (sorted(discover_symbols(root, args.test_month))
+    symbols = (sorted(discover_symbols(data_root, args.test_month))
                if args.symbols.upper() == "ALL"
                else [x.strip().upper() for x in args.symbols.split(",") if x.strip()])
 
     from scripts.july_r_composite_walkforward import components, TESTS
 
-    candidates = load_frozen_candidates(root / args.candidates if not Path(args.candidates).is_absolute() else Path(args.candidates))
+    # IMPORTANT: candidate/output paths are repository-relative by default.
+    # The market-data directory is intentionally separate from the repository.
+    candidate_path = Path(args.candidates)
+    if not candidate_path.is_absolute():
+        candidate_path = ROOT / candidate_path
+    output_path = Path(args.output)
+    if not output_path.is_absolute():
+        output_path = ROOT / output_path
+
+    candidates = load_frozen_candidates(candidate_path)
     test = {}
     for s in symbols:
-        p = find_month_file(root, s, args.test_month)
+        p = find_month_file(data_root, s, args.test_month)
         if not p:
             continue
         cs = load_binance(p)
@@ -222,6 +231,7 @@ def main():
         f"V6_1M_FROZEN_AGGREGATE_CAPITAL_V3 test={args.test_month} assets={len(test)} "
         f"frozen_candidates={len(candidates)} tfs={','.join(map(str,tfs))} majority>{args.vote_majority:.1f}% initial={args.initial_capital:.2f}"
     )
+    print(f"CANDIDATES={candidate_path}")
     print("NO candidate discovery. NO train pass. NO optimization. Candidates are loaded once from the prior V6 CSV.")
     print("Pipeline: frozen V6 candidate -> 1m predictions -> block vote -> capital. Fees are reported at 1.3% per side.")
 
@@ -252,14 +262,13 @@ def main():
                 "fees_paid": r["fees"],
             })
 
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", newline="", encoding="utf-8") as f:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as f:
         fields = list(rows[0].keys()) if rows else ["tf"]
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)
-    print(f"SAVED {out} rows={len(rows)}")
+    print(f"SAVED {output_path} rows={len(rows)}")
 
 
 if __name__ == "__main__":
