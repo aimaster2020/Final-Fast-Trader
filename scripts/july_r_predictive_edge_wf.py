@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 from itertools import combinations
+from math import sqrt
 from pathlib import Path
 import sys
 
@@ -34,7 +35,7 @@ def rule_signs(candle):
 
 
 def make_candidates():
-    """Return every rule in normal and inverted orientation plus all pair variants."""
+    """Every rule normal/inverted plus every oriented pair."""
     candidates = {}
     for r in RULES:
         candidates[r] = ((r, 1),)
@@ -42,7 +43,6 @@ def make_candidates():
 
     oriented = [(r, d) for r in RULES for d in (1, -1)]
     for (a, da), (b, db) in combinations(oriented, 2):
-        # Same base rule in both orientations is intentionally excluded.
         if a == b:
             continue
         name = f"{a}{'' if da == 1 else '_INV'}+{b}{'' if db == 1 else '_INV'}"
@@ -95,6 +95,18 @@ def accuracy(s):
     return s["correct"] / s["signals"] * 100.0 if s["signals"] else 0.0
 
 
+def wilson_lower_pct(s, z=1.96):
+    """95% Wilson lower confidence bound, in percentage points."""
+    n = s["signals"]
+    if not n:
+        return 0.0
+    p = s["correct"] / n
+    denom = 1.0 + z * z / n
+    centre = p + z * z / (2.0 * n)
+    spread = z * sqrt((p * (1.0 - p) + z * z / (4.0 * n)) / n)
+    return 100.0 * (centre - spread) / denom
+
+
 def parse_tfs(raw: str) -> list[int]:
     values = [int(x.strip()) for x in raw.split(",") if x.strip()]
     return sorted(dict.fromkeys(values))
@@ -110,10 +122,12 @@ def main():
     ap.add_argument("--timeframes", default="5,15,30,60,120,240")
     ap.add_argument("--output", default="reports/july_r_accuracy_matrix.csv")
     ap.add_argument("--top-pairs", type=int, default=10)
+    ap.add_argument("--min-signals", default="100,300")
     args = ap.parse_args()
 
     input_dir = Path(args.input_dir)
     tfs = parse_tfs(args.timeframes)
+    min_signals = sorted({int(x.strip()) for x in args.min_signals.split(",") if x.strip() and int(x.strip()) > 0})
     if args.symbols.upper() == "ALL":
         symbols = sorted(discover_symbols(input_dir, args.test_month))
     else:
@@ -148,6 +162,7 @@ def main():
                 "kind": kind,
                 "signals": s["signals"],
                 "accuracy_pct": accuracy(s),
+                "wilson_lower_95_pct": wilson_lower_pct(s),
                 "long_pct": s["longs"] / s["signals"] * 100.0 if s["signals"] else 0.0,
                 "short_pct": s["shorts"] / s["signals"] * 100.0 if s["signals"] else 0.0,
                 "correct": s["correct"],
@@ -164,30 +179,27 @@ def main():
         w.writeheader()
         w.writerows(rows)
 
-    # Console is deliberately compact: all single rules are shown; only top pairs per TF.
     print(f"R_ACCURACY month={args.test_month} assets={len(symbols)} tfs={','.join(map(str, tfs))}")
     print("RULE      " + " ".join(f"{tf:>6}m" for tf in by_tf))
     for rule in RULES:
-        normal = " ".join(
-            f"{accuracy(by_tf[tf][rule]):6.2f}" if tf in by_tf else "   -- "
-            for tf in by_tf
-        )
-        inv = " ".join(
-            f"{accuracy(by_tf[tf][rule + '_INV']):6.2f}" if tf in by_tf else "   -- "
-            for tf in by_tf
-        )
+        normal = " ".join(f"{accuracy(by_tf[tf][rule]):6.2f}" for tf in by_tf)
+        inv = " ".join(f"{accuracy(by_tf[tf][rule + '_INV']):6.2f}" for tf in by_tf)
         print(f"{rule:<4} N {normal}")
         print(f"{rule:<4} I {inv}")
 
-    for tf in by_tf:
-        pairs = [
-            (name, s) for name, s in by_tf[tf].items()
-            if "+" in name and s["signals"] > 0
-        ]
-        pairs.sort(key=lambda x: (accuracy(x[1]), x[1]["signals"]), reverse=True)
-        print(f"PAIR_TOP tf={tf}m " + " | ".join(
-            f"{name}:{accuracy(s):.2f}%/{s['signals']}" for name, s in pairs[: args.top_pairs]
-        ))
+    for threshold in min_signals:
+        for tf in by_tf:
+            pairs = [
+                (name, s) for name, s in by_tf[tf].items()
+                if "+" in name and s["signals"] >= threshold
+            ]
+            # Rank by Wilson lower bound first; accuracy and sample count break ties.
+            pairs.sort(key=lambda x: (wilson_lower_pct(x[1]), accuracy(x[1]), x[1]["signals"]), reverse=True)
+            label = f"PAIR_WILSON{threshold}"
+            text = " | ".join(
+                f"{name}:{accuracy(s):.2f}%/{s['signals']}" for name, s in pairs[: args.top_pairs]
+            ) or "NONE"
+            print(f"{label} tf={tf}m {text}")
 
     print(f"SAVED {p} rows={len(rows)} candidates={len(candidates)}")
 
