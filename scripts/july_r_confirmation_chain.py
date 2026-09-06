@@ -47,19 +47,40 @@ def next_direction(candles: list[Candle], i: int) -> int:
     return 0
 
 
+def cumulative_signal(signals: list[int], trigger: int) -> int:
+    """Unweighted majority of active R signals, with trigger as tie-breaker.
+
+    No coefficient/weight is used. Inactive rules are ignored. If active
+    rules split evenly, the original trigger direction is retained rather
+    than manufacturing a HOLD, which keeps the sequential chain usable.
+    """
+    active = [s for s in signals if s]
+    if not active:
+        return 0
+    score = sum(active)
+    if score > 0:
+        return 1
+    if score < 0:
+        return -1
+    return trigger
+
+
 def evaluate_dataset(candles: list[Candle]) -> tuple[list[dict], dict]:
-    """Trigger -> entry -> independent confirmation attribution.
+    """R1 trigger followed by independent sequential confirmations.
 
-    R1 is the trigger. When R1 is active at t, its signed direction opens a
-    virtual trade. R2..R16 are then evaluated independently on t+1..t+15.
-    A disagreement never cancels the trade and never removes earlier results.
+    R1 at t opens a virtual prediction in its own direction. R2 is checked
+    one bar later, R3 two bars later, ... R16 fifteen bars later.
 
-    For every stage we measure two different things:
-      - confirm_pct: did Rn agree with the original trade direction?
-      - accuracy_pct: did Rn predict the next candle correctly?
+    The old implementation treated a disagreement as a permanent rejection,
+    which made conditional accuracy collapse to zero. This version keeps all
+    stages and separately reports:
+      1) individual rule accuracy;
+      2) agreement with the original R1 direction;
+      3) cumulative unweighted confirmation accuracy using R1..Rn.
 
-    We also track conditional accuracy: Rn's prediction accuracy after all
-    previous stages happened to confirm the original trade direction.
+    The cumulative signal is a majority vote of active rules seen so far, with
+    the R1 direction as a tie-breaker. This is descriptive attribution only;
+    it does not introduce optimized weights or a hard trade-frequency cap.
     """
     signs = [rule_signs(c) for c in candles]
     rows: list[dict] = []
@@ -69,21 +90,21 @@ def evaluate_dataset(candles: list[Candle]) -> tuple[list[dict], dict]:
             "active": 0,
             "confirm": 0,
             "correct": 0,
-            "cond_active": 0,
-            "cond_correct": 0,
+            "cum_signals": 0,
+            "cum_correct": 0,
+            "cum_agree": 0,
         }
         for step in range(1, len(RULES) + 1)
     }
     trigger_entries = 0
 
-    # R1 at t is the trigger. Rn is evaluated at t+(n-1).
     for entry_i in range(len(candles) - len(RULES)):
         trigger = signs[entry_i]["R1"]
         if not trigger:
             continue
 
         trigger_entries += 1
-        prior_confirmations = True
+        seen_signals: list[int] = []
 
         for step, rule in enumerate(RULES, start=1):
             i = entry_i + step - 1
@@ -102,28 +123,28 @@ def evaluate_dataset(candles: list[Candle]) -> tuple[list[dict], dict]:
                 st["active"] += 1
                 st["confirm"] += int(s == trigger)
                 st["correct"] += int(s == realized)
+                seen_signals.append(s)
 
-                if prior_confirmations:
-                    st["cond_active"] += 1
-                    st["cond_correct"] += int(s == realized)
+            cum = cumulative_signal(seen_signals, trigger)
+            if cum:
+                st["cum_signals"] += 1
+                st["cum_correct"] += int(cum == realized)
+                st["cum_agree"] += int(cum == trigger)
 
-                rows.append({
-                    "entry_index": entry_i,
-                    "stage": step,
-                    "rule": rule,
-                    "stage_index": i,
-                    "trigger_direction": direction_name(trigger),
-                    "rule_direction": direction_name(s),
-                    "realized_next": direction_name(realized),
-                    "confirmed": int(s == trigger),
-                    "correct": int(s == realized),
-                    "prior_confirmed": int(prior_confirmations),
-                })
-
-            # A rejection does not kill the trade, but it means later
-            # conditional results are no longer "after all prior confirms".
-            if s != trigger:
-                prior_confirmations = False
+            rows.append({
+                "entry_index": entry_i,
+                "stage": step,
+                "rule": rule,
+                "stage_index": i,
+                "trigger_direction": direction_name(trigger),
+                "rule_direction": direction_name(s),
+                "realized_next": direction_name(realized),
+                "confirmed": int(bool(s) and s == trigger),
+                "correct": int(bool(s) and s == realized),
+                "cumulative_direction": direction_name(cum),
+                "cumulative_correct": int(bool(cum) and cum == realized),
+                "cumulative_agree": int(bool(cum) and cum == trigger),
+            })
 
     return rows, {"trigger_entries": trigger_entries, "stage": stage_stats}
 
@@ -138,8 +159,9 @@ def aggregate(datasets: list[list[Candle]]) -> tuple[list[dict], dict]:
                 "active": 0,
                 "confirm": 0,
                 "correct": 0,
-                "cond_active": 0,
-                "cond_correct": 0,
+                "cum_signals": 0,
+                "cum_correct": 0,
+                "cum_agree": 0,
             }
             for step in range(1, 17)
         },
@@ -199,14 +221,15 @@ def main() -> None:
         rows_out.extend(rows)
 
         print(f"\nTF={tf}m TRIGGER_ENTRIES={stats['trigger_entries']}")
-        print("STEP RULE OPPORT ACTIVE CONFIRM% ACCURACY% COND_ACC%")
+        print("STEP RULE OPPORT ACTIVE CONFIRM% ACC% CUM_SIG CUM_ACC% CUM_AGREE%")
         for step in range(1, 17):
             s = stats["stage"][step]
             print(
-                f"S{step:<2} {RULES[step-1]:<3} {s['opportunities']:<10} "
+                f"S{step:<2} {RULES[step-1]:<3} {s['opportunities']:<7} "
                 f"{s['active']:<6} {pct(s['confirm'],s['active']):6.2f} "
-                f"{pct(s['correct'],s['active']):7.2f} "
-                f"{pct(s['cond_correct'],s['cond_active']):7.2f}"
+                f"{pct(s['correct'],s['active']):6.2f} "
+                f"{s['cum_signals']:<7} {pct(s['cum_correct'],s['cum_signals']):7.2f} "
+                f"{pct(s['cum_agree'],s['cum_signals']):9.2f}"
             )
 
     p = Path(args.output)
@@ -223,7 +246,9 @@ def main() -> None:
             "realized_next",
             "confirmed",
             "correct",
-            "prior_confirmed",
+            "cumulative_direction",
+            "cumulative_correct",
+            "cumulative_agree",
         ]
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
