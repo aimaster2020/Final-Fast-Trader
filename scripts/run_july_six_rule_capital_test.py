@@ -14,18 +14,30 @@ from ohlc_rule_isolation_monthly import (
     resample,
 )
 
+# Baseline thresholds by rule type. Binary direction rules require full vote;
+# continuous strength/location rules use the established 0.50/0.75 cutoffs.
 TESTS = {
+    "R1": 1.00,
+    "R2": 0.25,
+    "R3": 1.00,
+    "R4": 1.00,
+    "R5": 0.50,
+    "R6": 0.50,
+    "R7": 0.50,
+    "R8": 0.50,
+    "R9": 0.50,
     "R10": 0.50,
+    "R11": 0.50,
     "R12": 0.50,
+    "R13": 0.50,
     "R14": 0.75,
     "R15": 0.75,
-    "R6": 0.50,
-    "R2": 0.25,
+    "R16": 1.00,
 }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Independent July 2026 capital backtest for six R1-R16 rules.")
+    ap = argparse.ArgumentParser(description="Independent July 2026 capital backtest for R1-R16 rules.")
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--month", default="2026-07")
@@ -45,6 +57,7 @@ def main() -> None:
     if not candles:
         raise SystemExit("NO_COMPLETE_CANDLES")
 
+    print(f"{args.symbol} {args.month} {args.timeframe}m candles={len(candles)} direction={args.direction}")
     for rule, threshold in TESTS.items():
         s = evaluate_rule(
             candles,
