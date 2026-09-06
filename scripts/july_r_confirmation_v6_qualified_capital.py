@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-from dataclasses import dataclass
 from pathlib import Path
 import sys
 
@@ -27,14 +26,8 @@ from scripts.july_r_composite_walkforward import (
 )
 
 
-def next_direction(cs: list[Candle], i: int) -> int:
-    if i + 1 >= len(cs):
-        return 0
-    return 1 if cs[i + 1].close > cs[i].close else -1 if cs[i + 1].close < cs[i].close else 0
-
-
-def pct(c: int, n: int) -> float:
-    return 100.0 * c / n if n else 0.0
+def pct(correct: int, n: int) -> float:
+    return 100.0 * correct / n if n else 0.0
 
 
 def signal_indices(
@@ -49,18 +42,6 @@ def signal_indices(
     return out
 
 
-@dataclass
-class CapitalResult:
-    initial: float
-    final: float
-    trades: int
-    wins: int
-    losses: int
-    gross_return_sum_pct: float
-    fees_paid: float
-    max_dd_pct: float
-
-
 def run_capital(
     series: dict[str, list[Candle]],
     trigger_rule: str,
@@ -68,12 +49,12 @@ def run_capital(
     selected: list[dict],
     initial: float,
     fee_per_side_pct: float,
-) -> CapitalResult:
+) -> dict:
     capital = initial
     peak = initial
     max_dd = 0.0
     trades = wins = losses = 0
-    gross_return_sum = 0.0
+    gross_sum = 0.0
     fees_paid = 0.0
 
     for _, cs in series.items():
@@ -85,12 +66,11 @@ def run_capital(
             move = (exit_price / entry - 1.0) * direction
             gross_pnl = capital * move
             fee = capital * (fee_per_side_pct / 100.0) * 2.0
-            capital += gross_pnl - fee
-            capital = max(0.0, capital)
+            capital = max(0.0, capital + gross_pnl - fee)
             trades += 1
             wins += int(gross_pnl > 0)
             losses += int(gross_pnl <= 0)
-            gross_return_sum += move
+            gross_sum += move
             fees_paid += fee
             peak = max(peak, capital)
             if peak > 0:
@@ -100,21 +80,23 @@ def run_capital(
         if capital <= 0:
             break
 
-    return CapitalResult(
-        initial=initial,
-        final=capital,
-        trades=trades,
-        wins=wins,
-        losses=losses,
-        gross_return_sum_pct=100.0 * gross_return_sum,
-        fees_paid=fees_paid,
-        max_dd_pct=100.0 * max_dd,
-    )
+    return {
+        "initial_capital": initial,
+        "final_capital": capital,
+        "return_pct": 100.0 * (capital / initial - 1.0) if initial else 0.0,
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate_pct": pct(wins, trades),
+        "max_dd_pct": 100.0 * max_dd,
+        "gross_sum_pct": 100.0 * gross_sum,
+        "fees_paid": fees_paid,
+    }
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Run V6 confirmation strategies whose July TEST accuracy meets a threshold, then calculate compounded capital with 0% and 1.3% per-side fees."
+        description="Re-run V6 discovery, retain every July result with TEST_ACC >= threshold, and calculate compounded capital at 0% and 1.3% per side."
     )
     ap.add_argument("--input-dir", required=True)
     ap.add_argument("--train-month", default="2026-06")
@@ -144,9 +126,9 @@ def main() -> None:
         f"assets={len(symbols)} tfs={','.join(map(str, tfs))} threshold={args.threshold:.1f}% "
         f"initial={args.initial_capital:.2f}"
     )
-    print("Qualification uses V6 July TEST_ACC; all qualifying rows are retained, including low-N results.")
-    print("Capital is compounded at 100% position size; fees are reported at 0% and 1.3% per side.")
-    print("This is a retrospective July capital calculation after V6 strategy discovery, not a leakage-free WF capital test.")
+    print("Qualification uses V6 July TEST_ACC; every qualifying row is retained, including low-N results.")
+    print("Capital compounds at 100% position size; results are shown with 0% and 1.3% per-side fees.")
+    print("This is retrospective July capital on V6-discovered strategies, not a leakage-free capital walk-forward.")
 
     for tf in tfs:
         train = load_sets(root, symbols, args.train_month, tf)
@@ -154,8 +136,7 @@ def main() -> None:
         if not train or not test:
             continue
 
-        # Freeze the V6 strategy-selection process using training data only.
-        series = {}
+        series: dict[str, list[Candle]] = {}
         for symbol in symbols:
             p = find_month_file(root, symbol, args.test_month)
             if not p:
@@ -164,14 +145,16 @@ def main() -> None:
             if len(cs) > 32:
                 series[symbol] = cs
 
-        qualified = []
+        qualified: list[dict] = []
         for trig in RULES:
             tv, tn, nn, ti, ni = choose_variant(train, trig, args.min_samples)
             selected: list[dict] = []
+
             for level in range(args.levels + 1):
                 opp, sn, correct, bn, bc = evaluate_level(test, trig, tv, selected)
                 test_acc = pct(correct, sn)
                 base_acc = pct(bc, bn)
+
                 if test_acc >= args.threshold:
                     label = (
                         f"{trig}:{tv}"
@@ -201,6 +184,8 @@ def main() -> None:
                             "train_trigger_inverse_n": ni,
                             "selected": [dict(x) for x in selected],
                         }
+                    )
+
                 if level == args.levels:
                     break
                 ranked = choose_next(train, trig, tv, selected, args.min_samples)
@@ -208,14 +193,17 @@ def main() -> None:
                     break
                 selected.append(ranked[0])
 
-        qualified.sort(key=lambda x: (x["test_accuracy"], x["test_signals"], x["lift_pp"]), reverse=True)
+        qualified.sort(
+            key=lambda x: (x["test_accuracy"], x["test_signals"], x["lift_pp"]),
+            reverse=True,
+        )
 
-        print(f"\n===== TF={tf}m QUALIFIED>= {args.threshold:.1f}% =====")
+        print(f"\n===== TF={tf}m QUALIFIED >= {args.threshold:.1f}% =====")
         if not qualified:
             print("NONE")
             continue
-        print("RANK SET TEST_ACC N CORRECT WRONG BASE LIFT CAPITAL_0 CAPITAL_FEE1.3 RET_FEE1.3")
 
+        print("RANK SET TEST_ACC N CORRECT WRONG BASE LIFT CAPITAL_0 RET_0 CAPITAL_FEE1.3 RET_FEE1.3 FEES")
         for rank, q in enumerate(qualified, 1):
             no_fee = run_capital(
                 series,
@@ -233,12 +221,13 @@ def main() -> None:
                 args.initial_capital,
                 1.3,
             )
-            fee_ret = 100.0 * (fee.final / args.initial_capital - 1.0)
             print(
                 f"{rank:4} {q['set']:<38} {q['test_accuracy']:7.2f}% {q['test_signals']:4} "
                 f"{q['test_correct']:4} {q['test_wrong']:4} {q['baseline_accuracy']:7.2f}% {q['lift_pp']:+6.2f} "
-                f"{no_fee.final:10.2f} {fee.final:12.2f} {fee_ret:+9.2f}%"
+                f"{no_fee['final_capital']:10.2f} {no_fee['return_pct']:+7.2f}% "
+                f"{fee['final_capital']:12.2f} {fee['return_pct']:+9.2f}% {fee['fees_paid']:10.2f}"
             )
+
             rows.append(
                 {
                     "timeframe_min": tf,
@@ -254,17 +243,21 @@ def main() -> None:
                     "baseline_accuracy_pct": round(q["baseline_accuracy"], 6),
                     "lift_pp": round(q["lift_pp"], 6),
                     "initial_capital": args.initial_capital,
-                    "final_no_fee": round(no_fee.final, 10),
-                    "return_no_fee_pct": round(100.0 * (no_fee.final / args.initial_capital - 1.0), 8),
-                    "trades_no_fee": no_fee.trades,
-                    "win_rate_no_fee_pct": round(pct(no_fee.wins, no_fee.trades), 6),
-                    "max_dd_no_fee_pct": round(no_fee.max_dd_pct, 6),
-                    "final_fee_1_3_per_side": round(fee.final, 10),
-                    "return_fee_1_3_per_side_pct": round(fee_ret, 8),
-                    "trades_fee_1_3_per_side": fee.trades,
-                    "win_rate_fee_1_3_per_side_pct": round(pct(fee.wins, fee.trades), 6),
-                    "max_dd_fee_1_3_per_side_pct": round(fee.max_dd_pct, 6),
-                    "fees_paid": round(fee.fees_paid, 10),
+                    "final_no_fee": round(no_fee["final_capital"], 10),
+                    "return_no_fee_pct": round(no_fee["return_pct"], 8),
+                    "trades_no_fee": no_fee["trades"],
+                    "wins_no_fee": no_fee["wins"],
+                    "losses_no_fee": no_fee["losses"],
+                    "win_rate_no_fee_pct": round(no_fee["win_rate_pct"], 6),
+                    "max_dd_no_fee_pct": round(no_fee["max_dd_pct"], 6),
+                    "final_fee_1_3_per_side": round(fee["final_capital"], 10),
+                    "return_fee_1_3_per_side_pct": round(fee["return_pct"], 8),
+                    "trades_fee_1_3_per_side": fee["trades"],
+                    "wins_fee_1_3_per_side": fee["wins"],
+                    "losses_fee_1_3_per_side": fee["losses"],
+                    "win_rate_fee_1_3_per_side_pct": round(fee["win_rate_pct"], 6),
+                    "max_dd_fee_1_3_per_side_pct": round(fee["max_dd_pct"], 6),
+                    "fees_paid": round(fee["fees_paid"], 10),
                     "train_trigger_native_acc_pct": round(q["train_trigger_native_acc"], 6),
                     "train_trigger_native_n": q["train_trigger_native_n"],
                     "train_trigger_inverse_acc_pct": round(q["train_trigger_inverse_acc"], 6),
