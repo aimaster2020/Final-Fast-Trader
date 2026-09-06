@@ -10,6 +10,7 @@ FEE_PER_SIDE = 0.013          # 1.3% of leveraged notional per side
 LEVERAGE = 10.0
 DEFAULT_ALLOCATION = 0.10     # 10% of currently free capital as margin
 DEFAULT_CAPITAL = 1000.0
+DEFAULT_MAX_HOLD_BARS = 10
 
 
 def resample(candles: list[Candle], minutes: int) -> list[Candle]:
@@ -112,8 +113,9 @@ def evaluate_rule(
     threshold: float,
     fee: float,
     leverage: float,
+    max_hold_bars: int = DEFAULT_MAX_HOLD_BARS,
 ):
-    """Run one rule in BOTH, LONG_ONLY or SHORT_ONLY mode."""
+    """Run one rule with at most one active position and a maximum holding period."""
     free_capital = initial_capital
     positions: list[dict] = []
     trade_pnls: list[float] = []
@@ -123,8 +125,18 @@ def evaluate_rule(
     last_signal = 0
     signals = buys = sells = holds = 0
     accepted_signals = 0
+    time_exits = 0
+    signal_exits = 0
 
-    for c in candles:
+    for i, c in enumerate(candles):
+        # Hard time-based exit: close after max_hold_bars completed bars.
+        if positions and i - positions[0]["entry_index"] >= max_hold_bars:
+            p = positions.pop(0)
+            free_capital, trade_pnl, cf = _close_position(p, c.close, free_capital, fee, leverage)
+            trade_pnls.append(trade_pnl)
+            fees += cf + p["entry_fee"]
+            time_exits += 1
+
         raw_sig = signal_for_rule(c, rule, threshold)
         if raw_sig:
             signals += 1
@@ -145,46 +157,32 @@ def evaluate_rule(
         if sig:
             accepted_signals += 1
 
-        if direction == "BOTH":
-            if sig and last_signal and sig != last_signal and positions:
-                for p in positions:
-                    free_capital, trade_pnl, cf = _close_position(p, c.close, free_capital, fee, leverage)
-                    trade_pnls.append(trade_pnl)
-                    fees += cf + p["entry_fee"]
-                positions = []
+        # With one active position, an opposite signal exits it in BOTH mode.
+        if direction == "BOTH" and sig and positions and sig != positions[0]["side"]:
+            p = positions.pop(0)
+            free_capital, trade_pnl, cf = _close_position(p, c.close, free_capital, fee, leverage)
+            trade_pnls.append(trade_pnl)
+            fees += cf + p["entry_fee"]
+            signal_exits += 1
 
-            if sig and free_capital > 0:
-                margin = free_capital * allocation
-                notional = margin * leverage
-                entry_fee = notional * fee
-                if margin + entry_fee <= free_capital:
-                    free_capital -= margin + entry_fee
-                    fees += entry_fee
-                    positions.append({
-                        "side": sig,
-                        "entry": c.close,
-                        "margin": margin,
-                        "notional": notional,
-                        "entry_fee": entry_fee,
-                        "opened_at": c.timestamp,
-                    })
-                last_signal = sig
-        else:
-            if sig and free_capital > 0:
-                margin = free_capital * allocation
-                notional = margin * leverage
-                entry_fee = notional * fee
-                if margin + entry_fee <= free_capital:
-                    free_capital -= margin + entry_fee
-                    fees += entry_fee
-                    positions.append({
-                        "side": sig,
-                        "entry": c.close,
-                        "margin": margin,
-                        "notional": notional,
-                        "entry_fee": entry_fee,
-                        "opened_at": c.timestamp,
-                    })
+        # Enter only when flat. Repeated same-side signals do not pyramid.
+        if sig and not positions and free_capital > 0:
+            margin = free_capital * allocation
+            notional = margin * leverage
+            entry_fee = notional * fee
+            if margin + entry_fee <= free_capital:
+                free_capital -= margin + entry_fee
+                fees += entry_fee
+                positions.append({
+                    "side": sig,
+                    "entry": c.close,
+                    "margin": margin,
+                    "notional": notional,
+                    "entry_fee": entry_fee,
+                    "opened_at": c.timestamp,
+                    "entry_index": i,
+                })
+            last_signal = sig
 
         equity = free_capital
         for p in positions:
@@ -230,6 +228,9 @@ def evaluate_rule(
         "commission_paid": fees,
         "max_drawdown_pct": max_dd,
         "calendar_days": days,
+        "time_exits": time_exits,
+        "signal_exits": signal_exits,
+        "max_hold_bars": max_hold_bars,
     }
 
 
@@ -257,6 +258,7 @@ def main() -> None:
     ap.add_argument("--leverage", type=float, default=LEVERAGE)
     ap.add_argument("--fee-per-side", type=float, default=FEE_PER_SIDE, help="decimal; 1.3%% = 0.013")
     ap.add_argument("--threshold", type=float, default=1.0)
+    ap.add_argument("--max-hold-bars", type=int, default=DEFAULT_MAX_HOLD_BARS)
     ap.add_argument("--output", default="reports/ohlc_rule_isolation_monthly.csv")
     args = ap.parse_args()
 
@@ -278,7 +280,7 @@ def main() -> None:
             for direction in directions:
                 for i in range(1, 17):
                     rule = f"R{i}"
-                    s = evaluate_rule(candles, rule, direction, args.initial_capital, args.trade_allocation, args.threshold, args.fee_per_side, args.leverage)
+                    s = evaluate_rule(candles, rule, direction, args.initial_capital, args.trade_allocation, args.threshold, args.fee_per_side, args.leverage, args.max_hold_bars)
                     s.update({
                         "symbol": symbol,
                         "month": args.month,
@@ -318,44 +320,33 @@ def main() -> None:
 
     summary: list[dict] = []
     grouped: dict[tuple[str, int, str], dict[str, dict]] = {}
-    for row in rows:
-        if row["direction"] in {"LONG_ONLY", "SHORT_ONLY"}:
-            key = (row["symbol"], int(row["timeframe_min"]), row["rule"])
-            grouped.setdefault(key, {})[row["direction"]] = row
-    for (symbol, tf, rule), pair in grouped.items():
-        long_row = pair.get("LONG_ONLY")
-        short_row = pair.get("SHORT_ONLY")
-        if not long_row or not short_row:
-            continue
-        long_ret = float(long_row["return_pct"])
-        short_ret = float(short_row["return_pct"])
-        preferred = "LONG" if long_ret > short_ret else "SHORT" if short_ret > long_ret else "TIE"
-        summary.append({
-            "symbol": symbol,
-            "timeframe_min": tf,
-            "rule": rule,
-            "long_return_pct": long_ret,
-            "short_return_pct": short_ret,
-            "long_win_rate_pct": float(long_row["win_rate_pct"]),
-            "short_win_rate_pct": float(short_row["win_rate_pct"]),
-            "long_profit_factor": long_row["profit_factor"],
-            "short_profit_factor": short_row["profit_factor"],
-            "long_max_drawdown_pct": float(long_row["max_drawdown_pct"]),
-            "short_max_drawdown_pct": float(short_row["max_drawdown_pct"]),
-            "long_trades": int(long_row["completed_trades"]),
-            "short_trades": int(short_row["completed_trades"]),
-            "preferred_direction": preferred,
-            "return_edge_long_minus_short_pct": long_ret - short_ret,
-        })
-    summary_path = p.with_name(p.stem + "_direction_summary.csv")
+    for r in rows:
+        grouped.setdefault((r["symbol"], int(r["timeframe_min"]), r["direction"]), {})[r["rule"]] = r
+    for (symbol, tf, direction), by_rule in sorted(grouped.items()):
+        for rule in sorted(by_rule, key=lambda x: int(x[1:])):
+            r = by_rule[rule]
+            summary.append({
+                "symbol": symbol,
+                "timeframe_min": tf,
+                "direction": direction,
+                "rule": rule,
+                "return_pct": r["return_pct"],
+                "final_capital": r["final_capital"],
+                "completed_trades": r["completed_trades"],
+                "win_rate_pct": r["win_rate_pct"],
+                "profit_factor": r["profit_factor"],
+                "max_drawdown_pct": r["max_drawdown_pct"],
+                "commission_paid": r["commission_paid"],
+                "time_exits": r["time_exits"],
+                "signal_exits": r["signal_exits"],
+                "max_hold_bars": r["max_hold_bars"],
+            })
+    summary_path = p.with_name(p.stem + "_summary.csv")
     with summary_path.open("w", newline="", encoding="utf-8") as f:
-        sw = csv.DictWriter(f, fieldnames=list(summary[0].keys()))
-        sw.writeheader()
-        sw.writerows(sorted(summary, key=lambda x: abs(float(x["return_edge_long_minus_short_pct"])), reverse=True))
-
-    print(f"Saved: {p}")
-    print(f"Saved ranked: {rank_path}")
-    print(f"Saved direction summary: {summary_path}")
+        fields2 = list(summary[0].keys())
+        w = csv.DictWriter(f, fieldnames=fields2)
+        w.writeheader()
+        w.writerows(summary)
 
 
 if __name__ == "__main__":
