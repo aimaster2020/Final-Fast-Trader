@@ -43,29 +43,23 @@ def composite_filtered(candle, weights, gate: float, min_confirm: int):
     return signal, score, len(signed)
 
 
-def evaluate(candles, weights, gate: float, min_confirm: int, max_trades_per_day: int = 1):
+def evaluate(candles, weights, gate: float, min_confirm: int):
     accepted = correct = longs = shorts = 0
     active_sum = 0
-    last_day = None
-    day_trades = 0
     total = max(len(candles) - 1, 0)
 
     for i, c in enumerate(candles[:-1]):
         sig, _score, active = composite_filtered(c, weights, gate, min_confirm)
         active_sum += active
-        day = c.timestamp // 86400
-        if day != last_day:
-            last_day = day
-            day_trades = 0
-        if not sig or day_trades >= max_trades_per_day:
+        if not sig:
             continue
 
-        day_trades += 1
         accepted += 1
         if sig == 1:
             longs += 1
         else:
             shorts += 1
+
         nxt = candles[i + 1].close
         realized = 1 if nxt > c.close else -1 if nxt < c.close else 0
         if realized:
@@ -80,6 +74,7 @@ def evaluate(candles, weights, gate: float, min_confirm: int, max_trades_per_day
         "accuracy_pct": correct / accepted * 100.0 if accepted else 0.0,
         "long_pct": longs / accepted * 100.0 if accepted else 0.0,
         "avg_active_rules": active_sum / total if total else 0.0,
+        "correct_signals": correct,
     }
 
 
@@ -90,9 +85,9 @@ def main():
     ap.add_argument("--test-month", default="2026-07")
     ap.add_argument("--symbols", default="ALL")
     ap.add_argument("--timeframes", default="5,15,30,60")
-    ap.add_argument("--gates", default="0.25,0.35,0.45,0.55,0.65,0.75,0.85")
-    ap.add_argument("--min-confirms", default="2,3,4,5,6")
-    ap.add_argument("--max-trades-per-day", type=int, default=1)
+    ap.add_argument("--gates", default="0.25,0.35,0.45,0.55,0.65,0.75,0.85,0.90,0.95")
+    ap.add_argument("--min-confirms", default="2,3,4,5,6,7,8")
+    ap.add_argument("--min-signals", type=int, default=30)
     ap.add_argument("--output", default="reports/july_r_precision_sweep.csv")
     args = ap.parse_args()
 
@@ -139,42 +134,54 @@ def main():
         for min_confirm in confirms:
             per = []
             for symbol, tf, candles in test_sets:
-                r = evaluate(candles, weights, gate, min_confirm, args.max_trades_per_day)
+                r = evaluate(candles, weights, gate, min_confirm)
                 per.append(r)
                 rows.append({
                     "train_month": args.train_month, "test_month": args.test_month,
                     "symbol": symbol, "timeframe": tf, "gate": gate,
-                    "min_confirm": min_confirm, "max_trades_per_day": args.max_trades_per_day,
+                    "min_confirm": min_confirm, "min_signals": args.min_signals,
                     **r,
                 })
+
             signals = sum(x["signals"] for x in per)
-            correct = sum(round(x["signals"] * x["accuracy_pct"] / 100.0) for x in per)
+            correct = sum(x["correct_signals"] for x in per)
             days = sum(x["days"] for x in per)
-            rows.append({
+            aggregate = {
                 "train_month": args.train_month, "test_month": args.test_month,
                 "symbol": "ALL", "timeframe": 0, "gate": gate,
-                "min_confirm": min_confirm, "max_trades_per_day": args.max_trades_per_day,
+                "min_confirm": min_confirm, "min_signals": args.min_signals,
                 "candles": sum(x["candles"] for x in per), "days": days,
                 "signals": signals, "signals_per_day": signals / days if days else 0.0,
                 "accuracy_pct": correct / signals * 100.0 if signals else 0.0,
                 "long_pct": sum(x["long_pct"] * x["signals"] for x in per) / signals if signals else 0.0,
                 "avg_active_rules": sum(x["avg_active_rules"] for x in per) / len(per) if per else 0.0,
-            })
+                "correct_signals": correct,
+            }
+            aggregate["eligible"] = int(signals >= args.min_signals)
+            rows.append(aggregate)
 
-    # Keep only aggregate rows for ranking; target is roughly one accepted trade/day per asset.
-    agg = [r for r in rows if r["symbol"] == "ALL"]
-    for r in agg:
-        r["distance_to_1_trade_day"] = abs(float(r["signals_per_day"]) - 1.0)
-        r["eligible"] = int(0.50 <= float(r["accuracy_pct"]) and float(r["signals_per_day"]) <= 1.5)
-    ranked = sorted(agg, key=lambda r: (int(r["eligible"]), float(r["accuracy_pct"]), -float(r["distance_to_1_trade_day"])), reverse=True)
+    # Ranking is now explicitly quality-first. Trade frequency is reported, not optimized.
+    agg = [r for r in rows if r["symbol"] == "ALL" and r["eligible"]]
+    ranked = sorted(
+        agg,
+        key=lambda r: (float(r["accuracy_pct"]), int(r["signals"])),
+        reverse=True,
+    )
 
-    p = Path(args.output); p.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["train_month","test_month","symbol","timeframe","gate","min_confirm","max_trades_per_day","candles","days","signals","signals_per_day","accuracy_pct","long_pct","avg_active_rules","distance_to_1_trade_day","eligible"]
+    p = Path(args.output)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "train_month", "test_month", "symbol", "timeframe", "gate", "min_confirm",
+        "min_signals", "candles", "days", "signals", "signals_per_day",
+        "accuracy_pct", "long_pct", "avg_active_rules", "correct_signals", "eligible",
+    ]
     with p.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(rows)
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(rows)
 
-    print(f"PRECISION_WF train={args.train_month} test={args.test_month} assets={len(symbols)} tfs={','.join(map(str,tfs))} max/day={args.max_trades_per_day}")
-    print("GATE CONF  TRADES/DAY ACC%  LONG% SIGNALS ELIG")
+    print(f"PRECISION_WF train={args.train_month} test={args.test_month} assets={len(symbols)} tfs={','.join(map(str,tfs))}")
+    print("GATE CONF  SIGNALS/DAY ACC%  LONG% SIGNALS ELIG")
     for r in ranked[:15]:
         print(f"{float(r['gate']):.2f}  {int(r['min_confirm']):>4}  {float(r['signals_per_day']):8.2f} {float(r['accuracy_pct']):5.1f} {float(r['long_pct']):6.1f} {int(r['signals']):7d} {int(r['eligible'])}")
     print(f"SAVED {p} rows={len(rows)}")
