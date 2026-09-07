@@ -13,15 +13,15 @@ def test_fall_rules_score_two_of_three_produces_sell():
     assert result.signal == Signal.SELL
 
 
-def test_rise_rules_score_two_of_three_produces_buy():
+def test_rise_rules_score_three_of_three_produces_buy():
     result = decide(candle(100, 110, 95, 90))
-    assert result.rise_score == 2
-    assert result.fall_score == 1
+    assert result.rise_score == 3
+    assert result.fall_score == 0
     assert result.signal == Signal.BUY
 
 
 def test_below_two_votes_is_hold():
-    result = decide(candle(100, 105, 99, 102))
+    result = decide(candle(100, 105, 95, 100))
     assert result.fall_score < 2
     assert result.rise_score < 2
     assert result.signal == Signal.HOLD
@@ -39,6 +39,6 @@ def test_rules_are_based_only_on_current_ohlc():
     assert result.fall_rule_1 is False
     assert result.fall_rule_2 is True
     assert result.fall_rule_3 is True
-    assert result.rise_rule_1 is True
+    assert result.rise_rule_1 is False
     assert result.rise_rule_2 is False
     assert result.rise_rule_3 is False
