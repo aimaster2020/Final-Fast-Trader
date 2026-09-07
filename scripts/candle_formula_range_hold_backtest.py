@@ -9,8 +9,9 @@ from fast_pattern_trader.candle_formula_strategy import decide
 from fast_pattern_trader.models import Candle, Signal
 
 
-RANGE_MIN_BODY = -100.0
-RANGE_MAX_BODY = 100.0
+DEFAULT_RANGE_MIN = -100.0
+DEFAULT_RANGE_MAX = 100.0
+DEFAULT_COMMISSION = 0.0013  # 0.13% per side
 
 
 @dataclass
@@ -43,9 +44,9 @@ def load_month(path: Path, month: str, symbol: str) -> list[Candle]:
     return sorted(candles, key=lambda x: x.timestamp)
 
 
-def body_in_hold_range(candle: Candle) -> bool:
+def body_in_range(candle: Candle, range_min: float, range_max: float) -> bool:
     body = candle.close - candle.open
-    return RANGE_MIN_BODY <= body <= RANGE_MAX_BODY
+    return range_min <= body <= range_max
 
 
 def signal_side(candle: Candle) -> int:
@@ -69,7 +70,7 @@ def close_position(
     equity: float,
     commission: float,
 ) -> tuple[float, float, float, float]:
-    """Return (new_equity, gross_pnl, net_pnl, fees) for one round-trip trade."""
+    """Return (new_equity, gross_pnl, net_pnl, total_round_trip_fees)."""
     trade_return = pnl_pct(position.side, position.entry_price, exit_price)
     gross = position.allocated_capital * trade_return
     fees = position.allocated_capital * commission * 2.0
@@ -78,10 +79,11 @@ def close_position(
 
 
 def mark_to_market_equity(equity: float, position: Position | None, price: float) -> float:
-    """Equity marked to the current close while the position remains open."""
     if position is None:
         return equity
-    unrealized = position.allocated_capital * pnl_pct(position.side, position.entry_price, price)
+    unrealized = position.allocated_capital * pnl_pct(
+        position.side, position.entry_price, price
+    )
     return equity + unrealized
 
 
@@ -93,10 +95,12 @@ def run_timeframe(
     initial_capital: float,
     commission: float,
     allocation: float,
+    range_min: float,
+    range_max: float,
     output: Path,
-) -> dict[str, float | int | str]:
+) -> dict[str, object]:
     candles = load_month(path, month, symbol)
-    if len(candles) < 2:
+    if len(candles) < 1:
         raise SystemExit(f"No usable {timeframe} candles for {symbol} {month}: {path}")
     if initial_capital <= 0:
         raise SystemExit("initial_capital must be > 0")
@@ -104,6 +108,8 @@ def run_timeframe(
         raise SystemExit("allocation must be in (0, 1]")
     if commission < 0:
         raise SystemExit("commission must be >= 0")
+    if range_min > range_max:
+        raise SystemExit("range_min must be <= range_max")
 
     equity = initial_capital
     position: Position | None = None
@@ -118,18 +124,20 @@ def run_timeframe(
     total_fees = 0.0
     peak_equity = initial_capital
     max_drawdown = 0.0
-    forced_close = 0
-    held_through_opposite = 0
     switches = 0
+    held_through_opposite = 0
+    ignored_outside_entry_signals = 0
     entries_long = 0
     entries_short = 0
+    entry_signals = 0
 
-    output.parent.mkdir(parents=True, exist_ok=True)
     fields = [
         "symbol", "timeframe", "month", "timestamp", "open", "high", "low", "close",
         "body", "in_range", "signal", "position_before", "action", "position_after",
         "trade_pnl_pct", "trade_net_pnl", "equity", "mtm_equity", "drawdown_pct",
     ]
+
+    output.parent.mkdir(parents=True, exist_ok=True)
     sample_rows: list[dict[str, object]] = []
 
     with output.open("w", newline="", encoding="utf-8") as f:
@@ -139,22 +147,27 @@ def run_timeframe(
         for i, candle in enumerate(candles):
             sig = signal_side(candle)
             body = candle.close - candle.open
-            in_range = body_in_hold_range(candle)
+            in_range = range_min <= body <= range_max
             position_before = position.side if position else 0
             action = "HOLD"
             trade_return_pct = ""
             trade_net = ""
 
             if position is None:
-                if sig != 0:
+                # ENTRY: first valid signal only when body is inside the configurable range.
+                if sig != 0 and in_range:
                     allocated = equity * allocation
                     position = Position(sig, candle.close, candle.timestamp, i, allocated)
+                    entry_signals += 1
                     if sig > 0:
                         entries_long += 1
                         action = "OPEN_LONG"
                     else:
                         entries_short += 1
                         action = "OPEN_SHORT"
+                elif sig != 0:
+                    ignored_outside_entry_signals += 1
+                    action = "IGNORE_ENTRY_OUTSIDE_RANGE"
             else:
                 if sig == 0:
                     action = "HOLD_NO_SIGNAL"
@@ -162,12 +175,14 @@ def run_timeframe(
                     action = "HOLD_SAME"
                 elif not in_range:
                     held_through_opposite += 1
-                    action = "HOLD_OUTSIDE_RANGE"
+                    action = "HOLD_OPPOSITE_OUTSIDE_RANGE"
                 else:
                     equity, gross, net, fees = close_position(
                         position, candle.close, equity, commission
                     )
-                    trade_return_pct = f"{pnl_pct(position.side, position.entry_price, candle.close) * 100.0:.8f}"
+                    trade_return_pct = (
+                        f"{pnl_pct(position.side, position.entry_price, candle.close) * 100.0:.8f}"
+                    )
                     trade_net = f"{net:.10f}"
                     gross_pnl += gross
                     net_pnl += net
@@ -188,6 +203,7 @@ def run_timeframe(
                     position = Position(
                         new_side, candle.close, candle.timestamp, i, new_allocated
                     )
+                    entry_signals += 1
                     if new_side > 0:
                         entries_long += 1
                         action = "SWITCH_LONG"
@@ -227,14 +243,15 @@ def run_timeframe(
 
     if position is not None:
         candle = candles[-1]
-        equity, gross, net, fees = close_position(position, candle.close, equity, commission)
+        equity, gross, net, fees = close_position(
+            position, candle.close, equity, commission
+        )
         gross_pnl += gross
         net_pnl += net
         total_fees += fees
         gross_profit += max(gross, 0.0)
         gross_loss += min(gross, 0.0)
         trades += 1
-        forced_close = 1
         if net > 0:
             wins += 1
         elif net < 0:
@@ -247,7 +264,11 @@ def run_timeframe(
     total_closed = wins + losses + flats
     win_rate = wins / total_closed * 100.0 if total_closed else 0.0
     final_return = (equity / initial_capital - 1.0) * 100.0
-    profit_factor = gross_profit / abs(gross_loss) if gross_loss < 0 else float("inf") if gross_profit > 0 else 0.0
+    profit_factor = (
+        gross_profit / abs(gross_loss)
+        if gross_loss < 0
+        else float("inf") if gross_profit > 0 else 0.0
+    )
 
     return {
         "symbol": symbol,
@@ -269,11 +290,15 @@ def run_timeframe(
         "max_drawdown_pct": max_drawdown * 100.0,
         "long_entries": entries_long,
         "short_entries": entries_short,
+        "entry_signals": entry_signals,
         "switches": switches,
         "held_through_opposite": held_through_opposite,
-        "forced_close": forced_close,
+        "ignored_outside_entry_signals": ignored_outside_entry_signals,
+        "forced_close": 1 if position is not None else 0,
         "commission": commission,
         "allocation": allocation,
+        "range_min": range_min,
+        "range_max": range_max,
         "sample_rows": sample_rows,
         "fields": fields,
         "output": str(output),
@@ -281,12 +306,16 @@ def run_timeframe(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Range-hold backtest for the exact Excel candle formula strategy.")
-    ap.add_argument("--month", default="2026-07")
+    ap = argparse.ArgumentParser(
+        description="Trade exact Excel candle signals with configurable body range and 0.13% default per side."
+    )
+    ap.add_argument("--month", default="2026-05")
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--initial-capital", type=float, default=1000.0)
-    ap.add_argument("--commission", type=float, default=0.0, help="One-way commission rate; e.g. 0.001 = 0.1%%")
-    ap.add_argument("--allocation", type=float, default=1.0, help="Fraction of equity used per position")
+    ap.add_argument("--commission", type=float, default=DEFAULT_COMMISSION, help="One-way commission rate; default 0.0013 = 0.13%%")
+    ap.add_argument("--allocation", type=float, default=1.0)
+    ap.add_argument("--range-min", type=float, default=DEFAULT_RANGE_MIN)
+    ap.add_argument("--range-max", type=float, default=DEFAULT_RANGE_MAX)
     ap.add_argument("--input-5m", default="reports/prepared_price_action_5m.csv")
     ap.add_argument("--input-15m", default="reports/prepared_price_action_15m.csv")
     ap.add_argument("--input-1h", default="reports/prepared_price_action_1h.csv")
@@ -310,6 +339,8 @@ def main() -> None:
             args.initial_capital,
             args.commission,
             args.allocation,
+            args.range_min,
+            args.range_max,
             output,
         )
         results.append(result)
@@ -317,23 +348,30 @@ def main() -> None:
         pf_text = "INF" if pf == float("inf") else f"{pf:.2f}"
         print(
             f"{timeframe} | candles={result['candles']} | "
+            f"range=[{result['range_min']},{result['range_max']}] | "
+            f"commission/side={result['commission'] * 100.0:.2f}% | "
             f"initial={result['initial']:.2f} final={result['final']:.2f} "
             f"return={result['return_pct']:.2f}% | trades={result['trades']} "
             f"win={result['win_rate']:.2f}% PF={pf_text} | DD_MTM={result['max_drawdown_pct']:.2f}% | "
-            f"fees={result['fees']:.4f} | switches={result['switches']} "
+            f"fees={result['fees']:.4f} | ignored_entry={result['ignored_outside_entry_signals']} "
             f"held_opp={result['held_through_opposite']}"
         )
         print(f"  COLUMNS={','.join(result['fields'])}")
         for n, row in enumerate(result["sample_rows"], 1):
-            print(f"  ROW{n}=" + " | ".join(f"{field}={row[field]}" for field in result["fields"]))
+            print(
+                f"  ROW{n}="
+                + " | ".join(f"{field}={row[field]}" for field in result["fields"])
+            )
 
     summary = Path(args.output_dir) / f"summary_{args.symbol}_{args.month}.csv"
+    summary.parent.mkdir(parents=True, exist_ok=True)
     with summary.open("w", newline="", encoding="utf-8") as f:
         fields = [
             "symbol", "month", "timeframe", "candles", "initial", "final", "return_pct",
-            "trades", "wins", "losses", "flats", "win_rate", "profit_factor", "gross_pnl", "net_pnl", "fees",
-            "max_drawdown_pct", "long_entries", "short_entries", "switches", "held_through_opposite",
-            "forced_close", "commission", "allocation",
+            "trades", "wins", "losses", "flats", "win_rate", "profit_factor", "gross_pnl",
+            "net_pnl", "fees", "max_drawdown_pct", "long_entries", "short_entries",
+            "entry_signals", "switches", "held_through_opposite", "ignored_outside_entry_signals",
+            "forced_close", "commission", "allocation", "range_min", "range_max",
         ]
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
