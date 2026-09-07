@@ -19,6 +19,7 @@ class Position:
     entry_price: float
     entry_timestamp: int
     entry_index: int
+    allocated_capital: float
 
 
 def load_month(path: Path, month: str, symbol: str) -> list[Candle]:
@@ -62,6 +63,20 @@ def pnl_pct(side: int, entry: float, exit_price: float) -> float:
     return side * (exit_price - entry) / entry
 
 
+def close_position(
+    position: Position,
+    exit_price: float,
+    equity: float,
+    commission: float,
+) -> tuple[float, float, float, float]:
+    """Return (new_equity, gross_pnl, net_pnl, fees) for one round-trip trade."""
+    trade_return = pnl_pct(position.side, position.entry_price, exit_price)
+    gross = position.allocated_capital * trade_return
+    fees = position.allocated_capital * commission * 2.0
+    net = gross - fees
+    return equity + net, gross, net, fees
+
+
 def run_timeframe(
     path: Path,
     timeframe: str,
@@ -90,6 +105,8 @@ def run_timeframe(
     flats = 0
     gross_pnl = 0.0
     net_pnl = 0.0
+    gross_profit = 0.0
+    gross_loss = 0.0
     total_fees = 0.0
     peak_equity = equity
     max_drawdown = 0.0
@@ -103,7 +120,7 @@ def run_timeframe(
     fields = [
         "symbol", "timeframe", "month", "timestamp", "open", "high", "low", "close",
         "body", "in_range", "signal", "position_before", "action", "position_after",
-        "trade_pnl_pct", "equity",
+        "trade_pnl_pct", "trade_net_pnl", "equity",
     ]
 
     with output.open("w", newline="", encoding="utf-8") as f:
@@ -111,18 +128,18 @@ def run_timeframe(
         writer.writeheader()
 
         for i, candle in enumerate(candles):
-            decision = decide(candle)
             sig = signal_side(candle)
             body = candle.close - candle.open
             in_range = body_in_hold_range(candle)
             position_before = position.side if position else 0
             action = "HOLD"
-            trade_pnl_pct = ""
+            trade_return_pct = ""
+            trade_net = ""
 
             if position is None:
                 if sig != 0:
-                    position = Position(sig, candle.close, candle.timestamp, i)
-                    trades += 1
+                    allocated = equity * allocation
+                    position = Position(sig, candle.close, candle.timestamp, i, allocated)
                     if sig > 0:
                         entries_long += 1
                         action = "OPEN_LONG"
@@ -138,15 +155,16 @@ def run_timeframe(
                     held_through_opposite += 1
                     action = "HOLD_OUTSIDE_RANGE"
                 else:
-                    p = pnl_pct(position.side, position.entry_price, candle.close)
-                    allocated = equity * allocation
-                    gross = allocated * p
-                    fee = allocated * commission * 2.0
-                    net = gross - fee
-                    equity += net
+                    equity, gross, net, fees = close_position(
+                        position, candle.close, equity, commission
+                    )
+                    trade_return_pct = f"{pnl_pct(position.side, position.entry_price, candle.close) * 100.0:.8f}"
+                    trade_net = f"{net:.10f}"
                     gross_pnl += gross
                     net_pnl += net
-                    total_fees += fee
+                    total_fees += fees
+                    gross_profit += max(gross, 0.0)
+                    gross_loss += min(gross, 0.0)
                     trades += 1
                     if net > 0:
                         wins += 1
@@ -154,16 +172,19 @@ def run_timeframe(
                         losses += 1
                     else:
                         flats += 1
-                    trade_pnl_pct = f"{p * 100.0:.8f}"
                     switches += 1
 
                     new_side = sig
-                    position = Position(new_side, candle.close, candle.timestamp, i)
+                    new_allocated = equity * allocation
+                    position = Position(
+                        new_side, candle.close, candle.timestamp, i, new_allocated
+                    )
                     if new_side > 0:
                         entries_long += 1
+                        action = "SWITCH_LONG"
                     else:
                         entries_short += 1
-                    action = "SWITCH_LONG" if new_side > 0 else "SWITCH_SHORT"
+                        action = "SWITCH_SHORT"
 
             peak_equity = max(peak_equity, equity)
             drawdown = (peak_equity - equity) / peak_equity if peak_equity else 0.0
@@ -184,21 +205,20 @@ def run_timeframe(
                 "position_before": position_before,
                 "action": action,
                 "position_after": position.side if position else 0,
-                "trade_pnl_pct": trade_pnl_pct,
+                "trade_pnl_pct": trade_return_pct,
+                "trade_net_pnl": trade_net,
                 "equity": f"{equity:.10f}",
             })
 
     if position is not None:
         candle = candles[-1]
-        p = pnl_pct(position.side, position.entry_price, candle.close)
-        allocated = equity * allocation
-        gross = allocated * p
-        fee = allocated * commission
-        net = gross - fee
-        equity += net
+        equity, gross, net, fees = close_position(position, candle.close, equity, commission)
         gross_pnl += gross
         net_pnl += net
-        total_fees += fee
+        total_fees += fees
+        gross_profit += max(gross, 0.0)
+        gross_loss += min(gross, 0.0)
+        trades += 1
         forced_close = 1
         if net > 0:
             wins += 1
@@ -206,16 +226,13 @@ def run_timeframe(
             losses += 1
         else:
             flats += 1
-        trades += 1
         peak_equity = max(peak_equity, equity)
         max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity if peak_equity else 0.0)
 
     total_closed = wins + losses + flats
     win_rate = wins / total_closed * 100.0 if total_closed else 0.0
     final_return = (equity / initial_capital - 1.0) * 100.0
-    profit_factor = (
-        sum(max(0.0, 0.0) for _ in [])
-    )
+    profit_factor = gross_profit / abs(gross_loss) if gross_loss < 0 else float("inf") if gross_profit > 0 else 0.0
 
     return {
         "symbol": symbol,
@@ -229,6 +246,7 @@ def run_timeframe(
         "losses": losses,
         "flats": flats,
         "win_rate": win_rate,
+        "profit_factor": profit_factor,
         "gross_pnl": gross_pnl,
         "net_pnl": net_pnl,
         "fees": total_fees,
@@ -277,11 +295,13 @@ def main() -> None:
             output,
         )
         results.append(result)
+        pf = result["profit_factor"]
+        pf_text = "INF" if pf == float("inf") else f"{pf:.2f}"
         print(
             f"{timeframe} | candles={result['candles']} | "
             f"initial={result['initial']:.2f} final={result['final']:.2f} "
             f"return={result['return_pct']:.2f}% | trades={result['trades']} "
-            f"win={result['win_rate']:.2f}% | DD={result['max_drawdown_pct']:.2f}% | "
+            f"win={result['win_rate']:.2f}% PF={pf_text} | DD={result['max_drawdown_pct']:.2f}% | "
             f"fees={result['fees']:.4f} | switches={result['switches']} "
             f"held_opp={result['held_through_opposite']}"
         )
@@ -290,7 +310,7 @@ def main() -> None:
     with summary.open("w", newline="", encoding="utf-8") as f:
         fields = [
             "symbol", "month", "timeframe", "candles", "initial", "final", "return_pct",
-            "trades", "wins", "losses", "flats", "win_rate", "gross_pnl", "net_pnl", "fees",
+            "trades", "wins", "losses", "flats", "win_rate", "profit_factor", "gross_pnl", "net_pnl", "fees",
             "max_drawdown_pct", "long_entries", "short_entries", "switches", "held_through_opposite",
             "forced_close", "commission", "allocation",
         ]
