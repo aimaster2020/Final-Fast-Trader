@@ -11,8 +11,14 @@ from fast_pattern_trader.models import Candle, Signal
 DEFAULT_MONTHS = ("2026-05", "2026-06", "2026-07", "2026-08")
 DEFAULT_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 DEFAULT_COMMISSION = 0.0013
-DEFAULT_LOWER = 0.0
-DEFAULT_UPPER = 0.0
+
+# Bias ranges selected in the earlier multi-month bias tests.
+DEFAULT_BIAS = {
+    "BTCUSDT": (-200.0, -125.0),
+    "ETHUSDT": (-200.0, -175.0),
+    "SOLUSDT": (25.0, 50.0),
+    "XRPUSDT": (-200.0, -175.0),
+}
 
 
 @dataclass
@@ -52,6 +58,15 @@ def signal_side(candle: Candle) -> int:
     return 0
 
 
+def body_side(candle: Candle) -> int:
+    body = candle.close - candle.open
+    if body > 0:
+        return 1
+    if body < 0:
+        return -1
+    return 0
+
+
 def pnl(side: int, entry: float, price: float) -> float:
     return side * (price - entry) / entry if entry > 0 else 0.0
 
@@ -61,53 +76,50 @@ def run(
     lower: float,
     upper: float,
     commission: float,
-    opposite_signals_to_exit: int,
 ) -> dict[str, float | int]:
     equity = 1000.0
     position: Position | None = None
-    opposite_count = 0
     trades = wins = long_entries = short_entries = 0
     gross_profit = gross_loss = 0.0
     peak = 1000.0
     max_dd = 0.0
 
+    previous_prediction = 0
+    confirmed_entries = 0
+
     for candle in candles:
         sig = signal_side(candle)
-        body = candle.close - candle.open
+        body_dir = body_side(candle)
+
+        # The previous candle's prediction is evaluated against the
+        # current candle's body direction. Entry is allowed only when
+        # that previous prediction was correct.
+        previous_prediction_correct = (
+            previous_prediction != 0 and previous_prediction == body_dir
+        )
 
         if position is None:
-            opposite_count = 0
-            if sig != 0 and not (lower < body < upper) if lower < upper else sig != 0:
+            outside_bias = not (lower <= (candle.close - candle.open) <= upper)
+            if sig != 0 and outside_bias and previous_prediction_correct:
                 position = Position(sig, candle.close, equity)
                 long_entries += int(sig > 0)
                 short_entries += int(sig < 0)
-        else:
-            side = position.side
-            entry = position.entry_price
-            capital = position.capital
+                confirmed_entries += 1
 
-            if sig != 0 and sig != side:
-                opposite_count += 1
-            elif sig == side or sig == 0:
-                opposite_count = 0
-
-            if opposite_count >= opposite_signals_to_exit:
-                gross = capital * pnl(side, entry, candle.close)
-                fee = capital * commission * 2.0
-                net = gross - fee
-                equity += net
-                trades += 1
-                wins += int(net > 0)
-                gross_profit += max(gross, 0.0)
-                gross_loss += min(gross, 0.0)
-                position = None
-                opposite_count = 0
+        # No opposite-signal exit. Position is held until the end of
+        # the month/test window and force-closed there.
 
         mtm = equity
         if position is not None:
-            mtm += position.capital * pnl(position.side, position.entry_price, candle.close)
+            mtm += position.capital * pnl(
+                position.side,
+                position.entry_price,
+                candle.close,
+            )
         peak = max(peak, mtm)
         max_dd = max(max_dd, (peak - mtm) / peak if peak else 0.0)
+
+        previous_prediction = sig
 
     if position is not None and candles:
         side = position.side
@@ -131,6 +143,7 @@ def run(
         "dd": max_dd * 100.0,
         "long": long_entries,
         "short": short_entries,
+        "confirmed_entries": confirmed_entries,
     }
 
 
@@ -142,7 +155,12 @@ def compound(returns: list[float]) -> float:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="1h candle formula strategy with zero bias and exit sweep.")
+    ap = argparse.ArgumentParser(
+        description=(
+            "1h candle formula strategy with prior bias, "
+            "previous-prediction confirmation, and no opposite-signal exit."
+        )
+    )
     ap.add_argument("--timeframe", default="1h", choices=("1h",))
     ap.add_argument("--months", default=",".join(DEFAULT_MONTHS))
     ap.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS))
@@ -155,32 +173,40 @@ def main() -> None:
     path = Path(args.input_1h)
 
     print(
-        f"CANDLE_FORMULA | tf={args.timeframe} | bias=[0,0] | "
-        f"fee={args.commission * 100:.2f}%/side | roundtrip={args.commission * 200:.2f}% | capital=1000"
+        f"CANDLE_FORMULA | tf={args.timeframe} | prior-bias | "
+        f"previous-prediction-confirmed-entry | no-opposite-exit | "
+        f"fee={args.commission * 100:.2f}%/side | "
+        f"roundtrip={args.commission * 200:.2f}% | capital=1000"
     )
-    for exit_n in (1, 2, 3):
-        print(f"\nEXIT_AFTER={exit_n}_OPPOSITE_SIGNALS")
-        for symbol in symbols:
-            month_results: list[float] = []
-            for month in months:
-                candles = load_month(path, month, symbol)
-                if not candles:
-                    print(f"{symbol} {month} | NO_DATA")
-                    continue
-                r = run(candles, DEFAULT_LOWER, DEFAULT_UPPER, args.commission, exit_n)
-                month_results.append(float(r["return_pct"]))
-                pf = "INF" if r["pf"] == float("inf") else f"{float(r['pf']):.2f}"
-                print(
-                    f"{symbol} {month} | {float(r['return_pct']):+.2f}% final={float(r['final']):.2f} "
-                    f"trades={int(r['trades'])} win={float(r['win_rate']):.1f}% PF={pf} "
-                    f"DD={float(r['dd']):.2f}% L={int(r['long'])} S={int(r['short'])}"
-                )
-            if month_results:
-                print(
-                    f"{symbol} | 4M_COMPOUND={compound(month_results):+.2f}% | "
-                    f"AVG_MONTH={sum(month_results) / len(month_results):+.2f}% | "
-                    f"WORST={min(month_results):+.2f}%"
-                )
+
+    for symbol in symbols:
+        lower, upper = DEFAULT_BIAS.get(symbol, (-100.0, 100.0))
+        month_results: list[float] = []
+        print(f"\n{symbol} | bias=[{lower:.0f},{upper:.0f}]")
+
+        for month in months:
+            candles = load_month(path, month, symbol)
+            if not candles:
+                print(f"{month} | NO_DATA")
+                continue
+
+            r = run(candles, lower, upper, args.commission)
+            month_results.append(float(r["return_pct"]))
+            pf = "INF" if r["pf"] == float("inf") else f"{float(r['pf']):.2f}"
+            print(
+                f"{month} | return={float(r['return_pct']):+.2f}% "
+                f"final={float(r['final']):.2f} trades={int(r['trades'])} "
+                f"win={float(r['win_rate']):.1f}% PF={pf} DD={float(r['dd']):.2f}% "
+                f"L={int(r['long'])} S={int(r['short'])} "
+                f"confirmed={int(r['confirmed_entries'])}"
+            )
+
+        if month_results:
+            print(
+                f"{symbol} | 4M_COMPOUND={compound(month_results):+.2f}% | "
+                f"AVG_MONTH={sum(month_results) / len(month_results):+.2f}% | "
+                f"WORST={min(month_results):+.2f}%"
+            )
 
 
 if __name__ == "__main__":
