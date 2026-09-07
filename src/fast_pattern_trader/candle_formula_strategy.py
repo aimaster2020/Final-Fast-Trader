@@ -4,26 +4,26 @@ from dataclasses import dataclass
 
 from .models import Candle, Signal
 
-STRATEGY_NAME = "candle_formula_weighted_v3"
+STRATEGY_NAME = "candle_formula_exact_excel_v1"
 RANGE_MIN_BODY = -100.0
 RANGE_MAX_BODY = 100.0
-DECISION_SCORE = 3.0
+DECISION_SCORE = 3
 
-# Exact Excel formula groups. Do not relabel these algebraically.
-# RISE/UP group:
-#   H-C > C-O
-#   H-C > H-O
-#   L-C > C-O
-# FALL/DOWN group:
-#   H-C < C-O
-#   H-C < H-O
-#   L-C < C-O
-UP_WEIGHT_1 = 2.0
-UP_WEIGHT_2 = 1.0
-UP_WEIGHT_3 = 1.0
-DOWN_WEIGHT_1 = 2.0
-DOWN_WEIGHT_2 = 1.0
-DOWN_WEIGHT_3 = 1.0
+# Exact Excel formula groups.
+# UP group:
+#   R1: H-C > C-O
+#   R2: H-C > H-O
+#   R3: L-C > C-O
+# DOWN group:
+#   R4: H-C < C-O
+#   R5: H-C < H-O
+#   R6: L-C < C-O
+#
+# Excel decision logic is UNWEIGHTED:
+#   S = R1 + R2 + R3
+#   S = 3 -> UP
+#   S = 0 -> DOWN
+#   S = 1 or 2 -> HOLD
 
 
 @dataclass(frozen=True)
@@ -38,27 +38,29 @@ class FormulaRules:
     down_rule_3: bool
 
     @property
-    def up_score(self) -> float:
+    def up_score(self) -> int:
+        """Exact Excel S score: R1 + R2 + R3, no weighting."""
         return (
-            float(self.up_rule_1) * UP_WEIGHT_1
-            + float(self.up_rule_2) * UP_WEIGHT_2
-            + float(self.up_rule_3) * UP_WEIGHT_3
+            int(self.up_rule_1)
+            + int(self.up_rule_2)
+            + int(self.up_rule_3)
         )
 
     @property
-    def down_score(self) -> float:
+    def down_score(self) -> int:
+        """Diagnostic complement score: R4 + R5 + R6, no weighting."""
         return (
-            float(self.down_rule_1) * DOWN_WEIGHT_1
-            + float(self.down_rule_2) * DOWN_WEIGHT_2
-            + float(self.down_rule_3) * DOWN_WEIGHT_3
+            int(self.down_rule_1)
+            + int(self.down_rule_2)
+            + int(self.down_rule_3)
         )
 
 
 @dataclass(frozen=True)
 class FormulaDecision:
     signal: Signal
-    up_score: float
-    down_score: float
+    up_score: int
+    down_score: int
     is_range: bool
     body: float
     rules: FormulaRules
@@ -68,7 +70,7 @@ def evaluate_rules(candle: Candle) -> FormulaRules:
     """Evaluate the exact six Excel rules using only the current candle.
 
     H = high, L = low, C = close, O = open.
-    Rule order matches the spreadsheet's weighted logic.
+    Rule order matches the spreadsheet.
     """
     high_minus_close = candle.high - candle.close
     close_minus_open = candle.close - candle.open
@@ -76,13 +78,13 @@ def evaluate_rules(candle: Candle) -> FormulaRules:
     high_minus_open = candle.high - candle.open
 
     return FormulaRules(
-        # Original RISE/UP formulas: >
+        # Original UP formulas: >
         up_rule_1=high_minus_close > close_minus_open,
-        up_rule_2=high_minus_open < high_minus_close,  # equivalent to H-C > H-O
+        up_rule_2=high_minus_open < high_minus_close,
         up_rule_3=low_minus_close > close_minus_open,
-        # Original FALL/DOWN formulas: <
+        # Original DOWN formulas: <
         down_rule_1=high_minus_close < close_minus_open,
-        down_rule_2=high_minus_open > high_minus_close,  # equivalent to H-C < H-O
+        down_rule_2=high_minus_open > high_minus_close,
         down_rule_3=low_minus_close < close_minus_open,
     )
 
@@ -94,14 +96,14 @@ def is_range(candle: Candle) -> bool:
 
 
 def decide(candle: Candle) -> FormulaDecision:
-    """Return BUY for weighted UP=3, SELL for weighted DOWN=3, else HOLD."""
+    """Match the Excel decision rule exactly: S=3 UP, S=0 DOWN, else HOLD."""
     rules = evaluate_rules(candle)
     up_score = rules.up_score
     down_score = rules.down_score
 
-    if up_score >= DECISION_SCORE and down_score < DECISION_SCORE:
+    if up_score == DECISION_SCORE:
         signal = Signal.BUY
-    elif down_score >= DECISION_SCORE and up_score < DECISION_SCORE:
+    elif up_score == 0:
         signal = Signal.SELL
     else:
         signal = Signal.HOLD
