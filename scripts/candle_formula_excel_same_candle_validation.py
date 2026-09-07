@@ -72,6 +72,15 @@ def run_timeframe(path: Path, timeframe: str, month: str, symbol: str) -> dict[s
     hold_total = 0
     actual_flat = 0
     rule_mismatches = 0
+
+    # Streak statistics over signal frames only (UP/DOWN predictions).
+    current_correct_streak = 0
+    max_correct_streak = 0
+    correct_streak_sequences = 0
+    current_wrong_streak = 0
+    max_wrong_streak = 0
+    wrong_streak_sequences = 0
+
     rows = len(candles) - 1
 
     # Excel's I2 = compare J3 to J2. Therefore S(N) is evaluated on
@@ -87,8 +96,12 @@ def run_timeframe(path: Path, timeframe: str, month: str, symbol: str) -> dict[s
         actual_tuple = tuple(
             int(getattr(actual_rules, attr))
             for attr in (
-                "up_rule_1", "up_rule_2", "up_rule_3",
-                "down_rule_1", "down_rule_2", "down_rule_3",
+                "up_rule_1",
+                "up_rule_2",
+                "up_rule_3",
+                "down_rule_1",
+                "down_rule_2",
+                "down_rule_3",
             )
         )
         if actual_tuple != (r1, r2, r3, r4, r5, r6):
@@ -100,12 +113,30 @@ def run_timeframe(path: Path, timeframe: str, month: str, symbol: str) -> dict[s
 
         if expected_signal == 1:
             up_total += 1
-            up_correct += int(actual_dir == 1)
         elif expected_signal == -1:
             down_total += 1
-            down_correct += int(actual_dir == -1)
         else:
             hold_total += 1
+            continue
+
+        correct = actual_dir == expected_signal
+        if expected_signal == 1:
+            up_correct += int(correct)
+        else:
+            down_correct += int(correct)
+
+        if correct:
+            if current_correct_streak == 0:
+                correct_streak_sequences += 1
+            current_correct_streak += 1
+            max_correct_streak = max(max_correct_streak, current_correct_streak)
+            current_wrong_streak = 0
+        else:
+            if current_wrong_streak == 0:
+                wrong_streak_sequences += 1
+            current_wrong_streak += 1
+            max_wrong_streak = max(max_wrong_streak, current_wrong_streak)
+            current_correct_streak = 0
 
     up_accuracy = up_correct / up_total * 100.0 if up_total else 0.0
     down_accuracy = down_correct / down_total * 100.0 if down_total else 0.0
@@ -126,6 +157,10 @@ def run_timeframe(path: Path, timeframe: str, month: str, symbol: str) -> dict[s
         "overall_accuracy": overall_accuracy,
         "hold_total": hold_total,
         "actual_flat": actual_flat,
+        "max_correct_streak": max_correct_streak,
+        "correct_streak_sequences": correct_streak_sequences,
+        "max_wrong_streak": max_wrong_streak,
+        "wrong_streak_sequences": wrong_streak_sequences,
         "rule_mismatches": rule_mismatches,
     }
 
@@ -153,7 +188,10 @@ def main() -> None:
             f"{timeframe} | rows={r['rows']} | "
             f"UP={r['up_total']}/{r['up_correct']} ({r['up_accuracy']:.2f}%) | "
             f"DOWN={r['down_total']}/{r['down_correct']} ({r['down_accuracy']:.2f}%) | "
-            f"TOTAL={r['total_signals']}/{r['total_correct']} ({r['overall_accuracy']:.2f}%) | "
+            f"DIR={r['total_signals']}/{r['total_correct']} ({r['overall_accuracy']:.2f}%) | "
+            f"100PCT_MAX={r['total_signals']} | "
+            f"MAX_STREAK={r['max_correct_streak']} | "
+            f"STREAKS={r['correct_streak_sequences']} | "
             f"HOLD={r['hold_total']} FLAT={r['actual_flat']} | RULE_MISMATCH={r['rule_mismatches']}"
         )
 
