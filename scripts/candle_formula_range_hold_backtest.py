@@ -11,7 +11,7 @@ from fast_pattern_trader.models import Candle, Signal
 
 DEFAULT_RANGE_MIN = -100.0
 DEFAULT_RANGE_MAX = 100.0
-DEFAULT_COMMISSION = 0.0013  # 0.13% per side
+DEFAULT_COMMISSION = 0.0
 
 
 @dataclass
@@ -154,8 +154,9 @@ def run_timeframe(
             trade_net = ""
 
             if position is None:
-                # ENTRY: first valid signal only when body is inside the configurable range.
-                if sig != 0 and in_range:
+                # ENTRY: never enter while the candle body is in the range.
+                # A directional signal is actionable only outside the range.
+                if sig != 0 and not in_range:
                     allocated = equity * allocation
                     position = Position(sig, candle.close, candle.timestamp, i, allocated)
                     entry_signals += 1
@@ -167,7 +168,7 @@ def run_timeframe(
                         action = "OPEN_SHORT"
                 elif sig != 0:
                     ignored_outside_entry_signals += 1
-                    action = "IGNORE_ENTRY_OUTSIDE_RANGE"
+                    action = "IGNORE_ENTRY_IN_RANGE"
             else:
                 if sig == 0:
                     action = "HOLD_NO_SIGNAL"
@@ -307,12 +308,12 @@ def run_timeframe(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Trade exact Excel candle signals with configurable body range and 0.13% default per side."
+        description="Trade exact Excel candle signals with a body range filter. Default commission is 0."
     )
     ap.add_argument("--month", default="2026-05")
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--initial-capital", type=float, default=1000.0)
-    ap.add_argument("--commission", type=float, default=DEFAULT_COMMISSION, help="One-way commission rate; default 0.0013 = 0.13%%")
+    ap.add_argument("--commission", type=float, default=DEFAULT_COMMISSION, help="One-way commission rate; default 0")
     ap.add_argument("--allocation", type=float, default=1.0)
     ap.add_argument("--range-min", type=float, default=DEFAULT_RANGE_MIN)
     ap.add_argument("--range-max", type=float, default=DEFAULT_RANGE_MAX)
