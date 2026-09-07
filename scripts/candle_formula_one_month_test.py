@@ -30,10 +30,75 @@ def load_month(path: Path, month: str) -> list[Candle]:
     return sorted(candles, key=lambda x: x.timestamp)
 
 
+def signal_name(signal: Signal) -> str:
+    if signal == Signal.BUY:
+        return "BUY"
+    if signal == Signal.SELL:
+        return "SELL"
+    return "HOLD"
+
+
+def write_csv(candles: list[Candle], month: str, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    fields = [
+        "month", "timestamp", "open", "high", "low", "close", "body_close_minus_open",
+        "high_minus_close", "low_minus_close", "high_minus_open",
+        "fall_rule_1", "fall_rule_2", "fall_rule_3", "fall_score",
+        "rise_rule_1", "rise_rule_2", "rise_rule_3", "rise_score",
+        "is_range", "signal", "next_close", "actual_direction", "correct",
+    ]
+
+    with output.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+
+        for i, candle in enumerate(candles[:-1]):
+            d = decide(candle)
+            next_close = candles[i + 1].close
+
+            if next_close > candle.close:
+                actual = "BUY"
+            elif next_close < candle.close:
+                actual = "SELL"
+            else:
+                actual = "HOLD"
+
+            predicted = signal_name(d.signal)
+            correct = "" if predicted == "HOLD" else str(predicted == actual)
+
+            writer.writerow({
+                "month": month,
+                "timestamp": candle.timestamp,
+                "open": candle.open,
+                "high": candle.high,
+                "low": candle.low,
+                "close": candle.close,
+                "body_close_minus_open": candle.close - candle.open,
+                "high_minus_close": candle.high - candle.close,
+                "low_minus_close": candle.low - candle.close,
+                "high_minus_open": candle.high - candle.open,
+                "fall_rule_1": int(d.rules.fall_rule_1),
+                "fall_rule_2": int(d.rules.fall_rule_2),
+                "fall_rule_3": int(d.rules.fall_rule_3),
+                "fall_score": d.fall_score,
+                "rise_rule_1": int(d.rules.rise_rule_1),
+                "rise_rule_2": int(d.rules.rise_rule_2),
+                "rise_rule_3": int(d.rules.rise_rule_3),
+                "rise_score": d.rise_score,
+                "is_range": int(d.is_range),
+                "signal": predicted,
+                "next_close": next_close,
+                "actual_direction": actual,
+                "correct": correct,
+            })
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Test the new 3x3 candle formula on one month of 1h data.")
     ap.add_argument("--input", default="reports/1h/BTCUSDT_1h.csv")
     ap.add_argument("--month", default="2026-07")
+    ap.add_argument("--output", default="reports/candle_formula_1h_2026-07.csv")
     args = ap.parse_args()
 
     candles = load_month(Path(args.input), args.month)
@@ -62,6 +127,8 @@ def main() -> None:
         else:
             hold += 1
 
+    write_csv(candles, args.month, Path(args.output))
+
     signals = buy + sell
     wins = buy_wins + sell_wins
     accuracy = wins / signals * 100.0 if signals else 0.0
@@ -74,6 +141,7 @@ def main() -> None:
     print(f"SELL={sell} win={sell_wins} acc={sell_acc:.2f}%")
     print(f"HOLD={hold} RANGE={ranges} ({range_pct:.2f}%)")
     print(f"SIGNALS={signals} WINS={wins} LOSSES={losses} ACCURACY={accuracy:.2f}%")
+    print(f"CSV={args.output}")
 
 
 if __name__ == "__main__":
