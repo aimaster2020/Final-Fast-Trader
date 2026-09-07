@@ -55,7 +55,7 @@ def pnl(side: int, entry: float, price: float) -> float:
     return side * (price - entry) / entry if entry > 0 else 0.0
 
 
-def run(candles: list[Candle], lo: float, hi: float) -> dict[str, float | int]:
+def run(candles: list[Candle], lo: float, hi: float, commission: float) -> dict[str, float | int]:
     equity = CAPITAL
     position: Position | None = None
     prev_pred = 0
@@ -76,7 +76,7 @@ def run(candles: list[Candle], lo: float, hi: float) -> dict[str, float | int]:
         else:
             if in_bias(body, lo, hi):
                 gross = position.capital * pnl(position.side, position.entry, c.close)
-                net = gross - position.capital * COMMISSION * 2.0
+                net = gross - position.capital * commission * 2.0
                 equity += net
                 trades += 1
                 wins += int(net > 0)
@@ -94,7 +94,7 @@ def run(candles: list[Candle], lo: float, hi: float) -> dict[str, float | int]:
 
     if position is not None and candles:
         gross = position.capital * pnl(position.side, position.entry, candles[-1].close)
-        net = gross - position.capital * COMMISSION * 2.0
+        net = gross - position.capital * commission * 2.0
         equity += net
         trades += 1
         wins += int(net > 0)
@@ -140,17 +140,19 @@ def main() -> None:
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--min-trades", type=int, default=15)
     ap.add_argument("--min-positive-months", type=int, default=2)
+    ap.add_argument("--commission", type=float, default=COMMISSION, help="Commission per side as decimal; e.g. 0.0013 = 0.13%%")
     args = ap.parse_args()
     path = Path(args.input)
 
-    print(f"BIAS_WF_ROBUST | tf=1h | train=May-Jun-Jul | validation=Aug | fee=0.13%/side | min_trades={args.min_trades} | min_positive_months={args.min_positive_months}")
+    fee_pct = args.commission * 100.0
+    print(f"BIAS_WF_ROBUST | tf=1h | train=May-Jun-Jul | validation=Aug | fee={fee_pct:.2f}%/side | min_trades={args.min_trades} | min_positive_months={args.min_positive_months}")
 
     for symbol in SYMBOLS:
         train = [load(path, m, symbol) for m in TRAIN_MONTHS]
         valid = load(path, VALIDATION_MONTH, symbol)
         rows: list[tuple[tuple[int, float, float, float], float, float, dict[str, float | int]]] = []
         for lo, hi in candidates():
-            rs = [run(cs, lo, hi) for cs in train]
+            rs = [run(cs, lo, hi, args.commission) for cs in train]
             rets = [float(r["return"]) for r in rs]
             total_trades = sum(int(r["trades"]) for r in rs)
             positive_months = sum(r > 0 for r in rets)
@@ -160,7 +162,7 @@ def main() -> None:
             avg = sum(rets) / len(rets)
             worst = min(rets)
             score = (positive_months, comp, avg, worst)
-            rows.append((score, lo, hi, run(valid, lo, hi)))
+            rows.append((score, lo, hi, run(valid, lo, hi, args.commission)))
 
         rows.sort(key=lambda x: x[0], reverse=True)
         print(f"\n{symbol}")
