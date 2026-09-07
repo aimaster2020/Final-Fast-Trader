@@ -45,10 +45,18 @@ def excel_rule_values(candle: Candle) -> tuple[int, int, int, int, int, int]:
     )
 
 
+def candle_body(candle: Candle) -> float:
+    """Excel column J = Close - Open (C-O)."""
+    return candle.close - candle.open
+
+
 def actual_direction(candle: Candle, previous: Candle) -> int:
-    if candle.close > previous.close:
+    """Exact Excel column I: compare current J (C-O) with previous J (C-O)."""
+    current_body = candle_body(candle)
+    previous_body = candle_body(previous)
+    if current_body > previous_body:
         return 1
-    if candle.close < previous.close:
+    if current_body < previous_body:
         return -1
     return 0
 
@@ -61,6 +69,7 @@ def run_timeframe(path: Path, timeframe: str, month: str, symbol: str) -> dict[s
     up_total = up_correct = 0
     down_total = down_correct = 0
     hold_total = 0
+    actual_flat = 0
     rule_mismatches = 0
     rows = len(candles) - 1
 
@@ -83,6 +92,9 @@ def run_timeframe(path: Path, timeframe: str, month: str, symbol: str) -> dict[s
             rule_mismatches += 1
 
         actual_dir = actual_direction(candle, previous)
+        if actual_dir == 0:
+            actual_flat += 1
+
         if expected_signal == 1:
             up_total += 1
             up_correct += int(actual_dir == 1)
@@ -110,13 +122,14 @@ def run_timeframe(path: Path, timeframe: str, month: str, symbol: str) -> dict[s
         "total_correct": total_correct,
         "overall_accuracy": overall_accuracy,
         "hold_total": hold_total,
+        "actual_flat": actual_flat,
         "rule_mismatches": rule_mismatches,
     }
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Exact Excel same-candle validation: S=3 vs I=UP and S=0 vs I=DOWN."
+        description="Exact Excel validation: S=3/S=0 versus change in J=(Close-Open)."
     )
     ap.add_argument("--month", default="2026-07")
     ap.add_argument("--symbol", default="BTCUSDT")
@@ -138,7 +151,7 @@ def main() -> None:
             f"UP={r['up_total']}/{r['up_correct']} ({r['up_accuracy']:.2f}%) | "
             f"DOWN={r['down_total']}/{r['down_correct']} ({r['down_accuracy']:.2f}%) | "
             f"TOTAL={r['total_signals']}/{r['total_correct']} ({r['overall_accuracy']:.2f}%) | "
-            f"HOLD={r['hold_total']} | RULE_MISMATCH={r['rule_mismatches']}"
+            f"HOLD={r['hold_total']} FLAT={r['actual_flat']} | RULE_MISMATCH={r['rule_mismatches']}"
         )
 
 
