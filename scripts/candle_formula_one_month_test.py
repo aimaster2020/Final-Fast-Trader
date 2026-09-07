@@ -30,67 +30,50 @@ def load_month(path: Path, month: str) -> list[Candle]:
     return sorted(candles, key=lambda x: x.timestamp)
 
 
-def rule_predictions(candle: Candle) -> tuple[str, ...]:
-    rules = evaluate_rules(candle)
-    predictions: list[str] = []
-    if rules.fall_rule_1:
-        predictions.append("FALL")
-    if rules.fall_rule_2:
-        predictions.append("FALL")
-    if rules.fall_rule_3:
-        predictions.append("FALL")
-    if rules.rise_rule_1:
-        predictions.append("RISE")
-    if rules.rise_rule_2:
-        predictions.append("RISE")
-    if rules.rise_rule_3:
-        predictions.append("RISE")
-    return tuple(predictions)
+def actual_direction(candle: Candle, previous_candle: Candle) -> tuple[str, float]:
+    """Excel ground truth: IF(current Close > previous Close, UP, DOWN)."""
+    change = candle.close - previous_candle.close
+    if change > 0:
+        return "UP", change
+    if change < 0:
+        return "DOWN", change
+    return "FLAT", change
 
 
 def weighted_prediction(candle: Candle) -> str:
+    """Use the requested threshold of 3 points for the two rule groups."""
     rules = evaluate_rules(candle)
-    if rules.fall_score > rules.rise_score:
-        return "FALL"
-    if rules.rise_score > rules.fall_score:
-        return "RISE"
+    down = rules.fall_score
+    up = rules.rise_score
+
+    if down >= 3.0 and up < 3.0:
+        return "DOWN"
+    if up >= 3.0 and down < 3.0:
+        return "UP"
     return "UNDECIDED"
-
-
-def actual_direction(candle: Candle, previous_candle: Candle) -> tuple[str, float]:
-    """Excel ground truth: current Close - previous Close."""
-    change = candle.close - previous_candle.close
-    if change > 0:
-        return "RISE", change
-    if change < 0:
-        return "FALL", change
-    return "FLAT", change
 
 
 def write_csv(candles: list[Candle], month: str, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-
     fields = [
-        "month", "timestamp", "open", "high", "low", "close", "body_close_minus_open",
+        "month", "timestamp", "open", "high", "low", "close", "previous_close",
+        "actual_change", "actual_direction", "body_close_minus_open",
         "high_minus_close", "low_minus_close", "high_minus_open",
-        "fall_rule_1", "fall_rule_2", "fall_rule_3", "fall_score",
-        "rise_rule_1", "rise_rule_2", "rise_rule_3", "rise_score",
-        "is_range", "predicted_direction", "previous_close", "actual_change",
-        "actual_direction", "correct",
+        "down_rule_1", "down_rule_2", "down_rule_3", "down_score",
+        "up_rule_1", "up_rule_2", "up_rule_3", "up_score",
+        "is_range", "predicted_direction", "correct",
     ]
 
     with output.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
-
         for i in range(1, len(candles)):
             candle = candles[i]
-            previous_candle = candles[i - 1]
+            previous = candles[i - 1]
             rules = evaluate_rules(candle)
+            actual, actual_change = actual_direction(candle, previous)
             predicted = weighted_prediction(candle)
-            actual, actual_change = actual_direction(candle, previous_candle)
             correct = "" if predicted == "UNDECIDED" or actual == "FLAT" else str(predicted == actual)
-
             writer.writerow({
                 "month": month,
                 "timestamp": candle.timestamp,
@@ -98,23 +81,23 @@ def write_csv(candles: list[Candle], month: str, output: Path) -> None:
                 "high": candle.high,
                 "low": candle.low,
                 "close": candle.close,
+                "previous_close": previous.close,
+                "actual_change": actual_change,
+                "actual_direction": actual,
                 "body_close_minus_open": candle.close - candle.open,
                 "high_minus_close": candle.high - candle.close,
                 "low_minus_close": candle.low - candle.close,
                 "high_minus_open": candle.high - candle.open,
-                "fall_rule_1": int(rules.fall_rule_1),
-                "fall_rule_2": int(rules.fall_rule_2),
-                "fall_rule_3": int(rules.fall_rule_3),
-                "fall_score": rules.fall_score,
-                "rise_rule_1": int(rules.rise_rule_1),
-                "rise_rule_2": int(rules.rise_rule_2),
-                "rise_rule_3": int(rules.rise_rule_3),
-                "rise_score": rules.rise_score,
+                "down_rule_1": int(rules.fall_rule_1),
+                "down_rule_2": int(rules.fall_rule_2),
+                "down_rule_3": int(rules.fall_rule_3),
+                "down_score": rules.fall_score,
+                "up_rule_1": int(rules.rise_rule_1),
+                "up_rule_2": int(rules.rise_rule_2),
+                "up_rule_3": int(rules.rise_rule_3),
+                "up_score": rules.rise_score,
                 "is_range": int(is_range(candle)),
                 "predicted_direction": predicted,
-                "previous_close": previous_candle.close,
-                "actual_change": actual_change,
-                "actual_direction": actual,
                 "correct": correct,
             })
 
@@ -131,17 +114,17 @@ def main() -> None:
         raise SystemExit(f"No usable 1h candles found for {args.month}")
 
     rule_defs = [
-        ("R1_FALL", "fall_rule_1", "FALL"),
-        ("R2_FALL", "fall_rule_2", "FALL"),
-        ("R3_FALL", "fall_rule_3", "FALL"),
-        ("R4_RISE", "rise_rule_1", "RISE"),
-        ("R5_RISE", "rise_rule_2", "RISE"),
-        ("R6_RISE", "rise_rule_3", "RISE"),
+        ("R1_DOWN", "fall_rule_1", "DOWN"),
+        ("R2_DOWN", "fall_rule_2", "DOWN"),
+        ("R3_DOWN", "fall_rule_3", "DOWN"),
+        ("R4_UP", "rise_rule_1", "UP"),
+        ("R5_UP", "rise_rule_2", "UP"),
+        ("R6_UP", "rise_rule_3", "UP"),
     ]
     stats = {name: [0, 0] for name, _, _ in rule_defs}
-    rise = fall = undecided = ranges = 0
-    rise_wins = fall_wins = comparable = 0
-    actual_rise = actual_fall = actual_flat = 0
+    up = down = undecided = ranges = 0
+    up_wins = down_wins = comparable = 0
+    actual_up = actual_down = actual_flat = 0
 
     for i in range(1, len(candles)):
         candle = candles[i]
@@ -151,27 +134,27 @@ def main() -> None:
         predicted = weighted_prediction(candle)
         ranges += int(is_range(candle))
 
-        if actual == "RISE":
-            actual_rise += 1
-        elif actual == "FALL":
-            actual_fall += 1
+        if actual == "UP":
+            actual_up += 1
+        elif actual == "DOWN":
+            actual_down += 1
         else:
             actual_flat += 1
 
-        if predicted == "RISE":
-            rise += 1
-        elif predicted == "FALL":
-            fall += 1
+        if predicted == "UP":
+            up += 1
+        elif predicted == "DOWN":
+            down += 1
         else:
             undecided += 1
 
-        if predicted in {"RISE", "FALL"} and actual in {"RISE", "FALL"}:
+        if predicted in {"UP", "DOWN"} and actual in {"UP", "DOWN"}:
             comparable += 1
             if predicted == actual:
-                if predicted == "RISE":
-                    rise_wins += 1
+                if predicted == "UP":
+                    up_wins += 1
                 else:
-                    fall_wins += 1
+                    down_wins += 1
 
         for name, attr, expected in rule_defs:
             if getattr(rules, attr):
@@ -180,17 +163,19 @@ def main() -> None:
 
     write_csv(candles, args.month, Path(args.output))
 
-    wins = rise_wins + fall_wins
+    wins = up_wins + down_wins
     accuracy = wins / comparable * 100.0 if comparable else 0.0
-    rise_acc = rise_wins / rise * 100.0 if rise else 0.0
-    fall_acc = fall_wins / fall * 100.0 if fall else 0.0
+    up_acc = up_wins / up * 100.0 if up else 0.0
+    down_acc = down_wins / down * 100.0 if down else 0.0
     range_pct = ranges / (len(candles) - 1) * 100.0
 
     print(f"1h {args.month} | candles={len(candles)-1}")
-    print(f"ACTUAL RISE={actual_rise} FALL={actual_fall} FLAT={actual_flat}")
-    print(f"R1={stats['R1_FALL'][1]}/{stats['R1_FALL'][0]} ({stats['R1_FALL'][1]/stats['R1_FALL'][0]*100:.2f}%) | R2={stats['R2_FALL'][1]}/{stats['R2_FALL'][0]} ({stats['R2_FALL'][1]/stats['R2_FALL'][0]*100:.2f}%) | R3={stats['R3_FALL'][1]}/{stats['R3_FALL'][0]} ({stats['R3_FALL'][1]/stats['R3_FALL'][0]*100:.2f}%)")
-    print(f"R4={stats['R4_RISE'][1]}/{stats['R4_RISE'][0]} ({stats['R4_RISE'][1]/stats['R4_RISE'][0]*100:.2f}%) | R5={stats['R5_RISE'][1]}/{stats['R5_RISE'][0]} ({stats['R5_RISE'][1]/stats['R5_RISE'][0]*100:.2f}%) | R6={stats['R6_RISE'][1]}/{stats['R6_RISE'][0]} ({stats['R6_RISE'][1]/stats['R6_RISE'][0]*100:.2f}%)")
-    print(f"WEIGHTED RISE={rise} win={rise_wins} acc={rise_acc:.2f}% | FALL={fall} win={fall_wins} acc={fall_acc:.2f}%")
+    print(f"ACTUAL UP={actual_up} DOWN={actual_down} FLAT={actual_flat}")
+    for name, _, _ in rule_defs:
+        correct, activated = stats[name][1], stats[name][0]
+        acc = correct / activated * 100.0 if activated else 0.0
+        print(f"{name}={correct}/{activated} ({acc:.2f}%)")
+    print(f"WEIGHTED UP={up} win={up_wins} acc={up_acc:.2f}% | DOWN={down} win={down_wins} acc={down_acc:.2f}%")
     print(f"UNDECIDED={undecided} RANGE={ranges} ({range_pct:.2f}%)")
     print(f"CHECKED={comparable} WINS={wins} ACCURACY={accuracy:.2f}%")
     print(f"CSV={args.output}")
