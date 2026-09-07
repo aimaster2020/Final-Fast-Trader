@@ -66,21 +66,31 @@ def collect(df, pattern, direction, horizon):
 
 
 def candidates(pattern, s):
-    return [
-        ("BASE", pd.Series(True, index=s.index)),
-        ("body<=0.25", s.body_r <= 0.25),
-        ("lower>=0.70", s.lower_r >= 0.70),
-        ("lower>=0.75", s.lower_r >= 0.75),
-        ("upper<=0.15", s.upper_r <= 0.15),
-        ("upper<=0.20", s.upper_r <= 0.20),
+    base = [("BASE", pd.Series(True, index=s.index))]
+    if pattern == "Bullish Pin Bar":
+        return base + [
+            ("body<=0.25", s.body_r <= 0.25),
+            ("lower>=0.70", s.lower_r >= 0.70),
+            ("lower>=0.75", s.lower_r >= 0.75),
+            ("upper<=0.15", s.upper_r <= 0.15),
+            ("body<=0.25+lower>=0.70", (s.body_r <= 0.25) & (s.lower_r >= 0.70)),
+            ("body<=0.25+lower>=0.75", (s.body_r <= 0.25) & (s.lower_r >= 0.75)),
+            ("lower>=0.70+upper<=0.15", (s.lower_r >= 0.70) & (s.upper_r <= 0.15)),
+        ]
+    if pattern == "Hammer":
+        return base + [
+            ("body<=0.25", s.body_r <= 0.25),
+            ("lower>=0.70", s.lower_r >= 0.70),
+            ("upper<=0.20", s.upper_r <= 0.20),
+            ("body<=0.25+lower>=0.70", (s.body_r <= 0.25) & (s.lower_r >= 0.70)),
+            ("body<=0.25+upper<=0.20", (s.body_r <= 0.25) & (s.upper_r <= 0.20)),
+            ("lower>=0.70+upper<=0.20", (s.lower_r >= 0.70) & (s.upper_r <= 0.20)),
+            ("body<=0.25+lower>=0.70+upper<=0.20", (s.body_r <= 0.25) & (s.lower_r >= 0.70) & (s.upper_r <= 0.20)),
+        ]
+    return base + [
         ("body>=0.50", s.body_r >= 0.50),
         ("body>=0.60", s.body_r >= 0.60),
         ("range_exp>=1.25", s.range_exp >= 1.25),
-        ("body<=0.25+lower>=0.70", (s.body_r <= 0.25) & (s.lower_r >= 0.70)),
-        ("body<=0.25+lower>=0.75", (s.body_r <= 0.25) & (s.lower_r >= 0.75)),
-        ("body<=0.25+upper<=0.20", (s.body_r <= 0.25) & (s.upper_r <= 0.20)),
-        ("lower>=0.70+upper<=0.15", (s.lower_r >= 0.70) & (s.upper_r <= 0.15)),
-        ("lower>=0.70+upper<=0.20", (s.lower_r >= 0.70) & (s.upper_r <= 0.20)),
         ("body>=0.50+range_exp>=1.25", (s.body_r >= 0.50) & (s.range_exp >= 1.25)),
         ("body>=0.50+close_low<=0.25", (s.body_r >= 0.50) & (s.close_low_r <= 0.25)),
     ]
@@ -107,9 +117,25 @@ def load(path):
     time_col = next((c for c in ("timestamp", "time", "datetime", "date") if c in df.columns), None)
     if symbol_col is None or time_col is None:
         raise ValueError("Need symbol and timestamp/time/datetime/date columns")
-    df["_dt"] = pd.to_datetime(df[time_col], errors="coerce")
+
+    raw_time = df[time_col]
+    if pd.api.types.is_numeric_dtype(raw_time):
+        sample = pd.to_numeric(raw_time, errors="coerce").dropna()
+        median_abs = sample.abs().median() if not sample.empty else 0
+        if median_abs >= 1e17:
+            unit = "ns"
+        elif median_abs >= 1e14:
+            unit = "us"
+        elif median_abs >= 1e11:
+            unit = "ms"
+        else:
+            unit = "s"
+        df["_dt"] = pd.to_datetime(raw_time, unit=unit, errors="coerce", utc=True)
+    else:
+        df["_dt"] = pd.to_datetime(raw_time, errors="coerce", utc=True)
+
     df = df.dropna(subset=["_dt"]).copy()
-    return df, symbol_col
+    return df, symbol_col, time_col
 
 
 def main():
@@ -125,7 +151,7 @@ def main():
     train_months = set(x.strip() for x in args.train_months.split(",") if x.strip())
     test_months = set(x.strip() for x in args.test_months.split(",") if x.strip())
     symbols = [x.strip().upper() for x in args.symbols.split(",") if x.strip()]
-    df, symbol_col = load(args.prepared_file)
+    df, symbol_col, time_col = load(args.prepared_file)
     df["_month"] = df["_dt"].dt.strftime("%Y-%m")
 
     print()
@@ -133,22 +159,27 @@ def main():
     print(f"TRAIN: {','.join(sorted(train_months))} | TEST: {','.join(sorted(test_months))}")
     print("Filter selection uses TRAIN only; TEST is frozen out-of-sample.")
     print("Commission: 0.13% entry + 0.13% exit = 0.26% round trip")
+    print(f"DATA RANGE: {df['_dt'].min()} -> {df['_dt'].max()}")
+    print(f"MONTHS PRESENT: {','.join(sorted(df['_month'].dropna().unique()))}")
     print()
 
     for symbol in symbols:
         sdf = df[df[symbol_col].astype(str).str.upper() == symbol].copy()
         if sdf.empty:
+            print(f"{symbol} | NO DATA")
             continue
         sdf = sdf.sort_values("_dt").reset_index(drop=True)
         train = sdf[sdf._month.isin(train_months)].copy().sort_values("_dt").reset_index(drop=True)
         test = sdf[sdf._month.isin(test_months)].copy().sort_values("_dt").reset_index(drop=True)
         if train.empty or test.empty:
+            print(f"{symbol} | TRAIN_ROWS={len(train)} TEST_ROWS={len(test)} | SKIP: missing requested months")
             continue
 
         for pattern, direction in PATTERNS.items():
             tr = collect(train, pattern, direction, args.horizon)
             te = collect(test, pattern, direction, args.horizon)
             if tr.empty or te.empty:
+                print(f"{symbol} | {pattern} | TRAIN_N={len(tr)} TEST_N={len(te)} | SKIP: no pattern signals")
                 continue
 
             ranked = []
