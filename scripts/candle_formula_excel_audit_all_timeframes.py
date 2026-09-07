@@ -5,7 +5,7 @@ import csv
 from pathlib import Path
 
 from fast_pattern_trader.candle_formula_strategy import decide, evaluate_rules, is_range
-from fast_pattern_trader.models import Candle
+from fast_pattern_trader.models import Candle, Signal
 
 
 RULES = (
@@ -41,6 +41,15 @@ def excel_signal(candle: Candle) -> str:
     if s == 3:
         return "UP"
     if s == 0:
+        return "DOWN"
+    return "HOLD"
+
+
+def python_signal_name(signal: Signal) -> str:
+    """Map the project's IntEnum signal values to the audit vocabulary."""
+    if signal == Signal.BUY:
+        return "UP"
+    if signal == Signal.SELL:
         return "DOWN"
     return "HOLD"
 
@@ -96,11 +105,7 @@ def audit(path: Path, timeframe: str, month: str, symbol: str) -> dict[str, int 
         score_mismatches += int(actual_s != expected_s)
 
         expected_signal = excel_signal(candle)
-        python_signal = {
-            "BUY": "UP",
-            "SELL": "DOWN",
-            "HOLD": "HOLD",
-        }[decide(candle).signal.value]
+        python_signal = python_signal_name(decide(candle).signal)
         signal_mismatches += int(expected_signal != python_signal)
         range_mismatches += int(is_range(candle) != (-100.0 <= candle.close - candle.open <= 100.0))
 
@@ -112,7 +117,7 @@ def audit(path: Path, timeframe: str, month: str, symbol: str) -> dict[str, int 
         "weighted_mismatches": weighted_mismatches,
         "signal_mismatches": signal_mismatches,
         "range_mismatches": range_mismatches,
-        "pass": total > 0 and all(v == 0 for k, v in locals()["mismatches"].items())
+        "pass": total > 0 and all(v == 0 for v in mismatches.values())
         and score_mismatches == 0
         and weighted_mismatches == 0
         and signal_mismatches == 0
