@@ -29,12 +29,14 @@ def load_month(path: Path, month: str, symbol: str) -> list[Candle]:
             if row.get("month") != month or row.get("symbol") != symbol:
                 continue
             try:
-                out.append(Candle(
-                    int(float(row["timestamp"])),
-                    float(row["open"]),
-                    float(row["high"]),
-                    float(row["low"]),
-                    float(row["close"])),
+                out.append(
+                    Candle(
+                        int(float(row["timestamp"])),
+                        float(row["open"]),
+                        float(row["high"]),
+                        float(row["low"]),
+                        float(row["close"]),
+                    )
                 )
             except (KeyError, TypeError, ValueError):
                 continue
@@ -69,40 +71,51 @@ def run(candles: list[Candle], lower: float, upper: float, commission: float) ->
         if position is None:
             if sig != 0 and not (lower <= body <= upper):
                 position = Position(sig, candle.close, equity)
-                long_entries += sig > 0
-                short_entries += sig < 0
+                long_entries += int(sig > 0)
+                short_entries += int(sig < 0)
             elif sig != 0:
                 ignored += 1
-            continue
-
-        side, entry, capital = position
-        opposite = sig != 0 and sig != side
-        exit_now = (side > 0 and opposite and body <= upper) or (side < 0 and opposite and body >= lower)
-        if exit_now:
-            gross = capital * pnl(side, entry, candle.close)
-            fee = capital * commission * 2.0
-            net = gross - fee
-            equity += net
-            trades += 1
-            wins += net > 0
-            gross_profit += max(gross, 0.0)
-            gross_loss += min(gross, 0.0)
-            position = None
+        else:
+            side = position.side
+            entry = position.entry_price
+            capital = position.capital
+            opposite = sig != 0 and sig != side
+            exit_now = (
+                side > 0 and opposite and body <= upper
+            ) or (
+                side < 0 and opposite and body >= lower
+            )
+            if exit_now:
+                gross = capital * pnl(side, entry, candle.close)
+                fee = capital * commission * 2.0
+                net = gross - fee
+                equity += net
+                trades += 1
+                wins += int(net > 0)
+                gross_profit += max(gross, 0.0)
+                gross_loss += min(gross, 0.0)
+                position = None
 
         mtm = equity
         if position is not None:
-            mtm += position.capital * pnl(position.side, position.entry_price, candle.close)
+            mtm += position.capital * pnl(
+                position.side,
+                position.entry_price,
+                candle.close,
+            )
         peak = max(peak, mtm)
         max_dd = max(max_dd, (peak - mtm) / peak if peak else 0.0)
 
     if position is not None and candles:
-        side, entry, capital = position
+        side = position.side
+        entry = position.entry_price
+        capital = position.capital
         gross = capital * pnl(side, entry, candles[-1].close)
         fee = capital * commission * 2.0
         net = gross - fee
         equity += net
         trades += 1
-        wins += net > 0
+        wins += int(net > 0)
         gross_profit += max(gross, 0.0)
         gross_loss += min(gross, 0.0)
 
@@ -141,7 +154,10 @@ def main() -> None:
     symbols = tuple(x.strip() for x in args.symbols.split(",") if x.strip())
     path = Path(args.input_1h)
 
-    print(f"CANDLE_FORMULA | tf={args.timeframe} | range=[{args.lower:.0f},{args.upper:.0f}] | fee={args.commission*100:.2f}%/side | capital=1000")
+    print(
+        f"CANDLE_FORMULA | tf={args.timeframe} | range=[{args.lower:.0f},{args.upper:.0f}] | "
+        f"fee={args.commission * 100:.2f}%/side | roundtrip={args.commission * 200:.2f}% | capital=1000"
+    )
     for symbol in symbols:
         month_results: list[float] = []
         print(f"\n{symbol}")
@@ -153,9 +169,17 @@ def main() -> None:
             r = run(candles, args.lower, args.upper, args.commission)
             month_results.append(float(r["return_pct"]))
             pf = "INF" if r["pf"] == float("inf") else f"{float(r['pf']):.2f}"
-            print(f"{month} | return={float(r['return_pct']):+.2f}% final={float(r['final']):.2f} trades={int(r['trades'])} win={float(r['win_rate']):.1f}% PF={pf} DD={float(r['dd']):.2f}% L={int(r['long'])} S={int(r['short'])}")
+            print(
+                f"{month} | return={float(r['return_pct']):+.2f}% final={float(r['final']):.2f} "
+                f"trades={int(r['trades'])} win={float(r['win_rate']):.1f}% PF={pf} "
+                f"DD={float(r['dd']):.2f}% L={int(r['long'])} S={int(r['short'])} ignored={int(r['ignored'])}"
+            )
         if month_results:
-            print(f"4M_COMPOUND={compound(month_results):+.2f}% | AVG_MONTH={sum(month_results)/len(month_results):+.2f}% | WORST={min(month_results):+.2f}%")
+            print(
+                f"4M_COMPOUND={compound(month_results):+.2f}% | "
+                f"AVG_MONTH={sum(month_results) / len(month_results):+.2f}% | "
+                f"WORST={min(month_results):+.2f}%"
+            )
 
 
 if __name__ == "__main__":
