@@ -236,6 +236,7 @@ def run_timeframe(
 
     return {
         "symbol": symbol,
+        "month": month,
         "timeframe": timeframe,
         "candles": len(candles),
         "initial": initial_capital,
