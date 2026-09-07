@@ -44,11 +44,6 @@ def load_month(path: Path, month: str, symbol: str) -> list[Candle]:
     return sorted(candles, key=lambda x: x.timestamp)
 
 
-def body_in_range(candle: Candle, range_min: float, range_max: float) -> bool:
-    body = candle.close - candle.open
-    return range_min <= body <= range_max
-
-
 def signal_side(candle: Candle) -> int:
     signal = decide(candle).signal
     if signal == Signal.BUY:
@@ -70,7 +65,6 @@ def close_position(
     equity: float,
     commission: float,
 ) -> tuple[float, float, float, float]:
-    """Return (new_equity, gross_pnl, net_pnl, total_round_trip_fees)."""
     trade_return = pnl_pct(position.side, position.entry_price, exit_price)
     gross = position.allocated_capital * trade_return
     fees = position.allocated_capital * commission * 2.0
@@ -108,8 +102,8 @@ def run_timeframe(
         raise SystemExit("allocation must be in (0, 1]")
     if commission < 0:
         raise SystemExit("commission must be >= 0")
-    if range_min > range_max:
-        raise SystemExit("range_min must be <= range_max")
+    if range_min >= 0 or range_max <= 0 or range_min >= range_max:
+        raise SystemExit("range must satisfy range_min < 0 < range_max")
 
     equity = initial_capital
     position: Position | None = None
@@ -125,8 +119,7 @@ def run_timeframe(
     peak_equity = initial_capital
     max_drawdown = 0.0
     exits = 0
-    exit_threshold_exits = 0
-    ignored_in_range_entry_signals = 0
+    ignored_in_range_entries = 0
     entries_long = 0
     entries_short = 0
     entry_signals = 0
@@ -154,7 +147,8 @@ def run_timeframe(
             trade_net = ""
 
             if position is None:
-                # ENTRY: directional signal can open a trade only outside the range.
+                # ENTRY: only directional signals outside the neutral range may open a trade.
+                # UP outside +range_max => LONG; DOWN outside range_min => SHORT.
                 if sig != 0 and not in_range:
                     allocated = equity * allocation
                     position = Position(sig, candle.close, candle.timestamp, i, allocated)
@@ -166,50 +160,50 @@ def run_timeframe(
                         entries_short += 1
                         action = "OPEN_SHORT"
                 elif sig != 0:
-                    ignored_in_range_entry_signals += 1
+                    ignored_in_range_entries += 1
                     action = "IGNORE_ENTRY_IN_RANGE"
             else:
+                # EXIT FILTER:
+                # LONG + opposite DOWN: exit when BODY is at or below +range_max.
+                # LONG remains open while BODY is above +range_max.
+                # SHORT + opposite UP: exit when BODY is at or above range_min.
+                # SHORT remains open while BODY is below range_min.
+                # The exit candle does not automatically open the opposite side.
+                exit_triggered = (
+                    position.side > 0 and sig < 0 and body <= range_max
+                ) or (
+                    position.side < 0 and sig > 0 and body >= range_min
+                )
+
                 if sig == 0:
                     action = "HOLD_NO_SIGNAL"
                 elif sig == position.side:
                     action = "HOLD_SAME"
+                elif not exit_triggered:
+                    action = "HOLD_OPPOSITE_OUTSIDE_EXIT_THRESHOLD"
                 else:
-                    # EXIT NOISE FILTER:
-                    # LONG exits on an opposite DOWN signal only after BODY falls below +range_max.
-                    # SHORT exits on an opposite UP signal only after BODY rises above range_min.
-                    # The exit candle does not automatically open the opposite side.
-                    exit_triggered = (
-                        position.side > 0 and sig < 0 and body < range_max
-                    ) or (
-                        position.side < 0 and sig > 0 and body > range_min
+                    equity, gross, net, fees = close_position(
+                        position, candle.close, equity, commission
                     )
-
-                    if not exit_triggered:
-                        action = "HOLD_OPPOSITE_OUTSIDE_EXIT_THRESHOLD"
+                    trade_return_pct = (
+                        f"{pnl_pct(position.side, position.entry_price, candle.close) * 100.0:.8f}"
+                    )
+                    trade_net = f"{net:.10f}"
+                    gross_pnl += gross
+                    net_pnl += net
+                    total_fees += fees
+                    gross_profit += max(gross, 0.0)
+                    gross_loss += min(gross, 0.0)
+                    trades += 1
+                    exits += 1
+                    if net > 0:
+                        wins += 1
+                    elif net < 0:
+                        losses += 1
                     else:
-                        equity, gross, net, fees = close_position(
-                            position, candle.close, equity, commission
-                        )
-                        trade_return_pct = (
-                            f"{pnl_pct(position.side, position.entry_price, candle.close) * 100.0:.8f}"
-                        )
-                        trade_net = f"{net:.10f}"
-                        gross_pnl += gross
-                        net_pnl += net
-                        total_fees += fees
-                        gross_profit += max(gross, 0.0)
-                        gross_loss += min(gross, 0.0)
-                        trades += 1
-                        exits += 1
-                        exit_threshold_exits += 1
-                        if net > 0:
-                            wins += 1
-                        elif net < 0:
-                            losses += 1
-                        else:
-                            flats += 1
-                        position = None
-                        action = "EXIT_LONG" if position_before > 0 else "EXIT_SHORT"
+                        flats += 1
+                    position = None
+                    action = "EXIT_LONG" if position_before > 0 else "EXIT_SHORT"
 
             mtm_equity = mark_to_market_equity(equity, position, candle.close)
             peak_equity = max(peak_equity, mtm_equity)
@@ -258,7 +252,8 @@ def run_timeframe(
             losses += 1
         else:
             flats += 1
-        exits += 1
+        final_drawdown = (peak_equity - equity) / peak_equity if peak_equity else 0.0
+        max_drawdown = max(max_drawdown, final_drawdown)
 
     total_closed = wins + losses + flats
     win_rate = wins / total_closed * 100.0 if total_closed else 0.0
@@ -291,8 +286,7 @@ def run_timeframe(
         "short_entries": entries_short,
         "entry_signals": entry_signals,
         "exits": exits,
-        "exit_threshold_exits": exit_threshold_exits,
-        "ignored_in_range_entry_signals": ignored_in_range_entry_signals,
+        "ignored_in_range_entry_signals": ignored_in_range_entries,
         "forced_close": 1 if position is not None else 0,
         "commission": commission,
         "allocation": allocation,
@@ -306,15 +300,12 @@ def run_timeframe(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description=(
-            "Trade exact Excel candle signals with range-filtered entries and "
-            "directional noise-filtered exits."
-        )
+        description="Trade exact Excel candle signals with neutral entry range and directional exit thresholds."
     )
     ap.add_argument("--month", default="2026-05")
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--initial-capital", type=float, default=1000.0)
-    ap.add_argument("--commission", type=float, default=DEFAULT_COMMISSION, help="One-way commission rate; default 0.0")
+    ap.add_argument("--commission", type=float, default=DEFAULT_COMMISSION)
     ap.add_argument("--allocation", type=float, default=1.0)
     ap.add_argument("--range-min", type=float, default=DEFAULT_RANGE_MIN)
     ap.add_argument("--range-max", type=float, default=DEFAULT_RANGE_MAX)
@@ -350,13 +341,12 @@ def main() -> None:
         pf_text = "INF" if pf == float("inf") else f"{pf:.2f}"
         print(
             f"{timeframe} | candles={result['candles']} | "
-            f"range=[{result['range_min']},{result['range_max']}] | "
+            f"entry=OUTSIDE[{result['range_min']},{result['range_max']}] | "
             f"commission/side={result['commission'] * 100.0:.2f}% | "
             f"initial={result['initial']:.2f} final={result['final']:.2f} "
             f"return={result['return_pct']:.2f}% | trades={result['trades']} "
             f"win={result['win_rate']:.2f}% PF={pf_text} | DD_MTM={result['max_drawdown_pct']:.2f}% | "
-            f"fees={result['fees']:.4f} | ignored_in_range={result['ignored_in_range_entry_signals']} "
-            f"exits={result['exits']}"
+            f"ignored_in_range={result['ignored_in_range_entry_signals']} exits={result['exits']}"
         )
         print(f"  COLUMNS={','.join(result['fields'])}")
         for n, row in enumerate(result["sample_rows"], 1):
@@ -372,8 +362,8 @@ def main() -> None:
             "symbol", "month", "timeframe", "candles", "initial", "final", "return_pct",
             "trades", "wins", "losses", "flats", "win_rate", "profit_factor", "gross_pnl",
             "net_pnl", "fees", "max_drawdown_pct", "long_entries", "short_entries",
-            "entry_signals", "exits", "exit_threshold_exits", "ignored_in_range_entry_signals",
-            "forced_close", "commission", "allocation", "range_min", "range_max",
+            "entry_signals", "exits", "ignored_in_range_entry_signals", "forced_close",
+            "commission", "allocation", "range_min", "range_max",
         ]
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
