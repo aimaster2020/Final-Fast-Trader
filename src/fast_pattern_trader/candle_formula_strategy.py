@@ -4,16 +4,15 @@ from dataclasses import dataclass
 
 from .models import Candle, Signal
 
-STRATEGY_NAME = "candle_formula_3x3_v1"
+STRATEGY_NAME = "candle_formula_3x3_v1_no_lc"
 RANGE_MIN_BODY = -100.0
 RANGE_MAX_BODY = 100.0
 DECISION_SCORE = 2
-RULE_COUNT = 3
 
 
 @dataclass(frozen=True)
 class FormulaRules:
-    """The six boolean rules evaluated only from the current OHLC candle."""
+    """Current-OHLC rules with the L-C rules disabled."""
 
     fall_rule_1: bool
     fall_rule_2: bool
@@ -24,11 +23,13 @@ class FormulaRules:
 
     @property
     def fall_score(self) -> int:
-        return int(self.fall_rule_1) + int(self.fall_rule_2) + int(self.fall_rule_3)
+        # Rule 2 (L-C) is intentionally disabled and does not contribute.
+        return int(self.fall_rule_1) + int(self.fall_rule_3)
 
     @property
     def rise_score(self) -> int:
-        return int(self.rise_rule_1) + int(self.rise_rule_2) + int(self.rise_rule_3)
+        # Rule 2 (L-C) is intentionally disabled and does not contribute.
+        return int(self.rise_rule_1) + int(self.rise_rule_3)
 
 
 @dataclass(frozen=True)
@@ -42,33 +43,36 @@ class FormulaDecision:
 
 
 def evaluate_rules(candle: Candle) -> FormulaRules:
-    """Evaluate the user's six rules on the current candle only.
+    """Evaluate the active current-candle OHLC rules only.
 
     Variables:
         H = high, L = low, C = close, O = open
 
-    Fall:
+    Active Fall:
         1) H-C < C-O
-        2) L-C < C-O
         3) H-C < H-O
 
-    Rise:
+    Active Rise:
         1) H-C > C-O
-        2) L-C > C-O
         3) H-C > H-O
+
+    Disabled:
+        2) L-C < C-O
+        2) L-C > C-O
     """
 
     high_minus_close = candle.high - candle.close
     close_minus_open = candle.close - candle.open
-    low_minus_close = candle.low - candle.close
     high_minus_open = candle.high - candle.open
 
+    # L-C rules are deliberately kept as explicit FALSE values in the
+    # output CSV so the audit trail shows that they were disabled.
     return FormulaRules(
         fall_rule_1=high_minus_close < close_minus_open,
-        fall_rule_2=low_minus_close < close_minus_open,
+        fall_rule_2=False,
         fall_rule_3=high_minus_close < high_minus_open,
         rise_rule_1=high_minus_close > close_minus_open,
-        rise_rule_2=low_minus_close > close_minus_open,
+        rise_rule_2=False,
         rise_rule_3=high_minus_close > high_minus_open,
     )
 
@@ -81,11 +85,10 @@ def is_range(candle: Candle) -> bool:
 
 
 def decide(candle: Candle) -> FormulaDecision:
-    """Return BUY/SELL once 2 of 3 rules agree; otherwise HOLD.
+    """Return BUY/SELL when both active rules agree; otherwise HOLD.
 
-    Range detection is intentionally independent from the signal.  The
-    caller can use `is_range` as a market-state filter without changing the
-    core 2-of-3 decision rule.
+    There are now 2 active rules per side because the L-C rules are disabled.
+    Range detection remains informational and does not change the signal.
     """
 
     rules = evaluate_rules(candle)
