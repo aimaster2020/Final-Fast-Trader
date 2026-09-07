@@ -7,7 +7,7 @@ from .models import Candle, Signal
 STRATEGY_NAME = "candle_formula_weighted_v1"
 RANGE_MIN_BODY = -100.0
 RANGE_MAX_BODY = 100.0
-DECISION_SCORE = 2.0
+DECISION_SCORE = 3.0
 
 FALL_WEIGHT_1 = 2.0  # H-C < C-O
 FALL_WEIGHT_2 = 1.0  # L-C < C-O
@@ -95,7 +95,7 @@ def is_range(candle: Candle) -> bool:
 
 
 def decide(candle: Candle) -> FormulaDecision:
-    """Return BUY/SELL at the weighted 2-point threshold; otherwise HOLD."""
+    """Return BUY/SELL at the weighted 3-point threshold; otherwise HOLD."""
 
     rules = evaluate_rules(candle)
     fall_score = rules.fall_score
