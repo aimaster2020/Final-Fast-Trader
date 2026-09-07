@@ -77,6 +77,14 @@ def close_position(
     return equity + net, gross, net, fees
 
 
+def mark_to_market_equity(equity: float, position: Position | None, price: float) -> float:
+    """Equity marked to the current close while the position remains open."""
+    if position is None:
+        return equity
+    unrealized = position.allocated_capital * pnl_pct(position.side, position.entry_price, price)
+    return equity + unrealized
+
+
 def run_timeframe(
     path: Path,
     timeframe: str,
@@ -108,7 +116,7 @@ def run_timeframe(
     gross_profit = 0.0
     gross_loss = 0.0
     total_fees = 0.0
-    peak_equity = equity
+    peak_equity = initial_capital
     max_drawdown = 0.0
     forced_close = 0
     held_through_opposite = 0
@@ -120,8 +128,9 @@ def run_timeframe(
     fields = [
         "symbol", "timeframe", "month", "timestamp", "open", "high", "low", "close",
         "body", "in_range", "signal", "position_before", "action", "position_after",
-        "trade_pnl_pct", "trade_net_pnl", "equity",
+        "trade_pnl_pct", "trade_net_pnl", "equity", "mtm_equity", "drawdown_pct",
     ]
+    sample_rows: list[dict[str, object]] = []
 
     with output.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -186,11 +195,12 @@ def run_timeframe(
                         entries_short += 1
                         action = "SWITCH_SHORT"
 
-            peak_equity = max(peak_equity, equity)
-            drawdown = (peak_equity - equity) / peak_equity if peak_equity else 0.0
+            mtm_equity = mark_to_market_equity(equity, position, candle.close)
+            peak_equity = max(peak_equity, mtm_equity)
+            drawdown = (peak_equity - mtm_equity) / peak_equity if peak_equity else 0.0
             max_drawdown = max(max_drawdown, drawdown)
 
-            writer.writerow({
+            record = {
                 "symbol": symbol,
                 "timeframe": timeframe,
                 "month": month,
@@ -208,7 +218,12 @@ def run_timeframe(
                 "trade_pnl_pct": trade_return_pct,
                 "trade_net_pnl": trade_net,
                 "equity": f"{equity:.10f}",
-            })
+                "mtm_equity": f"{mtm_equity:.10f}",
+                "drawdown_pct": f"{drawdown * 100.0:.10f}",
+            }
+            writer.writerow(record)
+            if len(sample_rows) < 3:
+                sample_rows.append(record)
 
     if position is not None:
         candle = candles[-1]
@@ -259,6 +274,8 @@ def run_timeframe(
         "forced_close": forced_close,
         "commission": commission,
         "allocation": allocation,
+        "sample_rows": sample_rows,
+        "fields": fields,
         "output": str(output),
     }
 
@@ -302,10 +319,13 @@ def main() -> None:
             f"{timeframe} | candles={result['candles']} | "
             f"initial={result['initial']:.2f} final={result['final']:.2f} "
             f"return={result['return_pct']:.2f}% | trades={result['trades']} "
-            f"win={result['win_rate']:.2f}% PF={pf_text} | DD={result['max_drawdown_pct']:.2f}% | "
+            f"win={result['win_rate']:.2f}% PF={pf_text} | DD_MTM={result['max_drawdown_pct']:.2f}% | "
             f"fees={result['fees']:.4f} | switches={result['switches']} "
             f"held_opp={result['held_through_opposite']}"
         )
+        print(f"  COLUMNS={','.join(result['fields'])}")
+        for n, row in enumerate(result["sample_rows"], 1):
+            print(f"  ROW{n}=" + " | ".join(f"{field}={row[field]}" for field in result["fields"]))
 
     summary = Path(args.output_dir) / f"summary_{args.symbol}_{args.month}.csv"
     with summary.open("w", newline="", encoding="utf-8") as f:
