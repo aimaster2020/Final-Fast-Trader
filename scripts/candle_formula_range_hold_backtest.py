@@ -241,8 +241,8 @@ def run_timeframe(
             losses += 1
         else:
             flats += 1
-        peak_equity = max(peak_equity, equity)
-        max_drawdown = max(max_drawdown, (peak_equity - equity) / peak_equity if peak_equity else 0.0)
+        final_drawdown = (peak_equity - equity) / peak_equity if peak_equity else 0.0
+        max_drawdown = max(max_drawdown, final_drawdown)
 
     total_closed = wins + losses + flats
     win_rate = wins / total_closed * 100.0 if total_closed else 0.0
