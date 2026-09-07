@@ -30,18 +30,19 @@ def load_month(path: Path, month: str, symbol: str) -> list[Candle]:
 
 
 def excel_rule_values(candle: Candle) -> tuple[int, int, int, int, int, int]:
+    """Reproduce Excel P:R and the complementary DOWN comparisons exactly."""
     o, h, l, c = candle.open, candle.high, candle.low, candle.close
     hc = h - c
     co = c - o
     ho = h - o
     lc = l - c
     return (
-        int(hc > co),
-        int(hc > ho),
-        int(lc > co),
-        int(hc < co),
-        int(hc < ho),
-        int(lc < co),
+        int(hc > co),  # P / R1
+        int(hc > ho),  # Q / R2
+        int(lc > co),  # R / R3
+        int(hc < co),  # R4
+        int(hc < ho),  # R5
+        int(lc < co),  # R6
     )
 
 
@@ -50,13 +51,13 @@ def candle_body(candle: Candle) -> float:
     return candle.close - candle.open
 
 
-def actual_direction(candle: Candle, previous: Candle) -> int:
-    """Exact Excel column I: compare current J (C-O) with previous J (C-O)."""
-    current_body = candle_body(candle)
-    previous_body = candle_body(previous)
-    if current_body > previous_body:
+def excel_i_direction(current: Candle, following: Candle) -> int:
+    """Exact Excel I formula on row N: compare J(N+1) with J(N)."""
+    current_j = candle_body(current)
+    next_j = candle_body(following)
+    if next_j > current_j:
         return 1
-    if current_body < previous_body:
+    if next_j < current_j:
         return -1
     return 0
 
@@ -73,9 +74,11 @@ def run_timeframe(path: Path, timeframe: str, month: str, symbol: str) -> dict[s
     rule_mismatches = 0
     rows = len(candles) - 1
 
-    for i in range(1, len(candles)):
+    # Excel's I2 = compare J3 to J2. Therefore S(N) is evaluated on
+    # candle N and correctness is determined by J(N+1) vs J(N).
+    for i in range(rows):
         candle = candles[i]
-        previous = candles[i - 1]
+        following = candles[i + 1]
         r1, r2, r3, r4, r5, r6 = excel_rule_values(candle)
         s = r1 + r2 + r3
         expected_signal = 1 if s == 3 else -1 if s == 0 else 0
@@ -91,7 +94,7 @@ def run_timeframe(path: Path, timeframe: str, month: str, symbol: str) -> dict[s
         if actual_tuple != (r1, r2, r3, r4, r5, r6):
             rule_mismatches += 1
 
-        actual_dir = actual_direction(candle, previous)
+        actual_dir = excel_i_direction(candle, following)
         if actual_dir == 0:
             actual_flat += 1
 
@@ -129,7 +132,7 @@ def run_timeframe(path: Path, timeframe: str, month: str, symbol: str) -> dict[s
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Exact Excel validation: S=3/S=0 versus change in J=(Close-Open)."
+        description="Exact Excel validation: S(N)=3/S(N)=0 versus J(N+1)>J(N), where J=C-O."
     )
     ap.add_argument("--month", default="2026-07")
     ap.add_argument("--symbol", default="BTCUSDT")
