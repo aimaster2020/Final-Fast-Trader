@@ -46,7 +46,8 @@ def write_csv(candles: list[Candle], month: str, output: Path) -> None:
         "high_minus_close", "low_minus_close", "high_minus_open",
         "fall_rule_1", "fall_rule_2", "fall_rule_3", "fall_score",
         "rise_rule_1", "rise_rule_2", "rise_rule_3", "rise_score",
-        "is_range", "signal", "next_close", "actual_direction", "correct",
+        "is_range", "signal", "next_open", "next_close", "actual_body",
+        "actual_direction", "correct",
     ]
 
     with output.open("w", newline="", encoding="utf-8") as f:
@@ -55,11 +56,12 @@ def write_csv(candles: list[Candle], month: str, output: Path) -> None:
 
         for i, candle in enumerate(candles[:-1]):
             d = decide(candle)
-            next_close = candles[i + 1].close
+            next_candle = candles[i + 1]
+            actual_body = next_candle.close - next_candle.open
 
-            if next_close > candle.close:
+            if actual_body > 0:
                 actual = "BUY"
-            elif next_close < candle.close:
+            elif actual_body < 0:
                 actual = "SELL"
             else:
                 actual = "HOLD"
@@ -88,14 +90,18 @@ def write_csv(candles: list[Candle], month: str, output: Path) -> None:
                 "rise_score": d.rise_score,
                 "is_range": int(d.is_range),
                 "signal": predicted,
-                "next_close": next_close,
+                "next_open": next_candle.open,
+                "next_close": next_candle.close,
+                "actual_body": actual_body,
                 "actual_direction": actual,
                 "correct": correct,
             })
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Test the new 3x3 candle formula on one month of 1h data.")
+    ap = argparse.ArgumentParser(
+        description="Test candle formula direction against the NEXT candle body direction."
+    )
     ap.add_argument("--input", default="reports/1h/BTCUSDT_1h.csv")
     ap.add_argument("--month", default="2026-07")
     ap.add_argument("--output", default="reports/candle_formula_1h_2026-07.csv")
@@ -112,15 +118,18 @@ def main() -> None:
     for i, candle in enumerate(candles[:-1]):
         d = decide(candle)
         ranges += int(d.is_range)
+        next_candle = candles[i + 1]
+        actual_body = next_candle.close - next_candle.open
+
         if d.signal == Signal.BUY:
             buy += 1
-            if candles[i + 1].close > candle.close:
+            if actual_body > 0:
                 buy_wins += 1
             else:
                 losses += 1
         elif d.signal == Signal.SELL:
             sell += 1
-            if candles[i + 1].close < candle.close:
+            if actual_body < 0:
                 sell_wins += 1
             else:
                 losses += 1
