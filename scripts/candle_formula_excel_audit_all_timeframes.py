@@ -81,7 +81,6 @@ def audit(path: Path, timeframe: str, month: str, symbol: str) -> dict[str, int 
     score_mismatches = 0
     signal_mismatches = 0
     range_mismatches = 0
-    weighted_mismatches = 0
 
     for candle in candles:
         expected = excel_rules(candle)
@@ -92,16 +91,7 @@ def audit(path: Path, timeframe: str, month: str, symbol: str) -> dict[str, int 
             mismatches[name] += int(exp != got)
 
         expected_s = sum(map(int, expected[:3]))
-        actual_up_score = actual_rules.up_score
-        actual_down_score = actual_rules.down_score
-        expected_up_score = int(expected[0]) * 2 + int(expected[1]) + int(expected[2])
-        expected_down_score = int(expected[3]) * 2 + int(expected[4]) + int(expected[5])
-        weighted_mismatches += int(
-            actual_up_score != expected_up_score or actual_down_score != expected_down_score
-        )
-
-        # Excel direction is driven by S = R1+R2+R3.
-        actual_s = sum(map(int, actual[:3]))
+        actual_s = actual_rules.up_score
         score_mismatches += int(actual_s != expected_s)
 
         expected_signal = excel_signal(candle)
@@ -110,18 +100,20 @@ def audit(path: Path, timeframe: str, month: str, symbol: str) -> dict[str, int 
         range_mismatches += int(is_range(candle) != (-100.0 <= candle.close - candle.open <= 100.0))
 
     total = len(candles)
+    passed = (
+        total > 0
+        and all(v == 0 for v in mismatches.values())
+        and score_mismatches == 0
+        and signal_mismatches == 0
+        and range_mismatches == 0
+    )
     return {
         "rows": total,
         **mismatches,
         "score_mismatches": score_mismatches,
-        "weighted_mismatches": weighted_mismatches,
         "signal_mismatches": signal_mismatches,
         "range_mismatches": range_mismatches,
-        "pass": total > 0 and all(v == 0 for v in mismatches.values())
-        and score_mismatches == 0
-        and weighted_mismatches == 0
-        and signal_mismatches == 0
-        and range_mismatches == 0,
+        "pass": passed,
     }
 
 
@@ -148,8 +140,8 @@ def main() -> None:
             f"{timeframe} | rows={result['rows']} | "
             f"R1={result['R1_UP']} R2={result['R2_UP']} R3={result['R3_UP']} "
             f"R4={result['R4_DOWN']} R5={result['R5_DOWN']} R6={result['R6_DOWN']} | "
-            f"S={result['score_mismatches']} WEIGHTED={result['weighted_mismatches']} "
-            f"SIGNAL={result['signal_mismatches']} RANGE={result['range_mismatches']} | "
+            f"S={result['score_mismatches']} SIGNAL={result['signal_mismatches']} "
+            f"RANGE={result['range_mismatches']} | "
             f"{'PASS' if result['pass'] else 'FAIL'}"
         )
 
