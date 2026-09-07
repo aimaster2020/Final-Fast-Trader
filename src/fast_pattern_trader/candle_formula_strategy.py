@@ -4,16 +4,22 @@ from dataclasses import dataclass
 
 from .models import Candle, Signal
 
-STRATEGY_NAME = "candle_formula_3x3_v1"
+STRATEGY_NAME = "candle_formula_weighted_v1"
 RANGE_MIN_BODY = -100.0
 RANGE_MAX_BODY = 100.0
-DECISION_SCORE = 2
-RULE_COUNT = 3
+DECISION_SCORE = 2.0
+
+FALL_WEIGHT_1 = 2.0  # H-C < C-O
+FALL_WEIGHT_2 = 1.0  # L-C < C-O
+FALL_WEIGHT_3 = 1.0  # H-C < H-O
+RISE_WEIGHT_1 = 2.0  # H-C > C-O
+RISE_WEIGHT_2 = 1.0  # L-C > C-O
+RISE_WEIGHT_3 = 1.0  # H-C > H-O
 
 
 @dataclass(frozen=True)
 class FormulaRules:
-    """The six boolean rules evaluated only from the current OHLC candle."""
+    """The six current-OHLC rules with user-defined weights."""
 
     fall_rule_1: bool
     fall_rule_2: bool
@@ -23,19 +29,27 @@ class FormulaRules:
     rise_rule_3: bool
 
     @property
-    def fall_score(self) -> int:
-        return int(self.fall_rule_1) + int(self.fall_rule_2) + int(self.fall_rule_3)
+    def fall_score(self) -> float:
+        return (
+            float(self.fall_rule_1) * FALL_WEIGHT_1
+            + float(self.fall_rule_2) * FALL_WEIGHT_2
+            + float(self.fall_rule_3) * FALL_WEIGHT_3
+        )
 
     @property
-    def rise_score(self) -> int:
-        return int(self.rise_rule_1) + int(self.rise_rule_2) + int(self.rise_rule_3)
+    def rise_score(self) -> float:
+        return (
+            float(self.rise_rule_1) * RISE_WEIGHT_1
+            + float(self.rise_rule_2) * RISE_WEIGHT_2
+            + float(self.rise_rule_3) * RISE_WEIGHT_3
+        )
 
 
 @dataclass(frozen=True)
 class FormulaDecision:
     signal: Signal
-    fall_score: int
-    rise_score: int
+    fall_score: float
+    rise_score: float
     is_range: bool
     body: float
     rules: FormulaRules
@@ -47,15 +61,15 @@ def evaluate_rules(candle: Candle) -> FormulaRules:
     Variables:
         H = high, L = low, C = close, O = open
 
-    Fall:
-        1) H-C < C-O
-        2) L-C < C-O
-        3) H-C < H-O
+    Fall weights:
+        1) H-C < C-O : 2
+        2) L-C < C-O : 1
+        3) H-C < H-O : 1
 
-    Rise:
-        1) H-C > C-O
-        2) L-C > C-O
-        3) H-C > H-O
+    Rise weights:
+        1) H-C > C-O : 2
+        2) L-C > C-O : 1
+        3) H-C > H-O : 1
     """
 
     high_minus_close = candle.high - candle.close
@@ -81,7 +95,7 @@ def is_range(candle: Candle) -> bool:
 
 
 def decide(candle: Candle) -> FormulaDecision:
-    """Return BUY/SELL once 2 of 3 rules agree; otherwise HOLD."""
+    """Return BUY/SELL at the weighted 2-point threshold; otherwise HOLD."""
 
     rules = evaluate_rules(candle)
     fall_score = rules.fall_score
