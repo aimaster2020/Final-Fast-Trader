@@ -125,7 +125,7 @@ def run_timeframe(
     peak_equity = initial_capital
     max_drawdown = 0.0
     switches = 0
-    held_through_opposite = 0
+    opposite_exits = 0
     ignored_outside_entry_signals = 0
     entries_long = 0
     entries_short = 0
@@ -154,8 +154,7 @@ def run_timeframe(
             trade_net = ""
 
             if position is None:
-                # ENTRY: never enter while the candle body is in the range.
-                # A directional signal is actionable only outside the range.
+                # ENTRY: a directional signal can open a trade only when BODY is outside the range.
                 if sig != 0 and not in_range:
                     allocated = equity * allocation
                     position = Position(sig, candle.close, candle.timestamp, i, allocated)
@@ -174,10 +173,9 @@ def run_timeframe(
                     action = "HOLD_NO_SIGNAL"
                 elif sig == position.side:
                     action = "HOLD_SAME"
-                elif not in_range:
-                    held_through_opposite += 1
-                    action = "HOLD_OPPOSITE_OUTSIDE_RANGE"
                 else:
+                    # EXIT/SWITCH: any opposite directional signal closes the current side,
+                    # regardless of whether BODY is inside or outside the range.
                     equity, gross, net, fees = close_position(
                         position, candle.close, equity, commission
                     )
@@ -197,6 +195,7 @@ def run_timeframe(
                         losses += 1
                     else:
                         flats += 1
+                    opposite_exits += 1
                     switches += 1
 
                     new_side = sig
@@ -293,8 +292,8 @@ def run_timeframe(
         "short_entries": entries_short,
         "entry_signals": entry_signals,
         "switches": switches,
-        "held_through_opposite": held_through_opposite,
-        "ignored_outside_entry_signals": ignored_outside_entry_signals,
+        "opposite_exits": opposite_exits,
+        "ignored_in_range_entry_signals": ignored_outside_entry_signals,
         "forced_close": 1 if position is not None else 0,
         "commission": commission,
         "allocation": allocation,
@@ -308,12 +307,12 @@ def run_timeframe(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Trade exact Excel candle signals with a body range filter. Default commission is 0."
+        description="Trade exact Excel candle signals: range filters entry only; any opposite signal exits/switches."
     )
     ap.add_argument("--month", default="2026-05")
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--initial-capital", type=float, default=1000.0)
-    ap.add_argument("--commission", type=float, default=DEFAULT_COMMISSION, help="One-way commission rate; default 0")
+    ap.add_argument("--commission", type=float, default=DEFAULT_COMMISSION, help="One-way commission rate; default 0.0")
     ap.add_argument("--allocation", type=float, default=1.0)
     ap.add_argument("--range-min", type=float, default=DEFAULT_RANGE_MIN)
     ap.add_argument("--range-max", type=float, default=DEFAULT_RANGE_MAX)
@@ -354,8 +353,8 @@ def main() -> None:
             f"initial={result['initial']:.2f} final={result['final']:.2f} "
             f"return={result['return_pct']:.2f}% | trades={result['trades']} "
             f"win={result['win_rate']:.2f}% PF={pf_text} | DD_MTM={result['max_drawdown_pct']:.2f}% | "
-            f"fees={result['fees']:.4f} | ignored_entry={result['ignored_outside_entry_signals']} "
-            f"held_opp={result['held_through_opposite']}"
+            f"fees={result['fees']:.4f} | ignored_in_range={result['ignored_in_range_entry_signals']} "
+            f"opposite_exits={result['opposite_exits']}"
         )
         print(f"  COLUMNS={','.join(result['fields'])}")
         for n, row in enumerate(result["sample_rows"], 1):
@@ -371,7 +370,7 @@ def main() -> None:
             "symbol", "month", "timeframe", "candles", "initial", "final", "return_pct",
             "trades", "wins", "losses", "flats", "win_rate", "profit_factor", "gross_pnl",
             "net_pnl", "fees", "max_drawdown_pct", "long_entries", "short_entries",
-            "entry_signals", "switches", "held_through_opposite", "ignored_outside_entry_signals",
+            "entry_signals", "switches", "opposite_exits", "ignored_in_range_entry_signals",
             "forced_close", "commission", "allocation", "range_min", "range_max",
         ]
         writer = csv.DictWriter(f, fieldnames=fields)
