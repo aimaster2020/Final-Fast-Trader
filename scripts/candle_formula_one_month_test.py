@@ -41,15 +41,15 @@ def actual_direction(candle: Candle, previous_candle: Candle) -> tuple[str, floa
 
 
 def weighted_prediction(candle: Candle) -> str:
-    """Use the requested threshold of 3 points for the two rule groups."""
+    """Use the aligned formula scores with a 3-point decision threshold."""
     rules = evaluate_rules(candle)
-    down = rules.fall_score
-    up = rules.rise_score
+    up = rules.up_score
+    down = rules.down_score
 
-    if down >= 3.0 and up < 3.0:
-        return "DOWN"
     if up >= 3.0 and down < 3.0:
         return "UP"
+    if down >= 3.0 and up < 3.0:
+        return "DOWN"
     return "UNDECIDED"
 
 
@@ -59,8 +59,8 @@ def write_csv(candles: list[Candle], month: str, output: Path) -> None:
         "month", "timestamp", "open", "high", "low", "close", "previous_close",
         "actual_change", "actual_direction", "body_close_minus_open",
         "high_minus_close", "low_minus_close", "high_minus_open",
-        "down_rule_1", "down_rule_2", "down_rule_3", "down_score",
         "up_rule_1", "up_rule_2", "up_rule_3", "up_score",
+        "down_rule_1", "down_rule_2", "down_rule_3", "down_score",
         "is_range", "predicted_direction", "correct",
     ]
 
@@ -88,14 +88,14 @@ def write_csv(candles: list[Candle], month: str, output: Path) -> None:
                 "high_minus_close": candle.high - candle.close,
                 "low_minus_close": candle.low - candle.close,
                 "high_minus_open": candle.high - candle.open,
-                "down_rule_1": int(rules.fall_rule_1),
-                "down_rule_2": int(rules.fall_rule_2),
-                "down_rule_3": int(rules.fall_rule_3),
-                "down_score": rules.fall_score,
-                "up_rule_1": int(rules.rise_rule_1),
-                "up_rule_2": int(rules.rise_rule_2),
-                "up_rule_3": int(rules.rise_rule_3),
-                "up_score": rules.rise_score,
+                "up_rule_1": int(rules.up_rule_1),
+                "up_rule_2": int(rules.up_rule_2),
+                "up_rule_3": int(rules.up_rule_3),
+                "up_score": rules.up_score,
+                "down_rule_1": int(rules.down_rule_1),
+                "down_rule_2": int(rules.down_rule_2),
+                "down_rule_3": int(rules.down_rule_3),
+                "down_score": rules.down_score,
                 "is_range": int(is_range(candle)),
                 "predicted_direction": predicted,
                 "correct": correct,
@@ -114,12 +114,12 @@ def main() -> None:
         raise SystemExit(f"No usable 1h candles found for {args.month}")
 
     rule_defs = [
-        ("R1_DOWN", "fall_rule_1", "DOWN"),
-        ("R2_DOWN", "fall_rule_2", "DOWN"),
-        ("R3_DOWN", "fall_rule_3", "DOWN"),
-        ("R4_UP", "rise_rule_1", "UP"),
-        ("R5_UP", "rise_rule_2", "UP"),
-        ("R6_UP", "rise_rule_3", "UP"),
+        ("R1_UP", "up_rule_1", "UP"),
+        ("R2_UP", "up_rule_2", "UP"),
+        ("R3_UP", "up_rule_3", "UP"),
+        ("R4_DOWN", "down_rule_1", "DOWN"),
+        ("R5_DOWN", "down_rule_2", "DOWN"),
+        ("R6_DOWN", "down_rule_3", "DOWN"),
     ]
     stats = {name: [0, 0] for name, _, _ in rule_defs}
     up = down = undecided = ranges = 0
