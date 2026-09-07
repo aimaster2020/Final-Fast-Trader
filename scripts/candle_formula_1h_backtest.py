@@ -11,8 +11,14 @@ from fast_pattern_trader.models import Candle, Signal
 DEFAULT_MONTHS = ("2026-05", "2026-06", "2026-07", "2026-08")
 DEFAULT_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 DEFAULT_COMMISSION = 0.0013
-DEFAULT_LOWER = -100.0
-DEFAULT_UPPER = 100.0
+
+# Bias ranges selected in the earlier multi-month bias tests.
+DEFAULT_BIAS = {
+    "BTCUSDT": (-200.0, -125.0),
+    "ETHUSDT": (-200.0, -175.0),
+    "SOLUSDT": (25.0, 50.0),
+    "XRPUSDT": (-200.0, -175.0),
+}
 
 
 @dataclass
@@ -140,13 +146,11 @@ def compound(returns: list[float]) -> float:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Current candle formula strategy on 1h by default.")
+    ap = argparse.ArgumentParser(description="Current candle formula strategy on 1h with prior per-symbol bias by default.")
     ap.add_argument("--timeframe", default="1h", choices=("1h",))
     ap.add_argument("--months", default=",".join(DEFAULT_MONTHS))
     ap.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS))
     ap.add_argument("--commission", type=float, default=DEFAULT_COMMISSION)
-    ap.add_argument("--lower", type=float, default=DEFAULT_LOWER)
-    ap.add_argument("--upper", type=float, default=DEFAULT_UPPER)
     ap.add_argument("--input-1h", default="reports/prepared_price_action_1h.csv")
     args = ap.parse_args()
 
@@ -155,18 +159,19 @@ def main() -> None:
     path = Path(args.input_1h)
 
     print(
-        f"CANDLE_FORMULA | tf={args.timeframe} | range=[{args.lower:.0f},{args.upper:.0f}] | "
+        f"CANDLE_FORMULA | tf={args.timeframe} | prior-bias | "
         f"fee={args.commission * 100:.2f}%/side | roundtrip={args.commission * 200:.2f}% | capital=1000"
     )
     for symbol in symbols:
+        lower, upper = DEFAULT_BIAS.get(symbol, (-100.0, 100.0))
         month_results: list[float] = []
-        print(f"\n{symbol}")
+        print(f"\n{symbol} | bias=[{lower:.0f},{upper:.0f}]")
         for month in months:
             candles = load_month(path, month, symbol)
             if not candles:
                 print(f"{month} | NO_DATA")
                 continue
-            r = run(candles, args.lower, args.upper, args.commission)
+            r = run(candles, lower, upper, args.commission)
             month_results.append(float(r["return_pct"]))
             pf = "INF" if r["pf"] == float("inf") else f"{float(r['pf']):.2f}"
             print(
