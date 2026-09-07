@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
 from pathlib import Path
 
 from fast_pattern_trader.candle_formula_strategy import decide
@@ -47,8 +46,14 @@ def pnl_pct(side: int, entry: float, exit_price: float) -> float:
     return side * (exit_price - entry) / entry if entry > 0 else 0.0
 
 
-def run(candles: list[Candle], lower: float, upper: float) -> dict[str, float | int]:
-    equity = 1000.0
+def run(
+    candles: list[Candle],
+    lower: float,
+    upper: float,
+    commission: float,
+    initial_capital: float = 1000.0,
+) -> dict[str, float | int]:
+    equity = initial_capital
     position: tuple[int, float, float] | None = None
     trades = wins = 0
     gross_profit = gross_loss = 0.0
@@ -70,28 +75,32 @@ def run(candles: list[Candle], lower: float, upper: float) -> dict[str, float | 
             )
             if exit_triggered:
                 gross = capital * pnl_pct(side, entry, candle.close)
-                equity += gross
+                fees = capital * commission * 2.0
+                net = gross - fees
+                equity += net
                 trades += 1
-                if gross > 0:
+                if net > 0:
                     wins += 1
-                    gross_profit += gross
-                elif gross < 0:
-                    gross_loss += gross
+                    gross_profit += max(gross, 0.0)
+                elif net < 0:
+                    gross_loss += min(gross, 0.0)
                 position = None
 
     if position is not None:
         side, entry, capital = position
         gross = capital * pnl_pct(side, entry, candles[-1].close)
-        equity += gross
+        fees = capital * commission * 2.0
+        net = gross - fees
+        equity += net
         trades += 1
-        if gross > 0:
+        if net > 0:
             wins += 1
-            gross_profit += gross
-        elif gross < 0:
-            gross_loss += gross
+            gross_profit += max(gross, 0.0)
+        elif net < 0:
+            gross_loss += min(gross, 0.0)
 
     return {
-        "return_pct": (equity / 1000.0 - 1.0) * 100.0,
+        "return_pct": (equity / initial_capital - 1.0) * 100.0,
         "trades": trades,
         "win_rate": wins / trades * 100.0 if trades else 0.0,
         "profit_factor": gross_profit / abs(gross_loss) if gross_loss < 0 else (float("inf") if gross_profit else 0.0),
@@ -106,10 +115,10 @@ def parse_values(raw: str) -> tuple[float, ...]:
 
 
 def compounded_return(returns: list[float]) -> float:
-    equity_factor = 1.0
-    for r in returns:
-        equity_factor *= 1.0 + r / 100.0
-    return (equity_factor - 1.0) * 100.0
+    factor = 1.0
+    for ret in returns:
+        factor *= 1.0 + ret / 100.0
+    return (factor - 1.0) * 100.0
 
 
 def main() -> None:
@@ -119,6 +128,7 @@ def main() -> None:
     ap.add_argument("--months", default=",".join(DEFAULT_MONTHS))
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--commission", type=float, default=0.0)
+    ap.add_argument("--initial-capital", type=float, default=1000.0)
     ap.add_argument("--values", default=",".join(str(v) for v in DEFAULT_VALUES))
     ap.add_argument("--input-5m", default="reports/prepared_price_action_5m.csv")
     ap.add_argument("--input-15m", default="reports/prepared_price_action_15m.csv")
@@ -153,7 +163,10 @@ def main() -> None:
             all_returns: list[float] = []
             total_trades = 0
             for timeframe in TIMEFRAMES:
-                month_results = [run(data[(timeframe, month)], lower, upper) for month in months]
+                month_results = [
+                    run(data[(timeframe, month)], lower, upper, args.commission, args.initial_capital)
+                    for month in months
+                ]
                 month_returns = [float(r["return_pct"]) for r in month_results]
                 combined = compounded_return(month_returns)
                 total_tf_trades = sum(int(r["trades"]) for r in month_results)
@@ -176,7 +189,10 @@ def main() -> None:
 
     rows.sort(key=lambda x: (x[4], x[3], x[2], x[5], x[6]), reverse=True)
 
-    print(f"COMMON_TIMEFRAME_BIAS | symbol={args.symbol} | months={','.join(months)} | commission={args.commission * 100:.2f}%")
+    print(
+        f"COMMON_TIMEFRAME_BIAS | symbol={args.symbol} | months={','.join(months)} | "
+        f"commission={args.commission * 100:.2f}% per side"
+    )
     print("LOWER | UPPER | AVG_TF | WORST_TF | POS_TF | POS_MONTHS | TRADES | 5m_COMB | 15m_COMB | 1h_COMB")
     for lower, upper, avg_tf, worst_tf, positive_tf, positive_months, total_trades, tf_results in rows[:15]:
         print(
@@ -196,8 +212,6 @@ def main() -> None:
             f"5m={float(tf_results['5m']['combined']):+.2f}% 15m={float(tf_results['15m']['combined']):+.2f}% 1h={float(tf_results['1h']['combined']):+.2f}%"
         )
 
-    # Recommended common candidate: all three timeframes positive over the full tested period,
-    # with >= 50 trades total, then maximize the weakest timeframe.
     robust = [r for r in rows if r[4] == len(TIMEFRAMES) and r[6] >= 50]
     if robust:
         best = robust[0]
