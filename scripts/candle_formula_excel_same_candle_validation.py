@@ -19,9 +19,9 @@ def load_month(path: Path, month: str, symbol: str) -> list[Candle]:
                     Candle(
                         int(float(row["timestamp"])),
                         float(row["open"]),
-                        float(row["high"])),
-                        float(row["low"])),
-                        float(row["close"])),
+                        float(row["high"]),
+                        float(row["low"]),
+                        float(row["close"]),
                     )
                 )
             except (KeyError, TypeError, ValueError):
@@ -68,7 +68,9 @@ def run_timeframe(path: Path, timeframe: str, month: str, symbol: str) -> dict[s
         candle = candles[i]
         previous = candles[i - 1]
         r1, r2, r3, r4, r5, r6 = excel_rule_values(candle)
-        expected_signal = 1 if (r1 + r2 + r3) == 3 else -1 if (r1 + r2 + r3) == 0 else 0
+        s = r1 + r2 + r3
+        expected_signal = 1 if s == 3 else -1 if s == 0 else 0
+
         actual_rules = evaluate_rules(candle)
         actual_tuple = tuple(
             int(getattr(actual_rules, attr))
@@ -113,7 +115,9 @@ def run_timeframe(path: Path, timeframe: str, month: str, symbol: str) -> dict[s
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Exact Excel same-candle validation: S=3 vs I=UP and S=0 vs I=DOWN.")
+    ap = argparse.ArgumentParser(
+        description="Exact Excel same-candle validation: S=3 vs I=UP and S=0 vs I=DOWN."
+    )
     ap.add_argument("--month", default="2026-07")
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--input-5m", default="reports/prepared_price_action_5m.csv")
