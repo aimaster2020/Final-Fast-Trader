@@ -47,20 +47,21 @@ def load_all(path: Path, symbol: str) -> list[tuple[str, Candle]]:
 
 
 def excel_columns(c: Candle) -> tuple[float, float, float, float, float, float, int, int, int, int]:
-    j = c.close - c.open
-    k = c.high - c.close
-    l = c.low - c.close
-    m = c.high - c.open
-    n = c.low - c.open
-    o = c.high - c.low
-    p = int(k > j)
-    q = int(k > m)
-    r = int(l > j)
-    s = p + q + r
+    j = c.close - c.open       # J = C-O
+    k = c.high - c.close       # K = H-C
+    l = c.low - c.close        # L = Low-C
+    m = c.high - c.open        # M = H-O
+    n = c.low - c.open          # N = Low-O
+    o = c.high - c.low          # O = H-L
+    p = int(k > j)               # P = IF(K>J,1,0)
+    q = int(k > m)               # Q = IF(K>M,1,0)
+    r = int(l > j)               # R = IF(L>J,1,0)
+    s = p + q + r                # S = SUM(P:R)
     return j, k, l, m, n, o, p, q, r, s
 
 
 def excel_signal(s: int) -> int:
+    # S=3 -> BUY, S=0 -> SELL, S=1/2 -> HOLD.
     if s == 3:
         return 1
     if s == 0:
@@ -69,6 +70,7 @@ def excel_signal(s: int) -> int:
 
 
 def excel_i_for_row(j_current: float, j_next: float | None) -> int | None:
+    # Exact Excel placement: I(row) = compare J(next row) vs J(current row).
     if j_next is None:
         return None
     if j_next > j_current:
@@ -85,7 +87,11 @@ def pnl_pct(side: int, entry: float, price: float) -> float:
 
 
 def position_levels(close: float, open_: float, side: int) -> tuple[float, float, float]:
-    """A = abs(C-O); TP uses 2A, SL uses half of 2A = A."""
+    """Closed-entry-candle levels from A=abs(C-O).
+
+    BUY : Entry=C, TP=C+2A, SL=C-A
+    SELL: Entry=C, TP=C-2A, SL=C+A
+    """
     a = abs(close - open_)
     if side == 1:
         return a, close + 2.0 * a, close - a
@@ -95,13 +101,21 @@ def position_levels(close: float, open_: float, side: int) -> tuple[float, float
 def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | int]:
     month_indices = [i for i, (m, _) in enumerate(rows) if m == month]
     if not month_indices:
-        return {"return": 0.0, "trades": 0, "wins": 0, "predictions": 0, "correct": 0, "dd": 0.0}
+        return {
+            "return": 0.0,
+            "trades": 0,
+            "wins": 0,
+            "predictions": 0,
+            "correct": 0,
+            "dd": 0.0,
+        }
 
     equity = CAPITAL
     position: Position | None = None
     peak = CAPITAL
     max_dd = 0.0
     predictions = correct = trades = wins = 0
+    entry_idx: int | None = None
 
     for idx in month_indices:
         _, candle = rows[idx]
@@ -117,32 +131,8 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
             predictions += 1
             correct += int(current_correct)
 
-        # All trading decisions use CLOSED candle prices only.
-        # First close an existing position, then optionally open a new one
-        # from the same confirmed close if a new signal is present.
-        closed_this_candle = False
-        if position is not None:
-            close_price = candle.close
-            trade_pnl: float | None = None
-            if position.side == 1:
-                if close_price >= position.target:
-                    trade_pnl = 2.0 * position.abs_body / position.entry * 100.0
-                elif close_price <= position.stop:
-                    trade_pnl = -position.abs_body / position.entry * 100.0
-            else:
-                if close_price <= position.target:
-                    trade_pnl = 2.0 * position.abs_body / position.entry * 100.0
-                elif close_price >= position.stop:
-                    trade_pnl = -position.abs_body / position.entry * 100.0
-
-            if trade_pnl is not None:
-                equity += position.capital * trade_pnl / 100.0
-                trades += 1
-                wins += int(trade_pnl > 0)
-                position = None
-                closed_this_candle = True
-
-        if position is None and signal != 0 and not closed_this_candle:
+        # Entry is based only on the current CLOSED candle signal.
+        if position is None and signal != 0:
             abs_body, target, stop = position_levels(candle.close, candle.open, signal)
             position = Position(
                 side=signal,
@@ -152,8 +142,31 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
                 target=target,
                 stop=stop,
             )
+            entry_idx = idx
 
-        # Force close at the final CLOSED candle of each month if TP/SL was not hit.
+        # Exit is checked only on a later CLOSED candle.
+        if position is not None and entry_idx is not None and idx > entry_idx:
+            close_price = candle.close
+            trade_pnl: float | None = None
+            if position.side == 1:
+                if close_price >= position.target:
+                    trade_pnl = (position.target - position.entry) / position.entry * 100.0
+                elif close_price <= position.stop:
+                    trade_pnl = (position.stop - position.entry) / position.entry * 100.0
+            else:
+                if close_price <= position.target:
+                    trade_pnl = (position.entry - position.target) / position.entry * 100.0
+                elif close_price >= position.stop:
+                    trade_pnl = (position.entry - position.stop) / position.entry * 100.0
+
+            if trade_pnl is not None:
+                equity += position.capital * trade_pnl / 100.0
+                trades += 1
+                wins += int(trade_pnl > 0)
+                position = None
+                entry_idx = None
+
+        # Force-close at the last CLOSED candle of the month if TP/SL was not hit.
         next_month = rows[idx + 1][0] if idx + 1 < len(rows) else None
         if position is not None and next_month != month:
             trade_pnl = pnl_pct(position.side, position.entry, candle.close)
@@ -161,6 +174,7 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
             trades += 1
             wins += int(trade_pnl > 0)
             position = None
+            entry_idx = None
 
         mtm = equity
         if position is not None:
@@ -196,7 +210,7 @@ def main() -> None:
     path = Path(args.input)
     print(
         "EXCEL_EXACT_BACKTEST | tf=1h | fee=0 | entry=CLOSE_SIGNAL | "
-        "TP=2xABS(C-O) | SL=ABS(C-O) | close_only | "
+        "TP=+2xABS(C-O) | SL=-1xABS(C-O) | close_only | "
         "signal=S3_BUY/S0_SELL/S1,S2_HOLD | "
         "I(row)=IF(J_next>J_current,1,IF(J_next<J_current,-1,0))"
     )
@@ -207,6 +221,7 @@ def main() -> None:
         total_trades = total_wins = total_predictions = total_correct = 0
         max_dd = 0.0
         print(f"\n{symbol}")
+
         for month in MONTHS:
             r = run_month(rows, month)
             ret = float(r["return"])
