@@ -17,8 +17,9 @@ class Position:
     side: int
     entry: float
     capital: float
-    move: float
+    abs_body: float
     target: float
+    stop: float
 
 
 def load_all(path: Path, symbol: str) -> list[tuple[str, Candle]]:
@@ -46,21 +47,20 @@ def load_all(path: Path, symbol: str) -> list[tuple[str, Candle]]:
 
 
 def excel_columns(c: Candle) -> tuple[float, float, float, float, float, float, int, int, int, int]:
-    j = c.close - c.open       # J = C-O
-    k = c.high - c.close       # K = H-C
-    l = c.low - c.close        # L = Low-C
-    m = c.high - c.open        # M = H-O
-    n = c.low - c.open         # N = Low-O
-    o = c.high - c.low         # O = H-L
-    p = int(k > j)             # P = IF(K>J,1,0)
-    q = int(k > m)             # Q = IF(K>M,1,0)
-    r = int(l > j)             # R = IF(L>J,1,0)
-    s = p + q + r              # S = SUM(P:R)
+    j = c.close - c.open
+    k = c.high - c.close
+    l = c.low - c.close
+    m = c.high - c.open
+    n = c.low - c.open
+    o = c.high - c.low
+    p = int(k > j)
+    q = int(k > m)
+    r = int(l > j)
+    s = p + q + r
     return j, k, l, m, n, o, p, q, r, s
 
 
 def excel_signal(s: int) -> int:
-    # S=3 -> BUY, S=0 -> SELL, S=1/2 -> HOLD.
     if s == 3:
         return 1
     if s == 0:
@@ -69,7 +69,6 @@ def excel_signal(s: int) -> int:
 
 
 def excel_i_for_row(j_current: float, j_next: float | None) -> int | None:
-    # Exact Excel placement: I(row) = compare J(next row) vs J(current row).
     if j_next is None:
         return None
     if j_next > j_current:
@@ -85,15 +84,12 @@ def pnl_pct(side: int, entry: float, price: float) -> float:
     return side * (price - entry) / entry * 100.0
 
 
-def dynamic_move(c: Candle, side: int) -> float:
-    # User formula: abs(C-O) * 2; sign follows trade direction.
-    return side * abs(c.close - c.open) * 2.0
-
-
-def hit_target(position: Position, candle: Candle) -> bool:
-    if position.side == 1:
-        return candle.high >= position.target
-    return candle.low <= position.target
+def position_levels(close: float, open_: float, side: int) -> tuple[float, float, float]:
+    """A = abs(C-O); TP uses 2A, SL uses half of 2A = A."""
+    a = abs(close - open_)
+    if side == 1:
+        return a, close + 2.0 * a, close - a
+    return a, close - 2.0 * a, close + a
 
 
 def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | int]:
@@ -121,23 +117,43 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
             predictions += 1
             correct += int(current_correct)
 
-        # Entry: current BUY/SELL signal only. No previous-prediction filter and no bias filter.
-        if position is None and signal != 0:
-            move = dynamic_move(candle, signal)
-            entry = candle.close
-            target = entry + move
-            position = Position(signal, entry, equity, move, target)
+        # All trading decisions use CLOSED candle prices only.
+        # First close an existing position, then optionally open a new one
+        # from the same confirmed close if a new signal is present.
+        closed_this_candle = False
+        if position is not None:
+            close_price = candle.close
+            trade_pnl: float | None = None
+            if position.side == 1:
+                if close_price >= position.target:
+                    trade_pnl = 2.0 * position.abs_body / position.entry * 100.0
+                elif close_price <= position.stop:
+                    trade_pnl = -position.abs_body / position.entry * 100.0
+            else:
+                if close_price <= position.target:
+                    trade_pnl = 2.0 * position.abs_body / position.entry * 100.0
+                elif close_price >= position.stop:
+                    trade_pnl = -position.abs_body / position.entry * 100.0
 
-        # Exit: dynamic directional target based on the entry candle body.
-        if position is not None and hit_target(position, candle):
-            fill = position.target
-            trade_pnl = pnl_pct(position.side, position.entry, fill)
-            equity += position.capital * trade_pnl / 100.0
-            trades += 1
-            wins += int(trade_pnl > 0)
-            position = None
+            if trade_pnl is not None:
+                equity += position.capital * trade_pnl / 100.0
+                trades += 1
+                wins += int(trade_pnl > 0)
+                position = None
+                closed_this_candle = True
 
-        # Force-close at month end if target was not reached.
+        if position is None and signal != 0 and not closed_this_candle:
+            abs_body, target, stop = position_levels(candle.close, candle.open, signal)
+            position = Position(
+                side=signal,
+                entry=candle.close,
+                capital=equity,
+                abs_body=abs_body,
+                target=target,
+                stop=stop,
+            )
+
+        # Force close at the final CLOSED candle of each month if TP/SL was not hit.
         next_month = rows[idx + 1][0] if idx + 1 < len(rows) else None
         if position is not None and next_month != month:
             trade_pnl = pnl_pct(position.side, position.entry, candle.close)
@@ -146,7 +162,6 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
             wins += int(trade_pnl > 0)
             position = None
 
-        # Mark-to-market DD uses percentage return directly, without double scaling.
         mtm = equity
         if position is not None:
             floating_pct = pnl_pct(position.side, position.entry, candle.close)
@@ -173,15 +188,16 @@ def compound(values: list[float]) -> float:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Exact Excel candle formula backtest with dynamic 2*abs(C-O) directional exit; no commission."
+        description="Exact Excel candle formula backtest; closed-candle entry/exit; TP=2*abs(C-O), SL=abs(C-O); no commission."
     )
     ap.add_argument("--input", default="reports/prepared_price_action_1h.csv")
     args = ap.parse_args()
 
     path = Path(args.input)
     print(
-        "EXCEL_EXACT_BACKTEST | tf=1h | fee=0 | entry=SIGNAL_ONLY | "
-        "exit=DYNAMIC_2x_ABS_BODY | signal=S3_BUY/S0_SELL/S1,S2_HOLD | "
+        "EXCEL_EXACT_BACKTEST | tf=1h | fee=0 | entry=CLOSE_SIGNAL | "
+        "TP=2xABS(C-O) | SL=ABS(C-O) | close_only | "
+        "signal=S3_BUY/S0_SELL/S1,S2_HOLD | "
         "I(row)=IF(J_next>J_current,1,IF(J_next<J_current,-1,0))"
     )
 
