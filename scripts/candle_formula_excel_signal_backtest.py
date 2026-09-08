@@ -10,8 +10,6 @@ from fast_pattern_trader.models import Candle
 MONTHS = ("2026-05", "2026-06", "2026-07", "2026-08")
 SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 CAPITAL = 1000.0
-TAKE_PROFIT_PCT = 50.0
-STOP_LOSS_PCT = -50.0
 
 
 @dataclass
@@ -19,6 +17,8 @@ class Position:
     side: int
     entry: float
     capital: float
+    move: float
+    target: float
 
 
 def load_all(path: Path, symbol: str) -> list[tuple[str, Candle]]:
@@ -46,20 +46,21 @@ def load_all(path: Path, symbol: str) -> list[tuple[str, Candle]]:
 
 
 def excel_columns(c: Candle) -> tuple[float, float, float, float, float, float, int, int, int, int]:
-    j = c.close - c.open
-    k = c.high - c.close
-    l = c.low - c.close
-    m = c.high - c.open
-    n = c.low - c.open
-    o = c.high - c.low
-    p = int(k > j)
-    q = int(k > m)
-    r = int(l > j)
-    s = p + q + r
+    j = c.close - c.open       # J = C-O
+    k = c.high - c.close       # K = H-C
+    l = c.low - c.close        # L = Low-C
+    m = c.high - c.open        # M = H-O
+    n = c.low - c.open         # N = Low-O
+    o = c.high - c.low         # O = H-L
+    p = int(k > j)             # P = IF(K>J,1,0)
+    q = int(k > m)             # Q = IF(K>M,1,0)
+    r = int(l > j)             # R = IF(L>J,1,0)
+    s = p + q + r              # S = SUM(P:R)
     return j, k, l, m, n, o, p, q, r, s
 
 
 def excel_signal(s: int) -> int:
+    # S=3 -> BUY, S=0 -> SELL, S=1/2 -> HOLD.
     if s == 3:
         return 1
     if s == 0:
@@ -68,7 +69,7 @@ def excel_signal(s: int) -> int:
 
 
 def excel_i_for_row(j_current: float, j_next: float | None) -> int | None:
-    """Excel row N: =IF(J(N+1)>J(N),1,IF(J(N+1)<J(N),-1,0))."""
+    # Exact Excel placement: I(row) = compare J(next row) vs J(current row).
     if j_next is None:
         return None
     if j_next > j_current:
@@ -82,6 +83,23 @@ def pnl_pct(side: int, entry: float, price: float) -> float:
     if entry <= 0:
         return 0.0
     return side * (price - entry) / entry * 100.0
+
+
+def dynamic_move(c: Candle, side: int) -> float:
+    # User formula: abs(C-O) * 2; sign follows trade direction.
+    base_move = abs(c.close - c.open) * 2.0
+    return side * base_move
+
+
+def hit_target(position: Position, candle: Candle) -> bool:
+    # Use candle high/low to detect whether the dynamic target was reached.
+    if position.side == 1:
+        return candle.high >= position.target
+    return candle.low <= position.target
+
+
+def target_fill(position: Position) -> float:
+    return position.target
 
 
 def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | int]:
@@ -109,31 +127,34 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
             predictions += 1
             correct += int(current_correct)
 
-        # Entry: ONLY current BUY/SELL signal. No previous-prediction filter and no bias filter.
+        # Entry: current BUY/SELL signal only. No previous-prediction filter and no bias filter.
         if position is None and signal != 0:
-            position = Position(signal, candle.close, equity)
+            move = dynamic_move(candle, signal)
+            entry = candle.close
+            target = entry + move
+            position = Position(signal, entry, equity, move, target)
 
-        if position is not None:
-            current_pnl = pnl_pct(position.side, position.entry, candle.close)
-            if current_pnl >= TAKE_PROFIT_PCT or current_pnl <= STOP_LOSS_PCT:
-                equity += position.capital * current_pnl / 100.0
-                trades += 1
-                wins += int(current_pnl > 0)
-                position = None
+        # Dynamic exit: target = entry +/- 2*abs(C-O), sign from the position direction.
+        if position is not None and hit_target(position, candle):
+            fill = target_fill(position)
+            trade_pnl = pnl_pct(position.side, position.entry, fill)
+            equity += position.capital * trade_pnl / 100.0
+            trades += 1
+            wins += int(trade_pnl > 0)
+            position = None
 
-        # Force close at month end only if +/-50% was not reached.
+        # Force-close at month end only when dynamic target was not reached.
         next_month = rows[idx + 1][0] if idx + 1 < len(rows) else None
         if position is not None and next_month != month:
-            current_pnl = pnl_pct(position.side, position.entry, candle.close)
-            equity += position.capital * current_pnl / 100.0
+            trade_pnl = pnl_pct(position.side, position.entry, candle.close)
+            equity += position.capital * trade_pnl / 100.0
             trades += 1
-            wins += int(current_pnl > 0)
+            wins += int(trade_pnl > 0)
             position = None
 
         mtm = equity
         if position is not None:
-            current_pnl = pnl_pct(position.side, position.entry, candle.close)
-            mtm += position.capital * current_pnl / 100.0
+            mtm += position.capital * pnl_pct(position.side, position.entry, candle.close) / 100.0 * 100.0
         peak = max(peak, mtm)
         max_dd = max(max_dd, (peak - mtm) / peak if peak else 0.0)
 
@@ -155,14 +176,16 @@ def compound(values: list[float]) -> float:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Excel candle formula backtest; signal-only entry; +/-50%% exits; no commission.")
+    ap = argparse.ArgumentParser(
+        description="Exact Excel candle formula backtest with dynamic 2*abs(C-O) directional exit; no commission."
+    )
     ap.add_argument("--input", default="reports/prepared_price_action_1h.csv")
     args = ap.parse_args()
 
     path = Path(args.input)
     print(
         "EXCEL_EXACT_BACKTEST | tf=1h | fee=0 | entry=SIGNAL_ONLY | "
-        "exit=TP+50%%/SL-50%% | signal=S3_BUY/S0_SELL/S1,S2_HOLD | "
+        "exit=DYNAMIC_2x_ABS_BODY | signal=S3_BUY/S0_SELL/S1,S2_HOLD | "
         "I(row)=IF(J_next>J_current,1,IF(J_next<J_current,-1,0))"
     )
 
