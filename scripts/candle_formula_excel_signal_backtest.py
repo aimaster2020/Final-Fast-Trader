@@ -29,18 +29,7 @@ def load_all(path: Path, symbol: str) -> list[tuple[str, Candle]]:
             if row.get("symbol") != symbol:
                 continue
             try:
-                rows.append(
-                    (
-                        row["month"],
-                        Candle(
-                            int(float(row["timestamp"])),
-                            float(row["open"]),
-                            float(row["high"]),
-                            float(row["low"]),
-                            float(row["close"]),
-                        ),
-                    )
-                )
+                rows.append((row["month"], Candle(int(float(row["timestamp"])), float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"]))))
             except (KeyError, TypeError, ValueError):
                 continue
     return sorted(rows, key=lambda x: x[1].timestamp)
@@ -90,15 +79,8 @@ def position_levels(close: float, open_: float, side: int) -> tuple[float, float
 
 
 def empty_stats() -> dict[str, object]:
-    return {
-        "return": 0.0,
-        "trades": 0,
-        "wins": 0,
-        "predictions": 0,
-        "correct": 0,
-        "dd": 0.0,
-        "s_stats": {0: [0, 0], 1: [0, 0], 2: [0, 0], 3: [0, 0]},
-    }
+    return {"return": 0.0, "trades": 0, "wins": 0, "predictions": 0, "correct": 0, "dd": 0.0,
+            "s_stats": {0: [0, 0], 1: [0, 0], 2: [0, 0], 3: [0, 0]}}
 
 
 def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, object]:
@@ -118,7 +100,6 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, object]:
         _, candle = rows[idx]
         j, *_rest, s = excel_columns(candle)
         signal = excel_signal(s)
-
         next_candle = rows[idx + 1][1] if idx + 1 < len(rows) else None
         next_j = None if next_candle is None else next_candle.close - next_candle.open
         actual = excel_i_for_row(j, next_j)
@@ -131,14 +112,7 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, object]:
 
         if position is None:
             abs_body, target, stop = position_levels(candle.close, candle.open, signal)
-            position = Position(
-                side=signal,
-                entry=candle.close,
-                capital=equity,
-                abs_body=abs_body,
-                target=target,
-                stop=stop,
-            )
+            position = Position(side=signal, entry=candle.close, capital=equity, abs_body=abs_body, target=target, stop=stop)
             entry_idx = idx
 
         if position is not None and entry_idx is not None and idx > entry_idx:
@@ -154,7 +128,6 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, object]:
                     trade_pnl = (position.entry - position.target) / position.entry * 100.0
                 elif close_price >= position.stop:
                     trade_pnl = (position.entry - position.stop) / position.entry * 100.0
-
             if trade_pnl is not None:
                 equity += position.capital * trade_pnl / 100.0
                 trades += 1
@@ -178,15 +151,8 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, object]:
         peak = max(peak, mtm)
         max_dd = max(max_dd, (peak - mtm) / peak if peak else 0.0)
 
-    return {
-        "return": (equity / CAPITAL - 1.0) * 100.0,
-        "trades": trades,
-        "wins": wins,
-        "predictions": predictions,
-        "correct": correct,
-        "dd": max_dd * 100.0,
-        "s_stats": s_stats,
-    }
+    return {"return": (equity / CAPITAL - 1.0) * 100.0, "trades": trades, "wins": wins,
+            "predictions": predictions, "correct": correct, "dd": max_dd * 100.0, "s_stats": s_stats}
 
 
 def compound(values: list[float]) -> float:
@@ -202,31 +168,18 @@ def accuracy_pct(stat: list[int]) -> float:
 
 
 def s_stats_text(stats: dict[int, list[int]]) -> str:
-    return (
-        "S0={0}/{1}/{2:.1f}% S1={3}/{4}/{5:.1f}% "
-        "S2={6}/{7}/{8:.1f}% S3={9}/{10}/{11:.1f}%".format(
-            stats[0][0], stats[0][1], accuracy_pct(stats[0]),
-            stats[1][0], stats[1][1], accuracy_pct(stats[1]),
-            stats[2][0], stats[2][1], accuracy_pct(stats[2]),
-            stats[3][0], stats[3][1], accuracy_pct(stats[3]),
-        )
-    )
+    return ("S0={0}/{1}/{2:.1f}% S1={3}/{4}/{5:.1f}% S2={6}/{7}/{8:.1f}% S3={9}/{10}/{11:.1f}%".format(
+        stats[0][0], stats[0][1], accuracy_pct(stats[0]), stats[1][0], stats[1][1], accuracy_pct(stats[1]),
+        stats[2][0], stats[2][1], accuracy_pct(stats[2]), stats[3][0], stats[3][1], accuracy_pct(stats[3])))
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Excel candle formula backtest with expanded direction: S=3/2 BUY and S=0/1 SELL."
-    )
+    ap = argparse.ArgumentParser(description="Excel candle formula backtest with expanded direction: S=3/2 BUY and S=0/1 SELL.")
     ap.add_argument("--input", default="reports/prepared_price_action_1h.csv")
     args = ap.parse_args()
-
     path = Path(args.input)
-    print(
-        "EXCEL_DIRECTION_TEST | tf=1h | fee=0 | signal=S3/S2_BUY + S0/S1_SELL | no_hold | "
-        "I(row)=IF(J_next>J_current,1,IF(J_next<J_current,-1,0)) | "
-        "TP=+/-2xABS(C-O) | SL=+/-1xABS(C-O) | close_only"
-    )
-    print("S_STATS format = count/correct/accuracy")
+    print("EXCEL_DIRECTION_TEST | tf=1h | fee=0 | signal=S3/S2_BUY + S0/S1_SELL | no_hold | I(row)=IF(J_next>J_current,1,IF(J_next<J_current,-1,0)) | TP=+/-2xABS(C-O) | SL=+/-1xABS(C-O) | close_only")
+    print("S_STATS format = count/correct/accuracy | monthly")
 
     for symbol in SYMBOLS:
         rows = load_all(path, symbol)
@@ -235,7 +188,6 @@ def main() -> None:
         max_dd = 0.0
         total_s_stats: dict[int, list[int]] = {0: [0, 0], 1: [0, 0], 2: [0, 0], 3: [0, 0]}
         print(f"\n{symbol}")
-
         for month in MONTHS:
             r = run_month(rows, month)
             ret = float(r["return"])
@@ -255,21 +207,9 @@ def main() -> None:
             total_predictions += predictions
             total_correct += correct
             max_dd = max(max_dd, float(r["dd"]))
-            print(
-                f"{month} return={ret:+.2f}% trades={trades} "
-                f"win={(wins / trades * 100.0 if trades else 0.0):.1f}% "
-                f"pred={predictions} acc={acc:.1f}% DD={float(r['dd']):.2f}% "
-                f"| {s_stats_text(month_s_stats)}"
-            )
+            print(f"{month} return={ret:+.2f}% trades={trades} win={(wins / trades * 100.0 if trades else 0.0):.1f}% pred={predictions} acc={acc:.1f}% DD={float(r['dd']):.2f}% | {s_stats_text(month_s_stats)}")
 
-        print(
-            f"4M compound={compound(monthly_returns):+.2f}% "
-            f"avg={sum(monthly_returns)/len(monthly_returns):+.2f}% "
-            f"worst={min(monthly_returns):+.2f}% trades={total_trades} "
-            f"win={(total_wins/total_trades*100.0 if total_trades else 0.0):.1f}% "
-            f"pred={total_predictions} acc={(total_correct/total_predictions*100.0 if total_predictions else 0.0):.1f}% "
-            f"DD={max_dd:.2f}%"
-        )
+        print(f"4M compound={compound(monthly_returns):+.2f}% avg={sum(monthly_returns)/len(monthly_returns):+.2f}% worst={min(monthly_returns):+.2f}% trades={total_trades} win={(total_wins/total_trades*100.0 if total_trades else 0.0):.1f}% pred={total_predictions} acc={(total_correct/total_predictions*100.0 if total_predictions else 0.0):.1f}% DD={max_dd:.2f}%")
         print(f"4M_S_STATS | {s_stats_text(total_s_stats)}")
 
 
