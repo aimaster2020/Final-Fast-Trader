@@ -5,17 +5,22 @@ import numpy as np
 import pandas as pd
 
 
+REQUIRED = ["open", "high", "low", "close"]
+
+
 def load_data(path: str, limit: int = 0) -> pd.DataFrame:
-    df = pd.read_csv(path)
+    # The project CSVs can contain many extra/formula columns. We only need OHLC.
+    df = pd.read_csv(path, usecols=lambda c: str(c).strip().lower() in REQUIRED)
     df.columns = [str(c).strip().lower() for c in df.columns]
-    required = ["open", "high", "low", "close"]
-    missing = [c for c in required if c not in df.columns]
+
+    missing = [c for c in REQUIRED if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns: {missing}. Available: {list(df.columns)}")
 
-    for c in required:
+    for c in REQUIRED:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=required).copy()
+    df = df.dropna(subset=REQUIRED).copy()
+
     if limit > 0:
         df = df.tail(limit).copy()
 
@@ -28,7 +33,7 @@ def load_data(path: str, limit: int = 0) -> pd.DataFrame:
     df["N"] = df["J"] / rng
     df["O"] = (df["L"] - df["K"]) / rng
 
-    # Target: U = J(next) - J(current). No future field is used as a feature.
+    # Target: U = J(next) - J(current). The next candle is used only as target.
     df["U"] = df["J"].shift(-1) - df["J"]
     return df.dropna().reset_index(drop=True)
 
@@ -78,7 +83,7 @@ def evaluate(name: str, features: list[str], train: pd.DataFrame, test: pd.DataF
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Out-of-sample test for next-candle body change U = J_next - J_current")
+    parser = argparse.ArgumentParser(description="OOS test for next-candle body change U = J_next - J_current")
     parser.add_argument("--input", required=True, help="OHLC CSV path")
     parser.add_argument("--limit", type=int, default=0, help="Use last N rows; 0 = all")
     parser.add_argument("--test-ratio", type=float, default=0.30, help="Chronological OOS fraction")
@@ -103,10 +108,12 @@ def main() -> None:
     print(f"target         : U = J_next - J_current")
     print("leakage        : NO")
 
-    baseline_pred = np.full(len(test), train["U"].mean())
     baseline_y = test["U"].to_numpy(float)
+    baseline_pred = np.full(len(test), train["U"].mean())
     baseline_mae = float(np.mean(np.abs(baseline_y - baseline_pred)))
+    baseline_acc, baseline_n = direction_accuracy(baseline_y, baseline_pred)
     print("\nBASELINE (train mean)")
+    print(f"direction_acc  : {baseline_acc * 100:.2f}% ({baseline_n})")
     print(f"MAE            : {baseline_mae:.8f}")
 
     a = evaluate("MODEL A: J,K,L", ["J", "K", "L"], train, test)
