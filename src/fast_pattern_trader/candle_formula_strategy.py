@@ -4,10 +4,10 @@ from dataclasses import dataclass
 
 from .models import Candle, Signal
 
-STRATEGY_NAME = "candle_formula_exact_excel_v1"
+STRATEGY_NAME = "candle_formula_binary_s_v2"
 RANGE_MIN_BODY = -100.0
 RANGE_MAX_BODY = 100.0
-DECISION_SCORE = 3
+DECISION_SCORE = 2
 
 # Exact Excel formula groups.
 # UP group:
@@ -19,11 +19,11 @@ DECISION_SCORE = 3
 #   R5: H-C < H-O
 #   R6: L-C < C-O
 #
-# Excel decision logic is UNWEIGHTED:
+# Updated binary decision logic:
 #   S = R1 + R2 + R3
-#   S = 3 -> UP
-#   S = 0 -> DOWN
-#   S = 1 or 2 -> HOLD
+#   S = 3 or 2 -> BUY
+#   S = 1 or 0 -> SELL
+#   No HOLD is produced by the formula decision.
 
 
 @dataclass(frozen=True)
@@ -96,17 +96,15 @@ def is_range(candle: Candle) -> bool:
 
 
 def decide(candle: Candle) -> FormulaDecision:
-    """Match the Excel decision rule exactly: S=3 UP, S=0 DOWN, else HOLD."""
+    """Return BUY for S=3/2 and SELL for S=0/1."""
     rules = evaluate_rules(candle)
     up_score = rules.up_score
     down_score = rules.down_score
 
-    if up_score == DECISION_SCORE:
+    if up_score >= DECISION_SCORE:
         signal = Signal.BUY
-    elif up_score == 0:
-        signal = Signal.SELL
     else:
-        signal = Signal.HOLD
+        signal = Signal.SELL
 
     return FormulaDecision(
         signal=signal,
