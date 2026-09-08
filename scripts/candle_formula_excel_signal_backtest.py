@@ -87,19 +87,13 @@ def pnl_pct(side: int, entry: float, price: float) -> float:
 
 def dynamic_move(c: Candle, side: int) -> float:
     # User formula: abs(C-O) * 2; sign follows trade direction.
-    base_move = abs(c.close - c.open) * 2.0
-    return side * base_move
+    return side * abs(c.close - c.open) * 2.0
 
 
 def hit_target(position: Position, candle: Candle) -> bool:
-    # Use candle high/low to detect whether the dynamic target was reached.
     if position.side == 1:
         return candle.high >= position.target
     return candle.low <= position.target
-
-
-def target_fill(position: Position) -> float:
-    return position.target
 
 
 def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | int]:
@@ -134,16 +128,16 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
             target = entry + move
             position = Position(signal, entry, equity, move, target)
 
-        # Dynamic exit: target = entry +/- 2*abs(C-O), sign from the position direction.
+        # Exit: dynamic directional target based on the entry candle body.
         if position is not None and hit_target(position, candle):
-            fill = target_fill(position)
+            fill = position.target
             trade_pnl = pnl_pct(position.side, position.entry, fill)
             equity += position.capital * trade_pnl / 100.0
             trades += 1
             wins += int(trade_pnl > 0)
             position = None
 
-        # Force-close at month end only when dynamic target was not reached.
+        # Force-close at month end if target was not reached.
         next_month = rows[idx + 1][0] if idx + 1 < len(rows) else None
         if position is not None and next_month != month:
             trade_pnl = pnl_pct(position.side, position.entry, candle.close)
@@ -152,9 +146,11 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
             wins += int(trade_pnl > 0)
             position = None
 
+        # Mark-to-market DD uses percentage return directly, without double scaling.
         mtm = equity
         if position is not None:
-            mtm += position.capital * pnl_pct(position.side, position.entry, candle.close) / 100.0 * 100.0
+            floating_pct = pnl_pct(position.side, position.entry, candle.close)
+            mtm += position.capital * floating_pct / 100.0
         peak = max(peak, mtm)
         max_dd = max(max_dd, (peak - mtm) / peak if peak else 0.0)
 
