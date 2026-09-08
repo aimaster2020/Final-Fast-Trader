@@ -33,8 +33,8 @@ def pnl_pct(sd,en,px): return sd*(px-en)/en*100 if en>0 else 0.0
 
 def run(rows, mapping):
     # mapping[s] is the history bucket used when actual signal state is s.
-    # For a true label permutation placebo, the observed target must be
-    # appended to the permuted bucket as well.
+    # For a true label permutation placebo, the observed target is stored
+    # in the same permuted bucket used for future lookup.
     hist=defaultdict(list); glob=[]; eq=CAPITAL; peak=CAPITAL; dd=0.0
     pos=None; ei=-1; trades=wins=0
     monthly={m:0.0 for m in MONTHS}
@@ -64,8 +64,6 @@ def run(rows, mapping):
             if valid:
                 ratio_actual=abs(rs[i+1][5]-r[5])/b
                 if ratio_actual==ratio_actual:
-                    # IMPORTANT: store the target in the same permuted bucket
-                    # from which the next prediction for this state will read.
                     hist[key].append(ratio_actual)
                     glob.append(ratio_actual)
         if pos is not None:
@@ -80,7 +78,7 @@ def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--input',type=Path,default=Path('reports/prepared_price_action_1h.csv')); a=ap.parse_args()
     print('EXCEL_STATE_PLACEBO | tf=1h | exact S0-S3 | fixed trade capital=$1000 | close_only | past_only')
     print('Actual STATE vs 24 fixed state-label permutations; same signal/entry logic; SL=0.5xTP')
-    print('NOTE: placebo now permutes both prediction lookup and historical bucket assignment')
+    print('NOTE: placebo permutes both prediction lookup and historical bucket assignment')
     for sym in SYMS:
         rows=load_rows(a.input,sym); maps=list(itertools.permutations(range(4)))
         res=[]
@@ -91,7 +89,7 @@ def main():
             if mp==(0,1,2,3): actual=r
         sums=[x[1][0] for x in res]
         mean=sum(sums)/len(sums); med=statistics.median(sums)
-        better=sum(x>actual[0]+1e-12 for x in sums if x[0] != 0 or True) - 1
+        better=sum(x>actual[0]+1e-12 for x in sums)
         worse=sum(x<actual[0]-1e-12 for x in sums)
         print(f'{sym} STATE_sum={actual[0]:+.2f}% placebo_mean={mean:+.2f}% placebo_median={med:+.2f}% better_than_STATE={better}/23 worse={worse}/23 range=[{min(sums):+.2f},{max(sums):+.2f}]')
         print(f'  STATE trades={actual[1]} win={100*actual[2]/actual[1] if actual[1] else 0:.1f}% DD={actual[3]:.2f}%')
