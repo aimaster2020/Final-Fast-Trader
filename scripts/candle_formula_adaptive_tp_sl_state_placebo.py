@@ -64,6 +64,8 @@ def run(rows, mapping):
             if valid:
                 ratio_actual=abs(rs[i+1][5]-r[5])/b
                 if ratio_actual==ratio_actual:
+                    # Keep target observations in their REAL S bucket.
+                    # The permutation changes lookup only, preventing cancellation.
                     hist[s].append(ratio_actual)
                     glob.append(ratio_actual)
         if pos is not None:
