@@ -76,21 +76,61 @@ def run(rows, mapping):
     return sum(monthly.values()), trades, wins, dd, monthly
 
 
+def trace_entries(rows, mapping, limit=20):
+    hist=defaultdict(list); glob=[]; pos=False; traces=[]
+    for month in MONTHS:
+        rs=[r for r in rows if r[0]==month]
+        for i,r in enumerate(rs[:-1]):
+            s=S(r); b=abs(r[5]-r[2]); valid=r[5]!=0 and b/abs(r[5])>=MIN_BODY
+            gr=statistics.median(glob) if glob else 2.0
+            key=mapping[s]
+            ratio=statistics.median(hist[key]) if hist[key] else gr
+            if not pos:
+                traces.append((month,i,s,key,ratio))
+                pos=True
+            # Mirror the backtest's close-only position lifetime: the next candle
+            # gets a chance to close the position. This trace only tracks entry ratios.
+            if pos and i > 0:
+                # We only need entry-ratio diagnostics, so approximate a one-candle hold
+                # to expose lookup differences without changing the actual backtest.
+                pos=False
+            if valid:
+                ratio_actual=abs(rs[i+1][5]-r[5])/b
+                if ratio_actual==ratio_actual:
+                    hist[s].append(ratio_actual); glob.append(ratio_actual)
+            if len(traces)>=limit: return traces
+    return traces
+
+
+def diagnostic(rows):
+    ident=(0,1,2,3); probe=(1,0,2,3)
+    a=trace_entries(rows,ident,20); b=trace_entries(rows,probe,20)
+    diffs=[]
+    for x,y in zip(a,b):
+        if abs(x[4]-y[4])>1e-12: diffs.append((x,y))
+    meds={s:statistics.median([abs(rs[i+1][5]-r[5])/abs(r[5]-r[2]) for i,r in enumerate(rows[:-1]) if S(r)==s and abs(r[5]-r[2])>0 and r[5]!=0]) for s in range(4)}
+    print(f'  DIAG overall_ratio_medians={meds}')
+    print(f'  DIAG first20_entry_ratios_identity={[round(x[4],4) for x in a]}')
+    print(f'  DIAG first20_entry_ratios_probe={ [round(x[4],4) for x in b] }')
+    print(f'  DIAG differing_first20={len(diffs)}/20')
+    if diffs:
+        print(f'  DIAG first_difference identity={diffs[0][0]} probe={diffs[0][1]}')
+
+
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('--input',type=Path,default=Path('reports/prepared_price_action_1h.csv')); a=ap.parse_args()
+    ap=argparse.ArgumentParser(); ap.add_argument('--input',type=Path,default=Path('reports/prepared_price_action_1h.csv')); ap.add_argument('--diagnostic',action='store_true'); a=ap.parse_args()
     print('EXCEL_STATE_PLACEBO | tf=1h | exact S0-S3 | fixed trade capital=$1000 | close_only | past_only')
     print('Actual STATE vs 24 lookup permutations; history remains bucketed by real S; SL=0.5xTP')
     for sym in SYMS:
-        rows=load_rows(a.input,sym); maps=list(itertools.permutations(range(4)))
-        res=[]
-        actual=(0,0,0,0,{})
+        rows=load_rows(a.input,sym)
+        if a.diagnostic: diagnostic(rows)
+        maps=list(itertools.permutations(range(4))); res=[]; actual=(0,0,0,0,{})
         for mp in maps:
             r=run(rows,mp); res.append((mp,r))
             if mp==(0,1,2,3): actual=r
         sums=[x[1][0] for x in res]
         mean=sum(sums)/len(sums); med=statistics.median(sums)
-        better=sum(x>actual[0]+1e-12 for x in sums)
-        worse=sum(x<actual[0]-1e-12 for x in sums)
+        better=sum(x>actual[0]+1e-12 for x in sums); worse=sum(x<actual[0]-1e-12 for x in sums)
         print(f'{sym} STATE_sum={actual[0]:+.2f}% placebo_mean={mean:+.2f}% placebo_median={med:+.2f}% better_than_STATE={better}/23 worse={worse}/23 range=[{min(sums):+.2f},{max(sums):+.2f}]')
         print(f'  STATE trades={actual[1]} win={100*actual[2]/actual[1] if actual[1] else 0:.1f}% DD={actual[3]:.2f}%')
         best=max(res,key=lambda x:x[1][0]); worst=min(res,key=lambda x:x[1][0])
