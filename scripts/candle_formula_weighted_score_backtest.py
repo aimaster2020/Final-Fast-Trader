@@ -60,9 +60,20 @@ def weighted_signal(c: Candle, weights: dict[str, int]) -> int:
         return -1
     return 0
 
-def body_direction(c: Candle) -> int:
-    body = c.close - c.open
-    return 1 if body > 0 else -1 if body < 0 else 0
+def body_value(c: Candle) -> float:
+    return c.close - c.open
+
+def body_direction(current: Candle, previous: Candle | None) -> int:
+    """Exact Excel direction formula: =IF(L3>L2,1,IF(L3<L2,-1,0))."""
+    if previous is None:
+        return 0
+    current_l = body_value(current)
+    previous_l = body_value(previous)
+    if current_l > previous_l:
+        return 1
+    if current_l < previous_l:
+        return -1
+    return 0
 
 def in_bias(body: float, width: float) -> bool:
     return -width <= body <= width
@@ -78,10 +89,12 @@ def run(candles: list[Candle], weights: dict[str, int], width: float) -> dict[st
     peak = CAPITAL
     max_dd = 0.0
 
-    for candle in candles:
+    for i, candle in enumerate(candles):
         current_signal = weighted_signal(candle, weights)
-        body = candle.close - candle.open
-        previous_correct = previous_prediction != 0 and previous_prediction == body_direction(candle)
+        body = body_value(candle)
+        previous = candles[i - 1] if i > 0 else None
+        current_direction = body_direction(candle, previous)
+        previous_correct = previous_prediction != 0 and previous_prediction == current_direction
 
         if position is None:
             if current_signal != 0 and not in_bias(body, width) and previous_correct:
@@ -127,7 +140,7 @@ def main() -> None:
     args = ap.parse_args()
 
     path = Path(args.input)
-    print(f"WEIGHTED_SCORE_BACKTEST | tf=1h | fee=0 | width={args.width:g} | previous-prediction-confirmed-entry | same-bias-exit")
+    print(f"WEIGHTED_SCORE_BACKTEST | tf=1h | fee=0 | width={args.width:g} | excel-direction=L3_vs_L2 | previous-prediction-confirmed-entry | same-bias-exit")
     for symbol in SYMBOLS:
         print(f"\n{symbol}")
         candidates = []
