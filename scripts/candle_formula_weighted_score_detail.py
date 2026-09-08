@@ -66,11 +66,23 @@ def weighted_signal(r: dict[str, bool]) -> tuple[int, int, int]:
     return 0, up, down
 
 
-def body_direction(c: Candle) -> int:
-    body = c.close - c.open
-    if body > 0:
+def body_value(c: Candle) -> float:
+    return c.close - c.open
+
+
+def body_direction(current: Candle, previous: Candle | None) -> int:
+    """Exact Excel direction formula: =IF(L3>L2,1,IF(L3<L2,-1,0)).
+
+    Here L = Close - Open. For the current row, compare current L with
+    the previous row's L. The first row has no previous L and is undefined.
+    """
+    if previous is None:
+        return 0
+    current_l = body_value(current)
+    previous_l = body_value(previous)
+    if current_l > previous_l:
         return 1
-    if body < 0:
+    if current_l < previous_l:
         return -1
     return 0
 
@@ -89,8 +101,9 @@ def run_detail(candles: list[Candle], symbol: str, month: str, width: float) -> 
     for i, c in enumerate(candles):
         r = active_rules(c)
         current_signal, up_score, down_score = weighted_signal(r)
-        body = c.close - c.open
-        body_dir = body_direction(c)
+        body = body_value(c)
+        previous = candles[i - 1] if i > 0 else None
+        body_dir = body_direction(c, previous)
         in_bias = -width <= body <= width
         previous_correct = previous_prediction != 0 and previous_prediction == body_dir
 
@@ -121,8 +134,8 @@ def run_detail(candles: list[Candle], symbol: str, month: str, width: float) -> 
                 "high": c.high,
                 "low": c.low,
                 "close": c.close,
-                "body": body,
-                "body_direction": fmt_direction(body_dir),
+                "body_L": body,
+                "body_direction_excel_L3_vs_L2": fmt_direction(body_dir),
                 "R1": int(r["R1"]),
                 "R2": int(r["R2"]),
                 "R3": int(r["R3"]),
