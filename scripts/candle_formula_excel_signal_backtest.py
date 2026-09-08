@@ -61,12 +61,10 @@ def excel_columns(c: Candle) -> tuple[float, float, float, float, float, float, 
 
 
 def excel_signal(s: int) -> int:
-    # S=3 -> BUY, S=0 -> SELL, S=1/2 -> HOLD.
-    if s == 3:
+    # Expanded direction: S=3/2 -> BUY, S=0/1 -> SELL; no HOLD.
+    if s in (2, 3):
         return 1
-    if s == 0:
-        return -1
-    return 0
+    return -1
 
 
 def excel_i_for_row(j_current: float, j_next: float | None) -> int | None:
@@ -125,14 +123,13 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
         next_candle = rows[idx + 1][1] if idx + 1 < len(rows) else None
         next_j = None if next_candle is None else next_candle.close - next_candle.open
         actual = excel_i_for_row(j, next_j)
-        current_correct = signal != 0 and actual is not None and signal == actual
+        current_correct = actual is not None and signal == actual
 
-        if signal != 0:
-            predictions += 1
-            correct += int(current_correct)
+        predictions += 1
+        correct += int(current_correct)
 
-        # Entry is based only on the current CLOSED candle signal.
-        if position is None and signal != 0:
+        # Entry is based only on the current CLOSED candle direction signal.
+        if position is None:
             abs_body, target, stop = position_levels(candle.close, candle.open, signal)
             position = Position(
                 side=signal,
@@ -202,17 +199,16 @@ def compound(values: list[float]) -> float:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Exact Excel candle formula backtest; closed-candle entry/exit; TP=2*abs(C-O), SL=abs(C-O); no commission."
+        description="Excel candle formula backtest with expanded direction: S=3/2 BUY and S=0/1 SELL."
     )
     ap.add_argument("--input", default="reports/prepared_price_action_1h.csv")
     args = ap.parse_args()
 
     path = Path(args.input)
     print(
-        "EXCEL_EXACT_BACKTEST | tf=1h | fee=0 | entry=CLOSE_SIGNAL | "
-        "TP=+2xABS(C-O) | SL=-1xABS(C-O) | close_only | "
-        "signal=S3_BUY/S0_SELL/S1,S2_HOLD | "
-        "I(row)=IF(J_next>J_current,1,IF(J_next<J_current,-1,0))"
+        "EXCEL_DIRECTION_TEST | tf=1h | fee=0 | signal=S3/S2_BUY + S0/S1_SELL | no_hold | "
+        "I(row)=IF(J_next>J_current,1,IF(J_next<J_current,-1,0)) | "
+        "TP=+/-2xABS(C-O) | SL=+/-1xABS(C-O) | close_only"
     )
 
     for symbol in SYMBOLS:
