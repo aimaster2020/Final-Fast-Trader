@@ -77,7 +77,7 @@ def run(rows, mapping):
 
 
 def trace_entries(rows, mapping, limit=20):
-    hist=defaultdict(list); glob=[]; pos=False; traces=[]
+    hist=defaultdict(list); glob=[]; traces=[]
     for month in MONTHS:
         rs=[r for r in rows if r[0]==month]
         for i,r in enumerate(rs[:-1]):
@@ -85,15 +85,7 @@ def trace_entries(rows, mapping, limit=20):
             gr=statistics.median(glob) if glob else 2.0
             key=mapping[s]
             ratio=statistics.median(hist[key]) if hist[key] else gr
-            if not pos:
-                traces.append((month,i,s,key,ratio))
-                pos=True
-            # Mirror the backtest's close-only position lifetime: the next candle
-            # gets a chance to close the position. This trace only tracks entry ratios.
-            if pos and i > 0:
-                # We only need entry-ratio diagnostics, so approximate a one-candle hold
-                # to expose lookup differences without changing the actual backtest.
-                pos=False
+            traces.append((month,i,s,key,ratio))
             if valid:
                 ratio_actual=abs(rs[i+1][5]-r[5])/b
                 if ratio_actual==ratio_actual:
@@ -105,14 +97,23 @@ def trace_entries(rows, mapping, limit=20):
 def diagnostic(rows):
     ident=(0,1,2,3); probe=(1,0,2,3)
     a=trace_entries(rows,ident,20); b=trace_entries(rows,probe,20)
+
+    by_s=defaultdict(list)
+    for i,r in enumerate(rows[:-1]):
+        body=abs(r[5]-r[2])
+        if r[5]==0 or body<=0 or body/abs(r[5])<MIN_BODY:
+            continue
+        ratio_actual=abs(rows[i+1][5]-r[5])/body
+        if ratio_actual==ratio_actual:
+            by_s[S(r)].append(ratio_actual)
+    meds={s:(statistics.median(by_s[s]) if by_s[s] else None) for s in range(4)}
     diffs=[]
     for x,y in zip(a,b):
         if abs(x[4]-y[4])>1e-12: diffs.append((x,y))
-    meds={s:statistics.median([abs(rs[i+1][5]-r[5])/abs(r[5]-r[2]) for i,r in enumerate(rows[:-1]) if S(r)==s and abs(r[5]-r[2])>0 and r[5]!=0]) for s in range(4)}
     print(f'  DIAG overall_ratio_medians={meds}')
     print(f'  DIAG first20_entry_ratios_identity={[round(x[4],4) for x in a]}')
-    print(f'  DIAG first20_entry_ratios_probe={ [round(x[4],4) for x in b] }')
-    print(f'  DIAG differing_first20={len(diffs)}/20')
+    print(f'  DIAG first20_entry_ratios_probe={[round(x[4],4) for x in b]}')
+    print(f'  DIAG differing_first20={len(diffs)}/{min(len(a),len(b))}')
     if diffs:
         print(f'  DIAG first_difference identity={diffs[0][0]} probe={diffs[0][1]}')
 
