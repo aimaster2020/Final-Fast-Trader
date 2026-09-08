@@ -19,64 +19,61 @@ class Position:
     capital: float
 
 
-def load(path: Path, month: str, symbol: str) -> list[Candle]:
-    rows: list[Candle] = []
+def load_all(path: Path, symbol: str) -> list[tuple[str, Candle]]:
+    rows: list[tuple[str, Candle]] = []
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         for row in csv.DictReader(f):
-            if row.get("month") != month or row.get("symbol") != symbol:
+            if row.get("symbol") != symbol:
                 continue
             try:
                 rows.append(
-                    Candle(
-                        int(float(row["timestamp"])),
-                        float(row["open"]),
-                        float(row["high"]),
-                        float(row["low"]),
-                        float(row["close"]),
+                    (
+                        row["month"],
+                        Candle(
+                            int(float(row["timestamp"])),
+                            float(row["open"]),
+                            float(row["high"]),
+                            float(row["low"]),
+                            float(row["close"]),
+                        ),
                     )
                 )
             except (KeyError, TypeError, ValueError):
                 continue
-    return sorted(rows, key=lambda c: c.timestamp)
+    return sorted(rows, key=lambda x: x[1].timestamp)
 
 
-def scores(c: Candle) -> tuple[int, int]:
-    hc = c.high - c.close
-    co = c.close - c.open
-    lc = c.low - c.close
-    ho = c.high - c.open
-    r1 = int(hc > co)
-    r2 = int(ho < hc)
-    r3 = int(lc > co)
-    r4 = int(hc < co)
-    r5 = int(ho > hc)
-    r6 = int(lc < co)
-    return r1 + r2 + r3, r4 + r5 + r6
+def excel_columns(c: Candle) -> tuple[float, float, float, float, float, float, int, int, int, int]:
+    """Exact user Excel J:O and P:R formulas."""
+    j = c.close - c.open       # J = G-D = C-O
+    k = c.high - c.close      # K = E-G = H-C
+    l = c.low - c.close       # L = F-G = Low-C
+    m = c.high - c.open       # M = E-D = H-O
+    n = c.low - c.open        # N = F-D = Low-O
+    o = c.high - c.low        # O = E-F = H-L
+    p = int(k > j)             # P = IF(K>J,1,0)
+    q = int(k > m)             # Q = IF(K>M,1,0)
+    r = int(l > j)             # R = IF(L>J,1,0)
+    s = p + q + r              # S = SUM(P:R)
+    return j, k, l, m, n, o, p, q, r, s
 
 
-def excel_signal(c: Candle) -> int:
-    """Original Excel rule: S=3 BUY, S=0 SELL, S=1/2 HOLD."""
-    up, down = scores(c)
-    if up == 3:
+def excel_signal(s: int) -> int:
+    """Signal implied by S: 3=BUY, 0=SELL, 1/2=HOLD."""
+    if s == 3:
         return 1
-    if up == 0:
+    if s == 0:
         return -1
     return 0
 
 
-def body_value(c: Candle) -> float:
-    return c.close - c.open
-
-
-def excel_body_direction(current: Candle, previous: Candle | None) -> int:
-    """Exact Excel direction: =IF(L3>L2,1,IF(L3<L2,-1,0))."""
-    if previous is None:
-        return 0
-    current_l = body_value(current)
-    previous_l = body_value(previous)
-    if current_l > previous_l:
+def excel_i_for_row(j_current: float, j_next: float | None) -> int | None:
+    """Exact Excel I placement: in row N, compare J(N+1) with J(N)."""
+    if j_next is None:
+        return None
+    if j_next > j_current:
         return 1
-    if current_l < previous_l:
+    if j_next < j_current:
         return -1
     return 0
 
@@ -89,51 +86,130 @@ def pnl(side: int, entry: float, price: float) -> float:
     return side * (price - entry) / entry if entry > 0 else 0.0
 
 
-def run(candles: list[Candle], width: float) -> dict[str, float | int]:
+def run_symbol(rows: list[tuple[str, Candle]], width: float) -> dict[str, dict[str, float | int]]:
+    """Run exact formula timing without look-ahead in the trading layer.
+
+    Excel row N:
+      signal_N = f(S_N)
+      I_N = direction(J_(N+1), J_N)
+      T/U_N = whether signal_N correctly predicts I_N
+
+    A trade at row N may use only information known by row N:
+      - previous row's prediction correctness (signal_(N-1) vs I_(N-1))
+      - current row's signal_N
+      - current row's body/bias state
+    """
     equity = CAPITAL
     position: Position | None = None
-    previous_prediction = 0
-    trades = wins = 0
     peak = CAPITAL
     max_dd = 0.0
+    previous_prediction = 0
+    previous_prediction_correct = False
+    results: dict[str, dict[str, float | int]] = {}
 
-    for i, candle in enumerate(candles):
-        current_signal = excel_signal(candle)
-        body = body_value(candle)
-        previous = candles[i - 1] if i > 0 else None
-        actual_direction = excel_body_direction(candle, previous)
-        previous_correct = previous_prediction != 0 and previous_prediction == actual_direction
+    for i, (month, candle) in enumerate(rows):
+        if month not in MONTHS:
+            continue
+
+        j, *_rest, s = excel_columns(candle)
+        current_signal = excel_signal(s)
+
+        next_candle = rows[i + 1][1] if i + 1 < len(rows) else None
+        next_month = rows[i + 1][0] if i + 1 < len(rows) else None
+        next_j = None if next_candle is None else next_candle.close - next_candle.open
+        actual_direction = excel_i_for_row(j, next_j)
+        current_correct = actual_direction is not None and current_signal != 0 and current_signal == actual_direction
+
+        bucket = results.setdefault(month, {"return": 0.0, "trades": 0, "wins": 0, "predictions": 0, "correct": 0, "dd": 0.0})
+        if current_signal != 0 and actual_direction is not None:
+            bucket["predictions"] += 1
+            bucket["correct"] += int(current_correct)
+
+        body = j
+        bias = in_bias(body, width)
+        entered = False
+        closed = False
 
         if position is None:
-            if current_signal != 0 and not in_bias(body, width) and previous_correct:
+            if current_signal != 0 and not bias and previous_prediction_correct:
                 position = Position(current_signal, candle.close, equity)
-        elif in_bias(body, width):
+                entered = True
+        elif bias:
             gross = position.capital * pnl(position.side, position.entry, candle.close)
             equity += gross
-            trades += 1
-            wins += int(gross > 0)
+            bucket["trades"] += 1
+            bucket["wins"] += int(gross > 0)
             position = None
+            closed = True
+
+        # Force-close at month end, matching prior test convention.
+        if position is not None and next_month != month:
+            gross = position.capital * pnl(position.side, position.entry, candle.close)
+            equity += gross
+            bucket["trades"] += 1
+            bucket["wins"] += int(gross > 0)
+            position = None
+            closed = True
 
         mtm = equity
         if position is not None:
             mtm += position.capital * pnl(position.side, position.entry, candle.close)
         peak = max(peak, mtm)
         max_dd = max(max_dd, (peak - mtm) / peak if peak else 0.0)
+        bucket["dd"] = max(bucket["dd"], max_dd * 100.0)
+
         previous_prediction = current_signal
+        previous_prediction_correct = bool(current_correct)
+        _ = entered, closed, previous_prediction
 
-    if position is not None and candles:
-        gross = position.capital * pnl(position.side, position.entry, candles[-1].close)
-        equity += gross
-        trades += 1
-        wins += int(gross > 0)
+    # Convert monthly equity changes to percentage returns requires replaying each month.
+    # Re-run each month in isolation while preserving the exact Excel I look-ahead across rows.
+    for month in MONTHS:
+        month_rows = [(m, c) for m, c in rows if m == month]
+        if not month_rows:
+            results.setdefault(month, {"return": 0.0, "trades": 0, "wins": 0, "predictions": 0, "correct": 0, "dd": 0.0})
+            continue
+        # Keep the overall accumulated results above for diagnostics; return is filled below
+        # from a dedicated month-level replay.
+        results[month]["return"] = _run_month_return(rows, month, width)
 
-    return {
-        "return": (equity / CAPITAL - 1.0) * 100.0,
-        "trades": trades,
-        "wins": wins,
-        "win_rate": wins / trades * 100.0 if trades else 0.0,
-        "dd": max_dd * 100.0,
-    }
+    return results
+
+
+def _run_month_return(rows: list[tuple[str, Candle]], month: str, width: float) -> float:
+    month_indices = [i for i, (m, _) in enumerate(rows) if m == month]
+    if not month_indices:
+        return 0.0
+
+    equity = CAPITAL
+    position: Position | None = None
+    previous_prediction_correct = False
+
+    for idx in month_indices:
+        _, candle = rows[idx]
+        j, *_rest, s = excel_columns(candle)
+        signal = excel_signal(s)
+
+        next_candle = rows[idx + 1][1] if idx + 1 < len(rows) else None
+        next_j = None if next_candle is None else next_candle.close - next_candle.open
+        actual = excel_i_for_row(j, next_j)
+        current_correct = actual is not None and signal != 0 and signal == actual
+
+        if position is None:
+            if signal != 0 and not in_bias(j, width) and previous_prediction_correct:
+                position = Position(signal, candle.close, equity)
+        elif in_bias(j, width):
+            equity += position.capital * pnl(position.side, position.entry, candle.close)
+            position = None
+
+        next_month = rows[idx + 1][0] if idx + 1 < len(rows) else None
+        if position is not None and next_month != month:
+            equity += position.capital * pnl(position.side, position.entry, candle.close)
+            position = None
+
+        previous_prediction_correct = bool(current_correct)
+
+    return (equity / CAPITAL - 1.0) * 100.0
 
 
 def compound(values: list[float]) -> float:
@@ -144,36 +220,51 @@ def compound(values: list[float]) -> float:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Exact Excel candle signal backtest; no commission.")
+    ap = argparse.ArgumentParser(description="Exact user Excel candle formula backtest; no commission.")
     ap.add_argument("--input", default="reports/prepared_price_action_1h.csv")
     ap.add_argument("--width", type=float, default=1.0)
     args = ap.parse_args()
 
     path = Path(args.input)
     print(
-        f"EXCEL_SIGNAL_BACKTEST | tf=1h | fee=0 | width={args.width:g} | "
-        "signal=S3_BUY/S0_SELL/S1,S2_HOLD | direction=L_current_vs_L_previous"
+        f"EXCEL_EXACT_BACKTEST | tf=1h | fee=0 | width={args.width:g} | "
+        "I(row)=IF(J_next>J_current,1,IF(J_next<J_current,-1,0)) | "
+        "signal=S3_BUY/S0_SELL/S1,S2_HOLD"
     )
+
     for symbol in SYMBOLS:
-        monthly: list[float] = []
-        trades = wins = 0
-        dd = 0.0
+        rows = load_all(path, symbol)
+        results = run_symbol(rows, args.width)
+        monthly_returns: list[float] = []
+        total_trades = total_wins = total_predictions = total_correct = 0
+        max_dd = 0.0
         print(f"\n{symbol}")
+
         for month in MONTHS:
-            r = run(load(path, month, symbol), args.width)
-            monthly.append(float(r["return"]))
-            trades += int(r["trades"])
-            wins += int(r["wins"])
-            dd = max(dd, float(r["dd"]))
+            r = results.get(month, {"return": 0.0, "trades": 0, "wins": 0, "predictions": 0, "correct": 0, "dd": 0.0})
+            ret = float(r["return"])
+            monthly_returns.append(ret)
+            trades = int(r["trades"])
+            wins = int(r["wins"])
+            predictions = int(r["predictions"])
+            correct = int(r["correct"])
+            acc = correct / predictions * 100.0 if predictions else 0.0
+            total_trades += trades
+            total_wins += wins
+            total_predictions += predictions
+            total_correct += correct
+            max_dd = max(max_dd, float(r["dd"]))
             print(
-                f"{month} return={float(r['return']):+.2f}% trades={int(r['trades'])} "
-                f"win={float(r['win_rate']):.1f}% DD={float(r['dd']):.2f}%"
+                f"{month} return={ret:+.2f}% trades={trades} win={(wins/trades*100.0 if trades else 0.0):.1f}% "
+                f"pred={predictions} acc={acc:.1f}% DD={float(r['dd']):.2f}%"
             )
+
         print(
-            f"4M compound={compound(monthly):+.2f}% avg={sum(monthly)/len(monthly):+.2f}% "
-            f"worst={min(monthly):+.2f}% trades={trades} win={wins/trades*100:.1f}% DD={dd:.2f}%"
-            if trades else
-            f"4M compound=+0.00% avg=+0.00% worst=+0.00% trades=0 win=0.0% DD={dd:.2f}%"
+            f"4M compound={compound(monthly_returns):+.2f}% avg={sum(monthly_returns)/len(monthly_returns):+.2f}% "
+            f"worst={min(monthly_returns):+.2f}% trades={total_trades} "
+            f"win={(total_wins/total_trades*100.0 if total_trades else 0.0):.1f}% "
+            f"pred={total_predictions} acc={(total_correct/total_predictions*100.0 if total_predictions else 0.0):.1f}% "
+            f"DD={max_dd:.2f}%"
         )
 
 
