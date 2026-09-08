@@ -10,7 +10,7 @@ TEST_MONTH='2026-08'
 CAPITAL=1000.0
 MIN_BODY=0.0001
 MODES=('FIXED2','STATE','S12_S3','S13_S2')
-FEE_LEVELS=(0.0,0.0005,0.0010)  # fee per side as fraction of notional
+FEE_SIDE=0.0013  # user's actual fee per side = 0.13%
 
 
 def load_rows(p: Path, sym: str):
@@ -40,38 +40,22 @@ def bucket(mode,s):
     return 0
 
 
-def trade_return_pct(sd,en,px,fee):
-    if en<=0: return 0.0
-    gross=sd*(px-en)/en
-    # Fixed $1000 trade capital. Apply fee on both entry and exit notionals.
-    # Entry notional is CAPITAL; exit notional is CAPITAL*(1+gross).
-    exit_value=CAPITAL*(1+gross)
-    fees=CAPITAL*fee + max(exit_value,0.0)*fee
-    net_value=CAPITAL+CAPITAL*gross-fees
-    return (net_value-CAPITAL)/CAPITAL*100
-
-
-def run(rows, mode, fee):
+def run(rows, mode):
     hist=defaultdict(list); glob=[]
     eq=CAPITAL; peak=CAPITAL; max_dd=0.0
     pos=None; ei=-1; trades=wins=0
-    test_start=0
     all_rows=[r for r in rows if r[0] in TRAIN_MONTHS or r[0]==TEST_MONTH]
     train=[r for r in all_rows if r[0] in TRAIN_MONTHS]
     test=[r for r in all_rows if r[0]==TEST_MONTH]
 
-    # Build history from May-Jul only.
-    for rs in (train,):
-        for i,r in enumerate(rs[:-1]):
-            s=S(r); b=abs(r[5]-r[2]); valid=r[5]!=0 and b/abs(r[5])>=MIN_BODY
-            if valid:
-                x=abs(rs[i+1][5]-r[5])/b
-                if x==x:
-                    key=s if mode=='STATE' else bucket(mode,s)
-                    hist[key].append(x); glob.append(x)
+    for i,r in enumerate(train[:-1]):
+        s=S(r); b=abs(r[5]-r[2]); valid=r[5]!=0 and b/abs(r[5])>=MIN_BODY
+        if valid:
+            x=abs(train[i+1][5]-r[5])/b
+            if x==x:
+                key=s if mode=='STATE' else bucket(mode,s)
+                hist[key].append(x); glob.append(x)
 
-    # Start August with frozen May-Jul history, then update rolling past-only within August.
-    month_start=eq
     for i,r in enumerate(test[:-1]):
         s=S(r); b=abs(r[5]-r[2]); valid=r[5]!=0 and b/abs(r[5])>=MIN_BODY
         gr=statistics.median(glob) if glob else 2.0
@@ -92,7 +76,7 @@ def run(rows, mode, fee):
             if gross_pct is not None:
                 gross=gross_pct/100
                 exit_value=CAPITAL*(1+gross)
-                fees=CAPITAL*fee + max(exit_value,0.0)*fee
+                fees=CAPITAL*FEE_SIDE + max(exit_value,0.0)*FEE_SIDE
                 net_pct=(CAPITAL*gross-fees)/CAPITAL*100
                 eq += CAPITAL*net_pct/100
                 trades += 1; wins += int(net_pct>0); pos=None; ei=-1
@@ -106,7 +90,7 @@ def run(rows, mode, fee):
     if pos is not None:
         sd,en,tpd,sld=pos; px=test[-1][5]; gross=sd*(px-en)/en if en>0 else 0.0
         exit_value=CAPITAL*(1+gross)
-        fees=CAPITAL*fee + max(exit_value,0.0)*fee
+        fees=CAPITAL*FEE_SIDE + max(exit_value,0.0)*FEE_SIDE
         net_pct=(CAPITAL*gross-fees)/CAPITAL*100
         eq += CAPITAL*net_pct/100
         trades += 1; wins += int(net_pct>0); pos=None
@@ -119,18 +103,13 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--input',type=Path,default=Path('reports/prepared_price_action_1h.csv'))
     a=ap.parse_args()
-    print('EXCEL_OOS_FEE_SWEEP | tf=1h | train=May-Jul | test=Aug | fixed trade capital=$1000 | past_only | SL=0.5xTP')
-    print('Fee is charged per side; total round-trip is approximately 2x fee for unchanged notional.')
+    print('EXCEL_OOS_FEE | tf=1h | train=May-Jul | test=Aug | fixed trade capital=$1000 | fee_side=0.13% | round_trip≈0.26% | past_only | SL=0.5xTP')
     for sym in SYMS:
         rows=load_rows(a.input,sym)
         print(sym)
-        for fee in FEE_LEVELS:
-            label=f'fee_side={fee*100:.2f}%'
-            vals=[]
-            for mode in MODES:
-                r=run(rows,mode,fee); vals.append((mode,r))
-            line=' '.join(f'{m}={r[0]:+.2f}%/{r[1]}t/{(100*r[2]/r[1] if r[1] else 0):.1f}%w/DD{r[3]:.2f}%' for m,r in vals)
-            print(f'  {label} | {line}')
+        for mode in MODES:
+            r=run(rows,mode)
+            print(f'  {mode:7s} Aug_net={r[0]:+.2f}% trades={r[1]} win={100*r[2]/r[1] if r[1] else 0:.1f}% DD={r[3]:.2f}%')
 
 if __name__=='__main__':
     main()
