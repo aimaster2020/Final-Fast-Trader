@@ -32,9 +32,9 @@ def pnl_pct(sd,en,px): return sd*(px-en)/en*100 if en>0 else 0.0
 
 
 def run(rows, mapping):
-    # mapping[s] is the history bucket used when actual signal state is s.
-    # For a true label permutation placebo, the observed target is stored
-    # in the same permuted bucket used for future lookup.
+    # History is always assigned to the REAL observed S bucket.
+    # mapping only changes which bucket is consulted for the current S.
+    # Identity mapping (0,1,2,3) is the real STATE model.
     hist=defaultdict(list); glob=[]; eq=CAPITAL; peak=CAPITAL; dd=0.0
     pos=None; ei=-1; trades=wins=0
     monthly={m:0.0 for m in MONTHS}
@@ -64,7 +64,7 @@ def run(rows, mapping):
             if valid:
                 ratio_actual=abs(rs[i+1][5]-r[5])/b
                 if ratio_actual==ratio_actual:
-                    hist[key].append(ratio_actual)
+                    hist[s].append(ratio_actual)
                     glob.append(ratio_actual)
         if pos is not None:
             sd,en,tpd,sld=pos; px=rs[-1][5]; ret=pnl_pct(sd,en,px)
@@ -77,13 +77,11 @@ def run(rows, mapping):
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--input',type=Path,default=Path('reports/prepared_price_action_1h.csv')); a=ap.parse_args()
     print('EXCEL_STATE_PLACEBO | tf=1h | exact S0-S3 | fixed trade capital=$1000 | close_only | past_only')
-    print('Actual STATE vs 24 fixed state-label permutations; same signal/entry logic; SL=0.5xTP')
-    print('NOTE: placebo permutes both prediction lookup and historical bucket assignment')
+    print('Actual STATE vs 24 lookup permutations; history remains bucketed by real S; SL=0.5xTP')
     for sym in SYMS:
         rows=load_rows(a.input,sym); maps=list(itertools.permutations(range(4)))
         res=[]
         actual=(0,0,0,0,{})
-        # permutation tuple: bucket used for each actual S. Identity is the real STATE model.
         for mp in maps:
             r=run(rows,mp); res.append((mp,r))
             if mp==(0,1,2,3): actual=r
