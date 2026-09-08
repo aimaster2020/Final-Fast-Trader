@@ -176,12 +176,14 @@ def main() -> None:
             candles = load(path, month, symbol)
             result = run(candles, args.commission)
             monthly_returns.append(float(result["return"]))
+            pf_value = result["pf"]
+            pf_text = "INF" if pf_value == float("inf") else f"{float(pf_value):.2f}"
             print(
                 f"{month}={float(result['return']):+.2f}% "
                 f"final={float(result['final']):.2f} "
                 f"trades={int(result['trades'])} "
                 f"win={float(result['win_rate']):.1f}% "
-                f"PF={'INF' if result['pf'] == float('inf') else f'{float(result[\"pf\"]):.2f}'} "
+                f"PF={pf_text} "
                 f"DD={float(result['dd']):.2f}% "
                 f"entries={int(result['entries'])} exits={int(result['exits'])}"
             )
