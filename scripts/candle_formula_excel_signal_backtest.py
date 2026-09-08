@@ -47,28 +47,26 @@ def load_all(path: Path, symbol: str) -> list[tuple[str, Candle]]:
 
 
 def excel_columns(c: Candle) -> tuple[float, float, float, float, float, float, int, int, int, int]:
-    j = c.close - c.open       # J = C-O
-    k = c.high - c.close       # K = H-C
-    l = c.low - c.close        # L = Low-C
-    m = c.high - c.open        # M = H-O
-    n = c.low - c.open          # N = Low-O
-    o = c.high - c.low          # O = H-L
-    p = int(k > j)               # P = IF(K>J,1,0)
-    q = int(k > m)               # Q = IF(K>M,1,0)
-    r = int(l > j)               # R = IF(L>J,1,0)
-    s = p + q + r                # S = SUM(P:R)
+    j = c.close - c.open
+    k = c.high - c.close
+    l = c.low - c.close
+    m = c.high - c.open
+    n = c.low - c.open
+    o = c.high - c.low
+    p = int(k > j)
+    q = int(k > m)
+    r = int(l > j)
+    s = p + q + r
     return j, k, l, m, n, o, p, q, r, s
 
 
 def excel_signal(s: int) -> int:
-    # Expanded direction: S=3/2 -> BUY, S=0/1 -> SELL; no HOLD.
     if s in (2, 3):
         return 1
     return -1
 
 
 def excel_i_for_row(j_current: float, j_next: float | None) -> int | None:
-    # Exact Excel placement: I(row) = compare J(next row) vs J(current row).
     if j_next is None:
         return None
     if j_next > j_current:
@@ -85,29 +83,28 @@ def pnl_pct(side: int, entry: float, price: float) -> float:
 
 
 def position_levels(close: float, open_: float, side: int) -> tuple[float, float, float]:
-    """Closed-entry-candle levels from A=abs(C-O).
-
-    BUY : Entry=C, TP=C+2A, SL=C-A
-    SELL: Entry=C, TP=C-2A, SL=C+A
-    """
     a = abs(close - open_)
     if side == 1:
         return a, close + 2.0 * a, close - a
     return a, close - 2.0 * a, close + a
 
 
+def empty_stats() -> dict[str, object]:
+    return {
+        "return": 0.0,
+        "trades": 0,
+        "wins": 0,
+        "predictions": 0,
+        "correct": 0,
+        "dd": 0.0,
+        "s_stats": {0: [0, 0], 1: [0, 0], 2: [0, 0], 3: [0, 0]},
+    }
+
+
 def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, object]:
     month_indices = [i for i, (m, _) in enumerate(rows) if m == month]
     if not month_indices:
-        return {
-            "return": 0.0,
-            "trades": 0,
-            "wins": 0,
-            "predictions": 0,
-            "correct": 0,
-            "dd": 0.0,
-            "s_stats": {0: [0, 0], 1: [0, 0], 2: [0, 0], 3: [0, 0]},
-        }
+        return empty_stats()
 
     equity = CAPITAL
     position: Position | None = None
@@ -132,7 +129,6 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, object]:
         s_stats[s][0] += 1
         s_stats[s][1] += int(current_correct)
 
-        # Entry is based only on the current CLOSED candle direction signal.
         if position is None:
             abs_body, target, stop = position_levels(candle.close, candle.open, signal)
             position = Position(
@@ -145,7 +141,6 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, object]:
             )
             entry_idx = idx
 
-        # Exit is checked only on a later CLOSED candle.
         if position is not None and entry_idx is not None and idx > entry_idx:
             close_price = candle.close
             trade_pnl: float | None = None
@@ -167,7 +162,6 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, object]:
                 position = None
                 entry_idx = None
 
-        # Force-close at the last CLOSED candle of the month if TP/SL was not hit.
         next_month = rows[idx + 1][0] if idx + 1 < len(rows) else None
         if position is not None and next_month != month:
             trade_pnl = pnl_pct(position.side, position.entry, candle.close)
@@ -207,6 +201,18 @@ def accuracy_pct(stat: list[int]) -> float:
     return correct / count * 100.0 if count else 0.0
 
 
+def s_stats_text(stats: dict[int, list[int]]) -> str:
+    return (
+        "S0={0}/{1}/{2:.1f}% S1={3}/{4}/{5:.1f}% "
+        "S2={6}/{7}/{8:.1f}% S3={9}/{10}/{11:.1f}%".format(
+            stats[0][0], stats[0][1], accuracy_pct(stats[0]),
+            stats[1][0], stats[1][1], accuracy_pct(stats[1]),
+            stats[2][0], stats[2][1], accuracy_pct(stats[2]),
+            stats[3][0], stats[3][1], accuracy_pct(stats[3]),
+        )
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Excel candle formula backtest with expanded direction: S=3/2 BUY and S=0/1 SELL."
@@ -220,7 +226,7 @@ def main() -> None:
         "I(row)=IF(J_next>J_current,1,IF(J_next<J_current,-1,0)) | "
         "TP=+/-2xABS(C-O) | SL=+/-1xABS(C-O) | close_only"
     )
-    print("S_STATS = count/correct/accuracy by S value")
+    print("S_STATS format = count/correct/accuracy")
 
     for symbol in SYMBOLS:
         rows = load_all(path, symbol)
@@ -252,7 +258,8 @@ def main() -> None:
             print(
                 f"{month} return={ret:+.2f}% trades={trades} "
                 f"win={(wins / trades * 100.0 if trades else 0.0):.1f}% "
-                f"pred={predictions} acc={acc:.1f}% DD={float(r['dd']):.2f}%"
+                f"pred={predictions} acc={acc:.1f}% DD={float(r['dd']):.2f}% "
+                f"| {s_stats_text(month_s_stats)}"
             )
 
         print(
@@ -263,17 +270,7 @@ def main() -> None:
             f"pred={total_predictions} acc={(total_correct/total_predictions*100.0 if total_predictions else 0.0):.1f}% "
             f"DD={max_dd:.2f}%"
         )
-        print(
-            "S0 SELL | count={0} correct={1} acc={2:.1f}% | "
-            "S1 SELL | count={3} correct={4} acc={5:.1f}% | "
-            "S2 BUY  | count={6} correct={7} acc={8:.1f}% | "
-            "S3 BUY  | count={9} correct={10} acc={11:.1f}%".format(
-                total_s_stats[0][0], total_s_stats[0][1], accuracy_pct(total_s_stats[0]),
-                total_s_stats[1][0], total_s_stats[1][1], accuracy_pct(total_s_stats[1]),
-                total_s_stats[2][0], total_s_stats[2][1], accuracy_pct(total_s_stats[2]),
-                total_s_stats[3][0], total_s_stats[3][1], accuracy_pct(total_s_stats[3]),
-            )
-        )
+        print(f"4M_S_STATS | {s_stats_text(total_s_stats)}")
 
 
 if __name__ == "__main__":
