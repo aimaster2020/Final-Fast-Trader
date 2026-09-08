@@ -96,7 +96,7 @@ def position_levels(close: float, open_: float, side: int) -> tuple[float, float
     return a, close - 2.0 * a, close + a
 
 
-def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | int]:
+def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, object]:
     month_indices = [i for i, (m, _) in enumerate(rows) if m == month]
     if not month_indices:
         return {
@@ -106,6 +106,7 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
             "predictions": 0,
             "correct": 0,
             "dd": 0.0,
+            "s_stats": {0: [0, 0], 1: [0, 0], 2: [0, 0], 3: [0, 0]},
         }
 
     equity = CAPITAL
@@ -114,6 +115,7 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
     max_dd = 0.0
     predictions = correct = trades = wins = 0
     entry_idx: int | None = None
+    s_stats: dict[int, list[int]] = {0: [0, 0], 1: [0, 0], 2: [0, 0], 3: [0, 0]}
 
     for idx in month_indices:
         _, candle = rows[idx]
@@ -127,6 +129,8 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
 
         predictions += 1
         correct += int(current_correct)
+        s_stats[s][0] += 1
+        s_stats[s][1] += int(current_correct)
 
         # Entry is based only on the current CLOSED candle direction signal.
         if position is None:
@@ -187,6 +191,7 @@ def run_month(rows: list[tuple[str, Candle]], month: str) -> dict[str, float | i
         "predictions": predictions,
         "correct": correct,
         "dd": max_dd * 100.0,
+        "s_stats": s_stats,
     }
 
 
@@ -195,6 +200,11 @@ def compound(values: list[float]) -> float:
     for value in values:
         x *= 1.0 + value / 100.0
     return (x - 1.0) * 100.0
+
+
+def accuracy_pct(stat: list[int]) -> float:
+    count, correct = stat
+    return correct / count * 100.0 if count else 0.0
 
 
 def main() -> None:
@@ -210,12 +220,14 @@ def main() -> None:
         "I(row)=IF(J_next>J_current,1,IF(J_next<J_current,-1,0)) | "
         "TP=+/-2xABS(C-O) | SL=+/-1xABS(C-O) | close_only"
     )
+    print("S_STATS = count/correct/accuracy by S value")
 
     for symbol in SYMBOLS:
         rows = load_all(path, symbol)
         monthly_returns: list[float] = []
         total_trades = total_wins = total_predictions = total_correct = 0
         max_dd = 0.0
+        total_s_stats: dict[int, list[int]] = {0: [0, 0], 1: [0, 0], 2: [0, 0], 3: [0, 0]}
         print(f"\n{symbol}")
 
         for month in MONTHS:
@@ -227,6 +239,11 @@ def main() -> None:
             predictions = int(r["predictions"])
             correct = int(r["correct"])
             acc = correct / predictions * 100.0 if predictions else 0.0
+            month_s_stats = r["s_stats"]
+            assert isinstance(month_s_stats, dict)
+            for s_value, stat in month_s_stats.items():
+                total_s_stats[int(s_value)][0] += int(stat[0])
+                total_s_stats[int(s_value)][1] += int(stat[1])
             total_trades += trades
             total_wins += wins
             total_predictions += predictions
@@ -245,6 +262,17 @@ def main() -> None:
             f"win={(total_wins/total_trades*100.0 if total_trades else 0.0):.1f}% "
             f"pred={total_predictions} acc={(total_correct/total_predictions*100.0 if total_predictions else 0.0):.1f}% "
             f"DD={max_dd:.2f}%"
+        )
+        print(
+            "S0 SELL | count={0} correct={1} acc={2:.1f}% | "
+            "S1 SELL | count={3} correct={4} acc={5:.1f}% | "
+            "S2 BUY  | count={6} correct={7} acc={8:.1f}% | "
+            "S3 BUY  | count={9} correct={10} acc={11:.1f}%".format(
+                total_s_stats[0][0], total_s_stats[0][1], accuracy_pct(total_s_stats[0]),
+                total_s_stats[1][0], total_s_stats[1][1], accuracy_pct(total_s_stats[1]),
+                total_s_stats[2][0], total_s_stats[2][1], accuracy_pct(total_s_stats[2]),
+                total_s_stats[3][0], total_s_stats[3][1], accuracy_pct(total_s_stats[3]),
+            )
         )
 
 
