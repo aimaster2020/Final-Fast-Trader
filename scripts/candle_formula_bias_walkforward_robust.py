@@ -37,8 +37,11 @@ def load(path: Path, month: str, symbol: str) -> list[Candle]:
     return sorted(out, key=lambda c: c.timestamp)
 
 
-def sig(c: Candle) -> int:
-    s = decide(c).signal
+def sig(c: Candle, decision_mode: str) -> int:
+    d = decide(c)
+    if decision_mode == "binary_majority":
+        return 1 if d.up_score >= 2 else -1
+    s = d.signal
     return 1 if s == Signal.BUY else -1 if s == Signal.SELL else 0
 
 
@@ -55,7 +58,7 @@ def pnl(side: int, entry: float, price: float) -> float:
     return side * (price - entry) / entry if entry > 0 else 0.0
 
 
-def run(candles: list[Candle], lo: float, hi: float, commission: float) -> dict[str, float | int]:
+def run(candles: list[Candle], lo: float, hi: float, commission: float, decision_mode: str) -> dict[str, float | int]:
     equity = CAPITAL
     position: Position | None = None
     prev_pred = 0
@@ -65,7 +68,7 @@ def run(candles: list[Candle], lo: float, hi: float, commission: float) -> dict[
     max_dd = 0.0
 
     for c in candles:
-        s = sig(c)
+        s = sig(c, decision_mode)
         body = c.close - c.open
         prev_correct = prev_pred != 0 and prev_pred == body_dir(c)
 
@@ -135,24 +138,25 @@ def compound(returns: list[float]) -> float:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Robust 1h bias walk-forward with previous-prediction-confirmed entry and same-bias exit")
+    ap = argparse.ArgumentParser(description="Robust 1h bias walk-forward with configurable binary decision mode")
     ap.add_argument("--input", default="reports/prepared_price_action_1h.csv")
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--min-trades", type=int, default=15)
     ap.add_argument("--min-positive-months", type=int, default=2)
     ap.add_argument("--commission", type=float, default=COMMISSION, help="Commission per side as decimal; e.g. 0.0013 = 0.13%%")
+    ap.add_argument("--decision-mode", choices=("excel", "binary_majority"), default="excel")
     args = ap.parse_args()
     path = Path(args.input)
 
     fee_pct = args.commission * 100.0
-    print(f"BIAS_WF_ROBUST | tf=1h | train=May-Jun-Jul | validation=Aug | fee={fee_pct:.2f}%/side | min_trades={args.min_trades} | min_positive_months={args.min_positive_months}")
+    print(f"BIAS_WF_ROBUST | tf=1h | train=May-Jun-Jul | validation=Aug | mode={args.decision_mode} | fee={fee_pct:.2f}%/side | min_trades={args.min_trades} | min_positive_months={args.min_positive_months}")
 
     for symbol in SYMBOLS:
         train = [load(path, m, symbol) for m in TRAIN_MONTHS]
         valid = load(path, VALIDATION_MONTH, symbol)
         rows: list[tuple[tuple[int, float, float, float], float, float, dict[str, float | int]]] = []
         for lo, hi in candidates():
-            rs = [run(cs, lo, hi, args.commission) for cs in train]
+            rs = [run(cs, lo, hi, args.commission, args.decision_mode) for cs in train]
             rets = [float(r["return"]) for r in rs]
             total_trades = sum(int(r["trades"]) for r in rs)
             positive_months = sum(r > 0 for r in rets)
@@ -162,7 +166,7 @@ def main() -> None:
             avg = sum(rets) / len(rets)
             worst = min(rets)
             score = (positive_months, comp, avg, worst)
-            rows.append((score, lo, hi, run(valid, lo, hi, args.commission)))
+            rows.append((score, lo, hi, run(valid, lo, hi, args.commission, args.decision_mode)))
 
         rows.sort(key=lambda x: x[0], reverse=True)
         print(f"\n{symbol}")
