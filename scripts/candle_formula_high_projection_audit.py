@@ -39,8 +39,8 @@ def main():
         by_month={m:[0,0,0.0,0.0,0.0] for m in MONTHS}
         for i in range(len(rows)-1):
             cur=rows[i]; nxt=rows[i+1]
-            movement=cur[3]-cur[5]          # high - close
-            pred=cur[5]+movement             # close + (high-close) = high
+            movement=cur[3]-cur[5]
+            pred=cur[5]+movement
             actual=nxt[5]
             ok=sign(pred-cur[5]) == sign(actual-cur[5])
             err=abs(pred-actual)
