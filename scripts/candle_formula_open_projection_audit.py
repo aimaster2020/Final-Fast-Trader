@@ -5,7 +5,7 @@ from pathlib import Path
 
 SYMBOLS=("BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT")
 MONTHS=("2026-05","2026-06","2026-07","2026-08")
-FEE_SIDE=0.0013
+FEE_SIDE=0.0
 
 
 def load(path: Path, symbol: str):
@@ -31,8 +31,8 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--input', type=Path, default=Path('reports/prepared_price_action_1h.csv'))
     a=ap.parse_args()
-    print('OPEN_PROJECTION_AUDIT | tf=1h | exact rule: prediction = current close + (current open-current close) = current open')
-    print('Compare predicted price with NEXT candle close. Also report direction, absolute error, percentage error, and fee-adjusted one-bar trading edge.')
+    print('OPEN_PROJECTION_AUDIT | tf=1h | fee=0 | exact rule: prediction = current close + (current open-current close) = current open')
+    print('Compare predicted price with NEXT candle close. Also report direction, absolute error, percentage error, and zero-fee one-bar trading edge.')
     for sym in SYMBOLS:
         rows=load(a.input, sym)
         n=correct=0; abs_err=0.0; pct_err=0.0; gross_sum=0.0; net_sum=0.0; wins=0
