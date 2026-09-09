@@ -5,7 +5,7 @@ import csv
 import math
 from pathlib import Path
 
-SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
+DEFAULT_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT")
 
 
 def load(path: Path, symbol: str):
@@ -15,91 +15,96 @@ def load(path: Path, symbol: str):
         header = next(reader, None)
         if not header:
             return rows
+        if len(header) < 11:
+            raise ValueError(f"CSV must contain at least 11 physical columns; found {len(header)}")
         for r in reader:
             if len(r) < 11:
                 continue
             try:
-                if r[0] != symbol:
+                if r[0].strip() != symbol:
                     continue
-                rows.append((int(float(r[2])), float(r[7]), float(r[8]), float(r[9]), float(r[10])))
+                # A-G are OHLCV layout: A=symbol B=month C=timestamp D=open E=high F=low G=close H=volume.
+                # I/J/K are the three spreadsheet columns requested by the user.
+                rows.append({
+                    "timestamp": int(float(r[2])),
+                    "close": float(r[6]),
+                    "I": float(r[8]),
+                    "J": float(r[9]),
+                    "K": float(r[10]),
+                })
             except (ValueError, TypeError, IndexError):
                 continue
-    return sorted(rows, key=lambda x: x[0])
+    return sorted(rows, key=lambda x: x["timestamp"])
 
 
-def metrics(rows, predictor):
-    abs_sum = sq_sum = 0.0
-    correct = 0
-    n = 0
-    for i in range(len(rows) - 1):
-        cur = rows[i]
-        nxt = rows[i + 1]
-        actual = nxt[1] - cur[1]
-        pred = predictor(cur, nxt)
-        if pred is None or not math.isfinite(pred):
-            continue
-        err = pred - actual
-        abs_sum += abs(err)
-        sq_sum += err * err
-        if (pred > 0 and actual > 0) or (pred < 0 and actual < 0) or (pred == 0 and actual == 0):
-            correct += 1
-        n += 1
-    if n == 0:
+def err_metrics(values):
+    n = len(values)
+    if not n:
         return 0, math.inf, math.inf, 0.0
-    return n, abs_sum / n, math.sqrt(sq_sum / n), 100.0 * correct / n
-
-
-def close_delta(cur, nxt):
-    return nxt[1] - cur[1]
+    mae = sum(abs(p - a) for p, a in values) / n
+    rmse = math.sqrt(sum((p - a) ** 2 for p, a in values) / n)
+    correct = sum((p > 0 and a > 0) or (p < 0 and a < 0) or (p == 0 and a == 0) for p, a in values)
+    return n, mae, rmse, 100.0 * correct / n
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Audit spreadsheet columns I/J/K as next-close-delta predictors.")
-    ap.add_argument("--input", type=Path, default=Path("reports/prepared_price_action_1h_with_formula.csv"))
+    ap = argparse.ArgumentParser(description="Audit spreadsheet columns I/J/K against next-close change.")
+    ap.add_argument("--input", type=Path, required=True, help="CSV containing the spreadsheet columns A..K or more.")
+    ap.add_argument("--symbols", default=",".join(DEFAULT_SYMBOLS))
     args = ap.parse_args()
+    symbols = tuple(x.strip() for x in args.symbols.split(",") if x.strip())
 
-    print("IJK_NEXT_CLOSE_AUDIT | tf=1h | fee=0")
-    print("Rows: I/J/K are read by physical CSV positions 9/10/11 (1-based).")
-    print("Target = Close_next - Close_current. I/J/K are tested without fitting.")
-    print("NOTE: if K equals Close_next, it is an oracle/lookahead column and is reported separately.")
+    print("IJK_NEXT_CLOSE_AUDIT | tf=1h | fee=0 | physical columns")
+    print("A-G assumed = symbol/month/timestamp/open/high/low/close; H=volume; I/J/K are read as positions 9/10/11.")
+    print("Target = Close_next - Close_current.")
+    print("For I/J/K, both RAW value and VALUE-current-close are tested.")
 
-    for sym in SYMBOLS:
+    for sym in symbols:
         rows = load(args.input, sym)
         print(sym)
         if len(rows) < 2:
             print("  NO_DATA")
             continue
 
-        k_match = sum(abs(r[4] - rows[i + 1][1]) <= max(1e-9, abs(rows[i + 1][1]) * 1e-10) for i, r in enumerate(rows[:-1]))
-        k_match_pct = 100.0 * k_match / (len(rows) - 1)
-        print(f"  K_EQUALS_NEXT_CLOSE={k_match_pct:.2f}%")
+        actuals = [rows[i + 1]["close"] - rows[i]["close"] for i in range(len(rows) - 1)]
+        zero = [(0.0, a) for a in actuals]
+        _, zmae, zrmse, zacc = err_metrics(zero)
+        print(f"  ZERO_BASELINE       MAE={zmae:.6g} RMSE={zrmse:.6g} dir_acc={zacc:.2f}%")
 
         candidates = [
-            ("I_RAW", lambda c, n: c[2]),
-            ("J_RAW", lambda c, n: c[3]),
-            ("K_RAW", lambda c, n: c[4]),
-            ("I_AS_DELTA", lambda c, n: c[2]),
-            ("J_MINUS_CLOSE", lambda c, n: c[3] - c[1]),
-            ("K_MINUS_CLOSE", lambda c, n: c[4] - c[1]),
-            ("K_MINUS_J", lambda c, n: c[4] - c[3]),
-            ("J_MINUS_I", lambda c, n: c[3] - c[2]),
-            ("K_MINUS_I", lambda c, n: c[4] - c[2]),
-            ("AVG_IJ", lambda c, n: (c[2] + c[3]) / 2.0),
-            ("AVG_IJK", lambda c, n: (c[2] + c[3] + c[4]) / 3.0),
-            ("MID_IK_MINUS_CLOSE", lambda c, n: (c[2] + c[4]) / 2.0 - c[1]),
+            ("I_RAW", lambda r: r["I"]),
+            ("J_RAW", lambda r: r["J"]),
+            ("K_RAW", lambda r: r["K"]),
+            ("I-CLOSE", lambda r: r["I"] - r["close"]),
+            ("J-CLOSE", lambda r: r["J"] - r["close"]),
+            ("K-CLOSE", lambda r: r["K"] - r["close"]),
+            ("K-J", lambda r: r["K"] - r["J"]),
+            ("J-I", lambda r: r["J"] - r["I"]),
+            ("K-I", lambda r: r["K"] - r["I"]),
+            ("AVG_IJ-CLOSE", lambda r: (r["I"] + r["J"]) / 2.0 - r["close"]),
+            ("AVG_IJK-CLOSE", lambda r: (r["I"] + r["J"] + r["K"]) / 3.0 - r["close"]),
         ]
 
-        results = []
         for name, fn in candidates:
-            n, mae, rmse, acc = metrics(rows, fn)
-            results.append((mae, rmse, -acc, name, n))
+            pairs = []
+            for i in range(len(rows) - 1):
+                p = fn(rows[i])
+                if math.isfinite(p):
+                    pairs.append((p, actuals[i]))
+            _, mae, rmse, acc = err_metrics(pairs)
+            print(f"  {name:<18} MAE={mae:.6g} RMSE={rmse:.6g} dir_acc={acc:.2f}%")
 
-        # True zero baseline on exactly the same rows.
-        n, zmae, zrmse, zacc = metrics(rows, lambda c, n: 0.0)
-        print(f"  ZERO_BASELINE     MAE={zmae:.6g} RMSE={zrmse:.6g} dir_acc={zacc:.2f}%")
-        for mae, rmse, negacc, name, n in sorted(results):
-            flag = "  [ORACLE]" if name == "K_RAW" and k_match_pct >= 95.0 else ""
-            print(f"  {name:<18} MAE={mae:.6g} RMSE={rmse:.6g} dir_acc={-negacc:.2f}%{flag}")
+        # Oracle check: determine whether K on current row equals the next candle close.
+        matches = 0
+        for i in range(len(rows) - 1):
+            k = rows[i]["K"]
+            nxt = rows[i + 1]["close"]
+            tol = max(1e-9, abs(nxt) * 1e-10)
+            matches += int(abs(k - nxt) <= tol)
+        pct = 100.0 * matches / (len(rows) - 1)
+        print(f"  K_EQUALS_NEXT_CLOSE {pct:.2f}%")
+        if pct >= 95.0:
+            print("  WARNING: K is effectively the next Close; K-based results are LOOKAHEAD/ORACLE, not a valid predictor.")
         print()
 
 
