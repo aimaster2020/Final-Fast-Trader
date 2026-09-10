@@ -11,7 +11,8 @@ COMMISSION_PER_SIDE = 0.0013
 ROUND_TRIP_COMMISSION = COMMISSION_PER_SIDE * 2
 DEFAULT_POSITION_FRACTION = 0.10
 DEFAULT_INITIAL_CAPITAL = 1000.0
-COVERAGES = [i / 10 for i in range(11)]
+# Fine sweep around the useful 40%-80% range from the first test.
+COVERAGES = [i / 100 for i in range(40, 81, 5)]
 
 
 @dataclass
