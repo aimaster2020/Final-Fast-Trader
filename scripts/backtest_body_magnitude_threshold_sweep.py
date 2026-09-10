@@ -174,7 +174,7 @@ def main() -> None:
 
     print(f"BODY MAGNITUDE THRESHOLD SWEEP month={args.month} leverage={args.leverage:g}x")
     print("model=established J,K,L -> predicted J_next")
-    print("entry=next open | hold=1 candle | initial=$1000 | position=10% | short_ratio=%.4f" % args.short_ratio)
+    print(f"entry=next open | hold=1 candle | initial=$1000 | position=10% | short_ratio={args.short_ratio:.4f}")
     print("columns: threshold trades win return fees final")
     print("threshold  commission  trades  win%    return%    fees    final")
     print("----------------------------------------------------------------")
