@@ -31,10 +31,6 @@ def load(path: Path) -> pd.DataFrame:
     return df.iloc[:-1].copy()
 
 
-def pct(x: float) -> str:
-    return f"{x * 100:.2f}%"
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description="Analyze Score 0..3 x inverse H-O/O-L interaction cells.")
     ap.add_argument("--data-dir", required=True)
@@ -42,7 +38,8 @@ def main() -> None:
     args = ap.parse_args()
 
     rows: list[dict] = []
-    for symbol in [x.strip() for x in args.symbols.split(",") if x.strip()]:
+    symbols = [x.strip() for x in args.symbols.split(",") if x.strip()]
+    for symbol in symbols:
         df = load(Path(args.data_dir) / f"{symbol}_1h.csv")
         for score in range(4):
             for fdir, fname in ((1, "FORMULA_LONG"), (-1, "FORMULA_SHORT"), (0, "TIE")):
@@ -62,7 +59,7 @@ def main() -> None:
     print("For each cell, majority_acc shows the best constant direction for that cell (diagnostic only).")
     print()
 
-    for symbol in [x.strip() for x in args.symbols.split(",") if x.strip()]:
+    for symbol in symbols:
         print(symbol)
         print("score formula         N      UP%    DOWN%   majority")
         sub = table[table.symbol == symbol]
@@ -79,12 +76,15 @@ def main() -> None:
     print("score formula         N      UP%    DOWN%   majority")
     for score in range(4):
         for fdir, fname in ((1, "FORMULA_LONG"), (-1, "FORMULA_SHORT"), (0, "TIE")):
-            d = table[(table.score == score) & (table.formula == fname)]
+            d = table[(table.score == score) & (table.formula == fname) & (table.n > 0)]
             n = int(d.n.sum())
             if not n:
                 continue
-            up_n = sum(int(round(r.n * r.up_pct)) for r in d.itertuples(index=False))
-            down_n = n - up_n
+            up_n = int(sum(round(r.n * r.up_pct) for r in d.itertuples(index=False) if pd.notna(r.up_pct)))
+            down_n = int(sum(round(r.n * r.down_pct) for r in d.itertuples(index=False) if pd.notna(r.down_pct)))
+            total = up_n + down_n
+            if total != n:
+                down_n = n - up_n
             up = up_n / n
             down = down_n / n
             md = "LONG" if up >= down else "SHORT"
