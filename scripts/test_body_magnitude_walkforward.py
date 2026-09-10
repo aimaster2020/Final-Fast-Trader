@@ -1,120 +1,219 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-REQUIRED = ["open", "high", "low", "close"]
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+FEATURE_SETS = {
+    "J": ["J"],
+    "J_L": ["J", "L"],
+    "J_K_L": ["J", "K", "L"],
+}
 
 
-def load_data(path: str, limit: int = 0) -> pd.DataFrame:
-    df = pd.read_csv(path, usecols=lambda c: str(c).strip().lower() in REQUIRED)
-    df.columns = [str(c).strip().lower() for c in df.columns]
-    missing = [c for c in REQUIRED if c not in df.columns]
+def corr(a: np.ndarray, b: np.ndarray) -> float:
+    mask = np.isfinite(a) & np.isfinite(b)
+    a = a[mask]
+    b = b[mask]
+    if len(a) < 2 or np.std(a) == 0 or np.std(b) == 0:
+        return float("nan")
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def fit_model(train: pd.DataFrame, features: list[str]) -> np.ndarray:
+    data = train[features + ["U"]].apply(pd.to_numeric, errors="coerce").dropna()
+    X = np.column_stack([np.ones(len(data)), data[features].to_numpy(float)])
+    y = data["U"].to_numpy(float)
+    return np.linalg.lstsq(X, y, rcond=None)[0]
+
+
+def predict(row: pd.Series, beta: np.ndarray, features: list[str]) -> float:
+    x = np.array([1.0] + [float(row[f]) for f in features])
+    return float(x @ beta)
+
+
+def metric_block(actual_u: np.ndarray, pred_u: np.ndarray, j: np.ndarray, j_next: np.ndarray) -> dict[str, float]:
+    mask = np.isfinite(actual_u) & np.isfinite(pred_u) & np.isfinite(j) & np.isfinite(j_next)
+    u = actual_u[mask]
+    p = pred_u[mask]
+    j0 = j[mask]
+    jn = j_next[mask]
+    if len(u) == 0:
+        return {"n": 0, "mae_u": np.nan, "rmse_u": np.nan, "corr_u": np.nan, "r2_u": np.nan, "u_sign": np.nan, "jnext_mae": np.nan, "abs_jnext_mae": np.nan, "abs_corr": np.nan, "jnext_sign": np.nan}
+
+    err = u - p
+    ss_tot = np.sum((u - u.mean()) ** 2)
+    r2 = 1.0 - np.sum(err**2) / ss_tot if ss_tot > 0 else np.nan
+    jn_hat = j0 + p
+    sign_mask = jn != 0
+
+    return {
+        "n": int(len(u)),
+        "mae_u": float(np.mean(np.abs(err))),
+        "rmse_u": float(np.sqrt(np.mean(err**2))),
+        "corr_u": corr(u, p),
+        "r2_u": float(r2),
+        "u_sign": float(np.mean(np.sign(u) == np.sign(p))),
+        "jnext_mae": float(np.mean(np.abs(jn - jn_hat))),
+        "abs_jnext_mae": float(np.mean(np.abs(np.abs(jn) - np.abs(jn_hat)))),
+        "abs_corr": corr(np.abs(jn), np.abs(jn_hat)),
+        "jnext_sign": float(np.mean(np.sign(jn[sign_mask]) == np.sign(jn_hat[sign_mask]))) if sign_mask.any() else np.nan,
+    }
+
+
+def load_raw(path: Path, month: str, symbol: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if "symbol" in df.columns:
+        df = df[df["symbol"] == symbol].copy()
+    elif "timestamp" in df.columns:
+        pass
+    else:
+        raise ValueError(f"{path}: missing symbol/timestamp columns")
+
+    required = ["J", "K", "L", "J_next", "U"]
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing columns: {missing}")
-    for c in REQUIRED:
+        raise ValueError(f"{path}: missing columns {missing}")
+
+    for c in required:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=REQUIRED).copy()
-    if limit > 0:
-        df = df.tail(limit).copy()
 
-    df["J"] = df["close"] - df["open"]
-    df["K"] = df["high"] - df["close"]
-    df["L"] = df["close"] - df["low"]
-    rng = (df["high"] - df["low"]).clip(lower=1e-12)
-    df["M"] = rng
-    df["N"] = df["J"] / rng
-    df["O"] = (df["L"] - df["K"]) / rng
-    df["J_next"] = df["J"].shift(-1)
-    df["U"] = df["J_next"] - df["J"]
-    return df.dropna().reset_index(drop=True)
+    if "timestamp" in df.columns:
+        try:
+            ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            if ts.notna().any():
+                df = df.assign(_timestamp=ts).sort_values("_timestamp")
+        except Exception:
+            pass
 
+    if month and "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.loc[ts.dt.strftime("%Y-%m") == month].copy()
 
-def fit_predict(train: pd.DataFrame, test: pd.DataFrame) -> np.ndarray:
-    features = ["J", "K", "L"]
-    x_train = np.column_stack([np.ones(len(train)), train[features].to_numpy(float)])
-    y_train = train["U"].to_numpy(float)
-    coef = np.linalg.lstsq(x_train, y_train, rcond=None)[0]
-    x_test = np.column_stack([np.ones(len(test)), test[features].to_numpy(float)])
-    return x_test @ coef
+    return df.dropna(subset=required).reset_index(drop=True)
 
 
-def safe_corr(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.corrcoef(a, b)[0, 1]) if len(a) > 1 and np.std(a) > 0 and np.std(b) > 0 else 0.0
+def run_symbol(df: pd.DataFrame, min_train: int) -> dict[str, dict[str, float]]:
+    if len(df) <= min_train:
+        raise ValueError(f"Need more than min_train={min_train} rows; got {len(df)}")
+
+    out: dict[str, dict[str, float]] = {}
+    actual = {name: [] for name in ["BASELINE_-J", *FEATURE_SETS.keys()]}
+    preds = {name: [] for name in ["BASELINE_-J", *FEATURE_SETS.keys()]}
+    js = []
+    jnexts = []
+
+    for i in range(min_train, len(df)):
+        train = df.iloc[:i]
+        row = df.iloc[i]
+        j = float(row["J"])
+        u = float(row["U"])
+        jn = float(row["J_next"])
+
+        actual["BASELINE_-J"].append(u)
+        preds["BASELINE_-J"].append(-j)
+        for name, features in FEATURE_SETS.items():
+            beta = fit_model(train, features)
+            actual[name].append(u)
+            preds[name].append(predict(row, beta, features))
+        js.append(j)
+        jnexts.append(jn)
+
+    for name in actual:
+        out[name] = metric_block(
+            np.asarray(actual[name], dtype=float),
+            np.asarray(preds[name], dtype=float),
+            np.asarray(js, dtype=float),
+            np.asarray(jnexts, dtype=float),
+        )
+    return out
+
+
+def fmt(x: float, digits: int = 5) -> str:
+    return "NA" if not np.isfinite(x) else f"{x:.{digits}f}"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Walk-forward OOS estimation of next candle body magnitude")
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--folds", type=int, default=5)
-    parser.add_argument("--train-ratio", type=float, default=0.50)
+    parser = argparse.ArgumentParser(description="Expanding walk-forward OOS test for next-candle body magnitude")
+    parser.add_argument("--month", required=True, help="YYYY-MM")
+    parser.add_argument("--input", default=None, help="Raw body magnitude CSV")
+    parser.add_argument("--min-train", type=int, default=200)
+    parser.add_argument("--output", default=None, help="TXT output path")
     args = parser.parse_args()
 
-    if args.folds < 2:
-        raise ValueError("--folds must be >= 2")
-    if not 0.30 <= args.train_ratio <= 0.80:
-        raise ValueError("--train-ratio must be between 0.30 and 0.80")
+    input_path = Path(args.input or f"reports/body_magnitude_raw_{args.month}.csv")
+    output_path = Path(args.output or f"reports/body_magnitude_walkforward_{args.month}.txt")
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input not found: {input_path}")
 
-    df = load_data(args.input, args.limit)
-    n = len(df)
-    initial_train = int(n * args.train_ratio)
-    remaining = n - initial_train
-    if remaining < args.folds * 10:
-        raise ValueError(f"Not enough OOS candles for {args.folds} folds: {n}")
+    lines = [
+        "BODY MAGNITUDE WALK-FORWARD",
+        f"month={args.month}",
+        f"input={input_path}",
+        f"min_train={args.min_train}",
+        "training=expanding_history_only",
+        "target=U=J_next-J",
+        "",
+    ]
 
-    test_size = remaining // args.folds
-    all_u, all_u_hat = [], []
-    all_abs_j, all_abs_j_hat = [], []
+    pooled = {name: {"u": [], "p": [], "j": [], "jn": []} for name in ["BASELINE_-J", *FEATURE_SETS.keys()]}
 
-    print("=" * 64)
-    print("BODY MAGNITUDE WALK-FORWARD")
-    print("=" * 64)
-    print(f"candles={n} train0={initial_train} folds={args.folds} test/fold={test_size}")
-    print("target=next body J_next and change U=J_next-J_current leakage=NO")
-    print("fold  train  test  U_MAE     Jnext_MAE  |J|_MAE   corr")
+    for symbol in SYMBOLS:
+        part = load_raw(input_path, args.month, symbol)
+        results = run_symbol(part, args.min_train)
+        lines.append(f"[{symbol}] n={len(part)} oos={len(part) - args.min_train}")
+        for name, m in results.items():
+            lines.append(
+                f"{name}: n={m['n']} MAE_U={fmt(m['mae_u'])} RMSE_U={fmt(m['rmse_u'])} "
+                f"corr_U={fmt(m['corr_u'])} R2_U={fmt(m['r2_u'])} "
+                f"U_sign={fmt(m['u_sign'] * 100, 2)}% Jnext_MAE={fmt(m['jnext_mae'])} "
+                f"absJnext_MAE={fmt(m['abs_jnext_mae'])} abs_corr={fmt(m['abs_corr'])} "
+                f"Jnext_sign={fmt(m['jnext_sign'] * 100, 2)}%"
+            )
+        lines.append("")
 
-    for i in range(args.folds):
-        start = initial_train + i * test_size
-        end = initial_train + (i + 1) * test_size if i < args.folds - 1 else n
-        train = df.iloc[:start]
-        test = df.iloc[start:end]
+        # Rebuild the OOS arrays once for pooled metrics.
+        for i in range(args.min_train, len(part)):
+            train = part.iloc[:i]
+            row = part.iloc[i]
+            j = float(row["J"])
+            u = float(row["U"])
+            jn = float(row["J_next"])
+            pooled["BASELINE_-J"]["u"].append(u)
+            pooled["BASELINE_-J"]["p"].append(-j)
+            pooled["BASELINE_-J"]["j"].append(j)
+            pooled["BASELINE_-J"]["jn"].append(jn)
+            for name, features in FEATURE_SETS.items():
+                beta = fit_model(train, features)
+                pooled[name]["u"].append(u)
+                pooled[name]["p"].append(predict(row, beta, features))
+                pooled[name]["j"].append(j)
+                pooled[name]["jn"].append(jn)
 
-        u_hat = fit_predict(train, test)
-        u = test["U"].to_numpy(float)
-        j_next = test["J_next"].to_numpy(float)
-        j_next_hat = test["J"].to_numpy(float) + u_hat
-        abs_j = np.abs(j_next)
-        abs_j_hat = np.abs(j_next_hat)
+    lines.append("[ALL_POOLED]")
+    for name, data in pooled.items():
+        m = metric_block(
+            np.asarray(data["u"], dtype=float),
+            np.asarray(data["p"], dtype=float),
+            np.asarray(data["j"], dtype=float),
+            np.asarray(data["jn"], dtype=float),
+        )
+        lines.append(
+            f"{name}: n={m['n']} MAE_U={fmt(m['mae_u'])} RMSE_U={fmt(m['rmse_u'])} "
+            f"corr_U={fmt(m['corr_u'])} R2_U={fmt(m['r2_u'])} "
+            f"U_sign={fmt(m['u_sign'] * 100, 2)}% Jnext_MAE={fmt(m['jnext_mae'])} "
+            f"absJnext_MAE={fmt(m['abs_jnext_mae'])} abs_corr={fmt(m['abs_corr'])} "
+            f"Jnext_sign={fmt(m['jnext_sign'] * 100, 2)}%"
+        )
 
-        u_mae = float(np.mean(np.abs(u - u_hat)))
-        j_mae = float(np.mean(np.abs(j_next - j_next_hat)))
-        abs_mae = float(np.mean(np.abs(abs_j - abs_j_hat)))
-        corr = safe_corr(abs_j, abs_j_hat)
-
-        all_u.append(u)
-        all_u_hat.append(u_hat)
-        all_abs_j.append(abs_j)
-        all_abs_j_hat.append(abs_j_hat)
-        print(f"{i+1:>4}  {len(train):>5}  {len(test):>4}  {u_mae:>8.3f}  {j_mae:>10.3f}  {abs_mae:>8.3f}  {corr:>6.4f}")
-
-    u = np.concatenate(all_u)
-    u_hat = np.concatenate(all_u_hat)
-    abs_j = np.concatenate(all_abs_j)
-    abs_j_hat = np.concatenate(all_abs_j_hat)
-
-    u_mae = float(np.mean(np.abs(u - u_hat)))
-    j_mae = float(np.mean(np.abs(np.abs(abs_j) - np.abs(abs_j_hat))))
-    corr = safe_corr(abs_j, abs_j_hat)
-
-    baseline = np.full(len(abs_j), np.mean(df.iloc[:initial_train]["J_next"].abs()))
-    base_mae = float(np.mean(np.abs(abs_j - baseline)))
-
-    print("-" * 64)
-    print(f"ALL   {len(abs_j):>5}  U_MAE={u_mae:.3f}  |J_next|_MAE={j_mae:.3f}  corr={corr:.4f}")
-    print(f"BASE  {len(abs_j):>5}  |J_next|_MAE={base_mae:.3f}")
-    print("model=J,K,L -> U_hat -> J_next_hat -> abs(J_next_hat)")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("output=" + str(output_path))
+    print("-----")
+    print("\n".join(lines))
 
 
 if __name__ == "__main__":
