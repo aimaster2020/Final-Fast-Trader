@@ -26,7 +26,7 @@ def load(path: Path) -> pd.DataFrame:
     lc = df.low - df.close
     score = (hc > body).astype(int) + (ho < hc).astype(int) + (lc > body).astype(int)
 
-    # Direction in this experiment is determined ONLY by the score extremes:
+    # Direction is determined ONLY by the score extremes:
     # score 0 = SHORT, score 3 = LONG. Scores 1 and 2 are ignored.
     direction = np.where(score == 0, -1, np.where(score == 3, 1, 0)).astype(int)
 
@@ -51,14 +51,17 @@ def run_symbol(
     hold_sum = 0
 
     n = len(df)
-    for i in range(n - horizon):
+    i = 0
+    while i < n - horizon:
         row = df.iloc[i]
         trade_dir = int(row.direction)
 
         # Optional isolated LONG/SHORT tests. The score 0/3 mode passes None.
         if direction_filter is not None and trade_dir != direction_filter:
+            i += 1
             continue
         if trade_dir == 0:
+            i += 1
             continue
 
         entry = float(row.close)
@@ -74,6 +77,9 @@ def run_symbol(
         wins += int(gross_ret > 0)
         gross_sum += gross_ret
         hold_sum += horizon
+
+        # One open position per symbol: ignore all signals inside this holding window.
+        i += horizon + 1
 
     return {
         "final": capital,
@@ -175,10 +181,12 @@ def main() -> None:
     print("FIXED-HORIZON BACKTEST: NO ENTRY FILTER + NO SIGNAL EXIT")
     print("=" * 104)
     print("Direction: SCORE 0 = SHORT, SCORE 3 = LONG; SCORES 1/2 = NO TRADE")
+    print("Modes: SHORT ONLY | LONG ONLY | SCORE 0/3 ONLY")
     print("Entry: current candle close")
     print("Exit: close of candle +H")
     print("Entry magnitude filter: DISABLED")
     print("Progressive opposite-signal exit: DISABLED")
+    print("Open-position rule: one active trade per symbol; signals during a trade are ignored")
     print("Commission: reported at 0% and configured fee per side")
     print(f"Initial capital per symbol: {args.initial_capital:.2f}")
     print()
