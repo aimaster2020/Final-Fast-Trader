@@ -77,7 +77,10 @@ def main() -> None:
         df = df[df["timestamp"].dt.strftime("%Y-%m") == args.month].copy()
         if df.empty:
             continue
-        df.insert(0, "symbol", symbol)
+        if "symbol" in df.columns:
+            df["symbol"] = symbol
+        else:
+            df.insert(0, "symbol", symbol)
         rows.append(df)
 
     if not rows:
