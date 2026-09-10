@@ -20,11 +20,11 @@ def convert_file(src: Path, dst: Path, hours: int) -> int:
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=REQUIRED).copy()
-    df = df.sort_values(["symbol", "timestamp"]).drop_duplicates("timestamp", keep="first")
+    df = df.sort_values(["symbol", "timestamp"]).drop_duplicates(["symbol", "timestamp"], keep="first")
     if df.empty:
         raise ValueError(f"{src}: no usable rows")
 
-    # The source is UTC 1h candles. Resample on UTC boundaries (4h or 1d).
+    # Source candles are UTC 1h candles. Resample on UTC boundaries.
     dt = pd.to_datetime(df["timestamp"], unit="s", utc=True)
     df = df.set_index(dt)
 
@@ -43,8 +43,7 @@ def convert_file(src: Path, dst: Path, hours: int) -> int:
         .dropna(subset=["open", "high", "low", "close"])
     )
 
-    # Keep only complete candles. A 4h candle must contain 4 source hours;
-    # a 1d candle must contain 24 source hours.
+    # A valid 4h/1d candle must contain every underlying 1h candle.
     out = out[out["source_rows"] == hours].copy()
     out["timestamp"] = (out.index.view("int64") // 1_000_000_000).astype("int64")
     out["month"] = out.index.strftime("%Y-%m")
