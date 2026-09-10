@@ -32,7 +32,8 @@ def load_data(path: str) -> pd.DataFrame:
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"{path}: missing columns: {missing}")
-    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    # Source CSV timestamps are Unix seconds.
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True, errors="coerce")
     for c in ["open", "high", "low", "close"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=required).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
