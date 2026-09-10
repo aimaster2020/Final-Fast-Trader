@@ -49,6 +49,7 @@ def run_symbol(
     fee_each_side: float,
     entry_min_fraction: float,
     noise_fraction: float,
+    direction_filter: int | None = None,
 ) -> dict[str, float | int]:
     capital = float(initial_capital)
     fee_factor = (1.0 - fee_each_side) ** 2
@@ -63,6 +64,11 @@ def run_symbol(
         trade_dir = int(row.direction)
         expected_pct = float(row.magnitude_pct)
         signal_body = abs(float(row.body))
+
+        # Optional direction filter for isolated LONG or SHORT evaluation.
+        if direction_filter is not None and trade_dir != direction_filter:
+            i += 1
+            continue
 
         # Entry filter: predicted movement must cover at least the requested fraction of price.
         # 0.00065 = 0.065%, 0.0013 = 0.13%.
@@ -142,8 +148,63 @@ def run_symbol(
     }
 
 
+def pooled_result(
+    loaded: dict[str, pd.DataFrame],
+    symbols: list[str],
+    initial_capital: float,
+    fee: float,
+    entry_min: float,
+    noise: float,
+    direction_filter: int | None,
+) -> tuple[float, float, int]:
+    pooled_final = 0.0
+    pooled_trades = 0
+    pooled_initial = initial_capital * len(symbols)
+
+    for symbol in symbols:
+        r = run_symbol(
+            loaded[symbol],
+            initial_capital,
+            fee,
+            entry_min,
+            noise,
+            direction_filter=direction_filter,
+        )
+        pooled_final += float(r["final"])
+        pooled_trades += int(r["trades"])
+
+    pooled_return = pooled_final / pooled_initial - 1.0
+    return pooled_final, pooled_return, pooled_trades
+
+
+def print_direction_result(
+    label: str,
+    loaded: dict[str, pd.DataFrame],
+    symbols: list[str],
+    initial_capital: float,
+    args_fee: float,
+    entry_min: float,
+    noise: float,
+    direction_filter: int | None,
+) -> None:
+    print(label)
+    print("fee      pooled_final   pooled_return   trades")
+    for fee in (0.0, args_fee):
+        pooled_final, pooled_return, pooled_trades = pooled_result(
+            loaded,
+            symbols,
+            initial_capital,
+            fee,
+            entry_min,
+            noise,
+            direction_filter,
+        )
+        print(f"{fee*100:5.2f}%    {pooled_final:12.2f}   {pooled_return*100:+10.2f}%   {pooled_trades:6d}")
+    print()
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Backtest entry magnitude filter + progressive opposite-signal exit.")
+    ap = argparse.ArgumentParser(description="Backtest entry magnitude filter + progressive opposite-signal exit, split by direction.")
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--symbols", default=DEFAULT_SYMBOLS)
     ap.add_argument("--initial-capital", type=float, default=1000.0)
@@ -156,6 +217,7 @@ def main() -> None:
     entry_fractions = sorted({float(x) for x in args.entry_fractions.split(",") if x.strip()})
     noise_fractions = sorted({float(x) for x in args.noise_fractions.split(",") if x.strip()})
     root = Path(args.data_dir)
+    loaded = {symbol: load(root / f"{symbol}_1h.csv") for symbol in symbols}
 
     print("=" * 112)
     print("REAL CAPITAL BACKTEST: ENTRY MAGNITUDE FILTER + PROGRESSIVE OPPOSITE EXIT")
@@ -165,24 +227,43 @@ def main() -> None:
     print("Entry filter: predicted move / entry price must be >= threshold")
     print("0.00065 = 0.065% ; 0.0013 = 0.13%")
     print("Exit: same direction continues; 1st opposite=noise test; 2nd requires 2x first; 3rd mandatory")
+    print("Direction split: LONG and SHORT are evaluated independently with the same per-symbol initial capital")
     print(f"Initial capital per symbol: {args.initial_capital:.2f}")
     print()
 
     for entry_min in entry_fractions:
         for noise in noise_fractions:
             print(f"ENTRY MIN = {entry_min * 100:.3f}% | NOISE = {noise:.2f}")
-            print("fee      pooled_final   pooled_return   trades")
-            for fee in (0.0, args.fee):
-                pooled_final = 0.0
-                pooled_trades = 0
-                pooled_initial = args.initial_capital * len(symbols)
-                for symbol in symbols:
-                    r = run_symbol(load(root / f"{symbol}_1h.csv"), args.initial_capital, fee, entry_min, noise)
-                    pooled_final += float(r["final"])
-                    pooled_trades += int(r["trades"])
-                pooled_return = pooled_final / pooled_initial - 1.0
-                print(f"{fee*100:5.2f}%    {pooled_final:12.2f}   {pooled_return*100:+10.2f}%   {pooled_trades:6d}")
-            print()
+            print_direction_result(
+                "LONG",
+                loaded,
+                symbols,
+                args.initial_capital,
+                args.fee,
+                entry_min,
+                noise,
+                direction_filter=1,
+            )
+            print_direction_result(
+                "SHORT",
+                loaded,
+                symbols,
+                args.initial_capital,
+                args.fee,
+                entry_min,
+                noise,
+                direction_filter=-1,
+            )
+            print_direction_result(
+                "ALL",
+                loaded,
+                symbols,
+                args.initial_capital,
+                args.fee,
+                entry_min,
+                noise,
+                direction_filter=None,
+            )
 
     print("=" * 112)
 
