@@ -38,7 +38,7 @@ def fit_predict(train: pd.DataFrame, test: pd.DataFrame) -> tuple[np.ndarray, np
     return test["U"].to_numpy(float), x_test @ coef
 
 
-def stats(actual: np.ndarray, predicted: np.ndarray) -> tuple[int, float, float, dict[float, float]]:
+def close_stats(actual: np.ndarray, predicted: np.ndarray) -> tuple[int, float, float, dict[float, float]]:
     if len(actual) == 0:
         return 0, 0.0, 0.0, {t: 0.0 for t in THRESHOLDS}
     rel = np.abs(predicted - actual) / np.maximum(np.abs(actual), 1e-12)
@@ -46,16 +46,6 @@ def stats(actual: np.ndarray, predicted: np.ndarray) -> tuple[int, float, float,
     mape = float(np.mean(rel))
     within = {t: float(np.mean(rel <= t)) for t in THRESHOLDS}
     return len(actual), mae, mape, within
-
-
-def close_stats(actual: np.ndarray, predicted: np.ndarray) -> tuple[float, float, dict[float, float]]:
-    if len(actual) == 0:
-        return 0.0, 0.0, {t: 0.0 for t in THRESHOLDS}
-    rel = np.abs(predicted - actual) / np.maximum(np.abs(actual), 1e-12)
-    mae = float(np.mean(np.abs(predicted - actual)))
-    mape = float(np.mean(rel))
-    within = {t: float(np.mean(rel <= t)) for t in THRESHOLDS}
-    return mae, mape, within
 
 
 def main() -> None:
@@ -126,7 +116,7 @@ def main() -> None:
 
         row = []
         for key, mask in masks.items():
-            n_bucket, _, mape, within = stats(actual_close[mask], preds[mask])
+            n_bucket, _, mape, within = close_stats(actual_close[mask], preds[mask])
             buckets[key].append((actual_close[mask], preds[mask]))
             row.append((n_bucket, mape, within[0.0025], within[0.005]))
 
