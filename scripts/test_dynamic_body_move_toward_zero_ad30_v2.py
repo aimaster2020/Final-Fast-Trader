@@ -104,18 +104,23 @@ def run(rows: list[Candle], symbol: str, score_filter: int|None, threshold: floa
         after=before*(1.0+net)
         trades.append((i,rows[i].timestamp,rows[i+1].timestamp,side,s,body(rows[i]),pred,pred_next,entry,exit_price,gross,2*fee,net,before,after,ar))
         capital=after
-    wins=sum(t[14]>0 for t in trades)
+    wins=sum(1 for t in trades if t[12]>0)
+    gross_wins=sum(1 for t in trades if t[10]>0)
     gp=sum(t[10] for t in trades if t[10]>0); gl=sum(t[10] for t in trades if t[10]<0)
     np=sum(t[12] for t in trades if t[12]>0); nl=sum(t[12] for t in trades if t[12]<0)
     peak=capital0; dd=0.0; path=capital0
     for t in trades:
         path=t[14]; peak=max(peak,path); dd=max(dd,(peak-path)/peak if peak>EPS else 0.0)
     return {
-        'candidates':candidates,'signals':signals,'eligible':eligible,'trades':len(trades),'wins':wins,
-        'wr':wins/len(trades)*100 if trades else 0.0,'ret':capital/capital0-1.0,'final':capital,
-        'pf':(np/abs(nl) if nl< -EPS else math.inf),'dd':dd,'hist_skips':hist_skips,
+        'candidates':candidates,'signals':signals,'eligible':eligible,'trades':len(trades),'wins':wins,'gross_wins':gross_wins,
+        'wr':wins/len(trades)*100 if trades else 0.0,'gross_wr':gross_wins/len(trades)*100 if trades else 0.0,
+        'ret':capital/capital0-1.0,'final':capital,
+        'pf':(np/abs(nl) if nl< -EPS else math.inf),'gross_pf':(gp/abs(gl) if gl< -EPS else math.inf),'dd':dd,'hist_skips':hist_skips,
         'pred_med':median(pred_ratios) if pred_ratios else 0.0,'actual_med':median(ratio_actual) if ratio_actual else 0.0,
-        'trades_data':trades,'avg_gross':(sum(t[10] for t in trades)/len(trades) if trades else 0.0)
+        'trades_data':trades,'avg_gross':(sum(t[10] for t in trades)/len(trades) if trades else 0.0),
+        'avg_net':(sum(t[12] for t in trades)/len(trades) if trades else 0.0),
+        'longs':sum(1 for t in trades if t[3]=='LONG'),'shorts':sum(1 for t in trades if t[3]=='SHORT'),
+        'positive_signals':sum(1 for t in trades if t[12]>0),'negative_signals':sum(1 for t in trades if t[12]<0),
     }
 
 
@@ -147,7 +152,7 @@ def main():
                 r0=run(rows,sym,sf,t,0.0,a.lookback,a.min_history,a.capital)
                 r1=run(rows,sym,sf,t,a.commission,a.lookback,a.min_history,a.capital)
                 pf0='INF' if math.isinf(r0['pf']) else f"{r0['pf']:.2f}"; pf1='INF' if math.isinf(r1['pf']) else f"{r1['pf']:.2f}"
-                print(f"T={t:.2f} C={r0['candidates']} SIG={r0['signals']} TR={r0['trades']} WR={r0['wr']:.1f}% R0={r0['ret']*100:.2f}% F0={r0['final']:.2f} PF0={pf0} DD0={r0['dd']*100:.2f}% | Rfee={r1['ret']*100:.2f}% Ffee={r1['final']:.2f} PFfee={pf1} DDfee={r1['dd']*100:.2f}% | PRED_MED={r0['pred_med']:.3f} ACT_MED={r0['actual_med']:.3f} SKIP_H={r0['hist_skips']}")
+                print(f"T={t:.2f} C={r0['candidates']} SIG={r0['signals']} TR={r0['trades']} WR0={r0['wr']:.1f}% R0={r0['ret']*100:.2f}% F0={r0['final']:.2f} PF0={pf0} DD0={r0['dd']*100:.2f}% | WRfee={r1['wr']:.1f}% Rfee={r1['ret']*100:.2f}% Ffee={r1['final']:.2f} PFfee={pf1} DDfee={r1['dd']*100:.2f}% | PRED_MED={r0['pred_med']:.3f} ACT_MED={r0['actual_med']:.3f} SKIP_H={r0['hist_skips']} LONG={r0['longs']} SHORT={r0['shorts']}")
                 write_csv(log/f'{sym}_{label}_T{t:.2f}_F0.csv',r0['trades_data']); write_csv(log/f'{sym}_{label}_T{t:.2f}_F0_13.csv',r1['trades_data'])
 
 if __name__=='__main__': main()
