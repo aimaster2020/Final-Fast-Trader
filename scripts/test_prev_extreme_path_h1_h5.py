@@ -67,21 +67,23 @@ def one_trade(
 
         # Conservative same-candle rule: stop is assumed first.
         if hit_stop and hit_target:
-            gross = -stop
-            return gross - 2 * FEE_PER_SIDE, "STOP"
+            return -stop - 2 * FEE_PER_SIDE, "STOP"
         if hit_stop:
-            gross = -stop
-            return gross - 2 * FEE_PER_SIDE, "STOP"
+            return -stop - 2 * FEE_PER_SIDE, "STOP"
         if hit_target:
-            gross = target
-            return gross - 2 * FEE_PER_SIDE, "TARGET"
+            return target - 2 * FEE_PER_SIDE, "TARGET"
 
     final_c = float(df.loc[end, "close"])
     gross = (final_c - c) / c if direction == 1 else (c - final_c) / c
     return gross - 2 * FEE_PER_SIDE, "TIME"
 
 
-def evaluate(df: pd.DataFrame, horizon: int, target: float, stop: float) -> tuple[int, float, float, float, float, int, int, int]:
+def evaluate(
+    df: pd.DataFrame,
+    horizon: int,
+    target: float,
+    stop: float,
+) -> tuple[int, float, float, float, float, float, int, int, int]:
     returns: list[float] = []
     target_hits = stop_hits = time_exits = 0
     for i in range(LOOKBACK, len(df) - 1):
@@ -95,15 +97,18 @@ def evaluate(df: pd.DataFrame, horizon: int, target: float, stop: float) -> tupl
         time_exits += reason == "TIME"
 
     if not returns:
-        return 0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0
+        return 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0
 
     s = pd.Series(returns)
+    positive = float(s[s > 0].sum())
+    negative = float(s[s < 0].sum())
     return (
         len(s),
         float(s.sum() * 100),
         float((s > 0).mean() * 100),
         float(s.mean() * 100),
-        float(s[s > 0].sum() / abs(s[s < 0].sum()) if (s < 0).any() else 0.0),
+        positive * 100,
+        abs(negative) * 100,
         target_hits,
         stop_hits,
         time_exits,
@@ -138,19 +143,12 @@ def main() -> None:
                 total_return = sum(x[1] for x in parts)
                 wins = sum(x[2] * x[0] / 100 for x in parts)
                 avg = sum(x[3] * x[0] for x in parts) / n
-                gross_profit = sum(x[5] and 0 for x in parts)  # kept only for stable tuple unpacking
-                pf_num = 0.0
-                pf_den = 0.0
-                for result in parts:
-                    # Reconstruct PF from avg and win counts is not exact; compute from per-symbol summaries below.
-                    r = result
-                    # Approximate pooled PF from total positive/negative contribution is not available here.
-                    # Leave PF as 0 and use total return / avg / exit counts for screening.
-                    _ = r
-                pf = 0.0
-                t_hits = sum(x[5] for x in parts)
-                s_hits = sum(x[6] for x in parts)
-                tm_hits = sum(x[7] for x in parts)
+                gross_profit = sum(x[4] for x in parts)
+                gross_loss = sum(x[5] for x in parts)
+                pf = gross_profit / gross_loss if gross_loss > 0 else 0.0
+                t_hits = sum(x[6] for x in parts)
+                s_hits = sum(x[7] for x in parts)
+                tm_hits = sum(x[8] for x in parts)
                 print(f" {target*100:5.2f}% {stop*100:5.2f}% {n:6d} {total_return:9.2f} {wins/n*100:6.1f} {avg:6.3f} {pf:5.2f} {t_hits:6d} {s_hits:5d} {tm_hits:4d}")
 
 
