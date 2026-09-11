@@ -23,7 +23,7 @@ def get_json(session: requests.Session, path: str, params: dict[str, Any]) -> di
         params=params,
         headers={
             "Accept": "application/json",
-            "User-Agent": "TraderBot/Final-Fast-Trader-Nobitex-1.0.0",
+            "User-Agent": "TraderBot/Final-Fast-Trader-Nobitex-1.0.1",
         },
         timeout=30,
     )
@@ -32,6 +32,19 @@ def get_json(session: requests.Session, path: str, params: dict[str, Any]) -> di
     if not isinstance(payload, dict):
         raise RuntimeError(f"Unexpected response type from {path}: {type(payload).__name__}")
     return payload
+
+
+def normalize_symbol(raw_symbol: str) -> str:
+    """Normalize Nobitex market-stats keys to UDF history symbols."""
+    symbol = raw_symbol.replace("-", "").replace("/", "").upper()
+
+    # Nobitex market stats may expose the Iranian-rial quote as RLS,
+    # while the UDF history endpoint documents the equivalent quote as IRT.
+    # Preserve other quote currencies (notably USDT) unchanged.
+    if symbol.endswith("RLS"):
+        symbol = symbol[:-3] + "IRT"
+
+    return symbol
 
 
 def fetch_markets(session: requests.Session) -> list[str]:
@@ -48,14 +61,9 @@ def fetch_markets(session: requests.Session) -> list[str]:
         if not isinstance(raw_symbol, str) or not isinstance(value, dict):
             continue
 
-        # Nobitex market statistics are commonly keyed as btc-irt / btc-usdt.
-        symbol = raw_symbol.replace("-", "").replace("/", "").upper()
-        if not symbol:
-            continue
-
-        # Keep markets that expose a valid symbol and a normal market-stat object.
-        # The UDF endpoint itself is used later as the final availability check.
-        symbols.append(symbol)
+        symbol = normalize_symbol(raw_symbol)
+        if symbol:
+            symbols.append(symbol)
 
     return sorted(set(symbols))
 
@@ -117,9 +125,6 @@ def fetch_history(
                 }
             )
 
-        # page=1 is the newest batch, page=2 the next older batch, etc.
-        # Stop as soon as we have reached the requested start time or the API
-        # returned less than the maximum batch size.
         oldest = min(int(x) for x in ts)
         if oldest <= start_ts or n < MAX_PER_REQUEST:
             break
@@ -161,7 +166,8 @@ def main() -> None:
     session.headers.update({"Accept": "application/json"})
 
     if args.symbols.strip():
-        symbols = sorted(set(s.strip().upper() for s in args.symbols.split(",") if s.strip()))
+        raw_symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+        symbols = sorted(set(normalize_symbol(s) for s in raw_symbols))
     else:
         symbols = fetch_markets(session)
 
