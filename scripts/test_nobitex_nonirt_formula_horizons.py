@@ -6,9 +6,7 @@ import numpy as np
 import pandas as pd
 
 MIN_CANDLES = 100
-DEFAULT_HORIZONS = [1, 2, 3, 4, 5]
 NO_SIGNAL_MARKETS = {"DOSUSDT", "GRVTUSDT", "SLVONUSDT"}
-UNIVERSE_REPORT = "reports/nobitex_1h/nonirt_oos_direction_magnitude_stability.csv"
 TARGET_MARKETS = 233
 
 
@@ -37,7 +35,6 @@ def load(path: Path) -> pd.DataFrame:
     signal_dir = formula_dir.copy()
     signal_dir[(score == 1) & (side_formula == 1)] = 0
     signal_dir[(score == 2) & (side_formula == -1)] = 0
-
     df["signal_dir"] = signal_dir
     return df
 
@@ -71,10 +68,8 @@ def established_universe(root: Path) -> list[str]:
                 return sorted(symbols)
         except Exception:
             pass
-
     files = sorted(p for p in root.glob("*_1h.csv") if not p.stem[:-3].upper().endswith("IRT"))
-    symbols = sorted(set(p.stem[:-3].upper() for p in files) | NO_SIGNAL_MARKETS)
-    return symbols[:TARGET_MARKETS]
+    return sorted(set(p.stem[:-3].upper() for p in files) | NO_SIGNAL_MARKETS)[:TARGET_MARKETS]
 
 
 def main() -> None:
@@ -92,104 +87,69 @@ def main() -> None:
     if len(universe) != TARGET_MARKETS:
         raise SystemExit(f"Expected the established 233-market universe, found {len(universe)} symbols.")
 
-    rows: list[dict[str, float | int | str]] = []
     path_map = {p.stem[:-3].upper(): p for p in root.glob("*_1h.csv")}
-
+    records = []
     for symbol in universe:
         path = path_map.get(symbol)
         if path is None:
+            for h in horizons:
+                records.append({"symbol": symbol, "horizon": h, "n": 0, "win": np.nan, "mean": np.nan, "median": np.nan, "half": np.nan, "round": np.nan})
             continue
         try:
             df = load(path)
-            if len(df) < MIN_CANDLES:
-                continue
-            for horizon in horizons:
-                s = horizon_stats(df, horizon, args.half_fee, args.round_fee)
-                if not s["n"]:
-                    continue
-                rows.append({"symbol": symbol, "horizon": horizon, **s})
+            for h in horizons:
+                if len(df) < MIN_CANDLES:
+                    s = {"n": 0, "win": np.nan, "mean": np.nan, "median": np.nan, "half": np.nan, "round": np.nan}
+                else:
+                    s = horizon_stats(df, h, args.half_fee, args.round_fee)
+                records.append({"symbol": symbol, "horizon": h, **s})
         except Exception:
-            continue
+            for h in horizons:
+                records.append({"symbol": symbol, "horizon": h, "n": 0, "win": np.nan, "mean": np.nan, "median": np.nan, "half": np.nan, "round": np.nan})
 
-    out = pd.DataFrame(rows)
-    if out.empty:
-        raise SystemExit("No valid markets.")
+    out = pd.DataFrame(records)
     out.to_csv(args.output, index=False)
 
-    print("=" * 140)
-    print("NOBITEX NON-IRT | FORMULA HORIZON TEST")
-    print("=" * 140)
+    print("=" * 150)
+    print("NOBITEX NON-IRT | FORMULA HORIZON TEST | ALL 233 MARKETS")
+    print("=" * 150)
     print(f"Established universe : {TARGET_MARKETS} markets")
-    print(f"Markets with data    : {out.symbol.nunique()}")
+    print(f"Markets printed      : {out.symbol.nunique()} / {TARGET_MARKETS}")
     print("Entry                : current candle close")
     print("Exit                 : close after H candles")
-    print("Horizon              : 1, 2, 3, 4, 5 x 1H")
+    print("Horizons             : H1 H2 H3 H4 H5 (1H candles)")
     print("Signal               : fixed formula + ambiguity filter")
-    print("Fees reference       : 0.13% half-fee / 0.26% round-trip")
+    print("Fees                 : half 0.13% | round-trip 0.26%")
     print()
 
     summary = []
     for h in horizons:
         x = out[out.horizon == h]
-        summary.append({
-            "horizon": h,
-            "markets": x.symbol.nunique(),
-            "mean_win": x.win.mean(),
-            "median_win": x.win.median(),
-            "mkt_ge55": int((x.win >= 55).sum()),
-            "mean_move": x["mean"].mean(),
-            "half_ge50": int((x.half >= 50).sum()),
-            "round_ge50": int((x["round"] >= 50).sum()),
-            "mean_trades": x.n.mean(),
-        })
-    s = pd.DataFrame(summary)
-
-    print("ALL-233-MARKET SUMMARY")
-    print("H  markets  mean_win  median_win  >=55%  mean_move  half>=50  round>=50  mean_trades")
-    for _, r in s.iterrows():
-        print(
-            f"{int(r.horizon):<2d} {int(r.markets):>7d}  {r.mean_win:>8.2f}%  {r.median_win:>10.2f}%  "
-            f"{int(r.mkt_ge55):>5d}  {r.mean_move:>+9.3f}%  {int(r.half_ge50):>9d}  "
-            f"{int(r.round_ge50):>9d}  {r.mean_trades:>11.1f}"
-        )
+        valid = x[x.n > 0]
+        summary.append((h, len(valid), valid.win.mean(), valid.win.median(), int((valid.win >= 55).sum()), valid['mean'].mean(), int((valid.half >= 50).sum()), int((valid['round'] >= 50).sum()), valid.n.mean()))
+    print("SUMMARY — ALL 233")
+    print("H   tested   mean_win   median   >=55   mean_move   half>=50   round>=50   mean_n")
+    for h, tested, mw, med, ge55, mm, half, rnd, mn in summary:
+        print(f"{h:<3d} {tested:>7d}   {mw:>7.2f}%   {med:>7.2f}%  {ge55:>5d}   {mm:>+8.3f}%   {half:>9d}   {rnd:>10d}   {mn:>7.1f}")
 
     print()
-    print("ALL-233-MARKET DETAIL")
-    print("symbol               | H1 win/mean/round | H2 win/mean/round | H3 win/mean/round | H4 win/mean/round | H5 win/mean/round")
-    print("-" * 140)
-
-    pivot = out.pivot(index="symbol", columns="horizon", values=["win", "mean", "round"])
-    pivot = pivot.sort_index()
-    for symbol, row in pivot.iterrows():
-        parts = [symbol.ljust(20), "|"]
+    print("DETAIL — ALL 233 MARKETS")
+    print("Each value = WIN% / mean signed move% / round-fee coverage%")
+    print("SYMBOL               | H1                  | H2                  | H3                  | H4                  | H5")
+    print("-" * 150)
+    for symbol in universe:
+        chunks = []
         for h in horizons:
-            try:
-                win = float(row[("win", h)])
-                mean = float(row[("mean", h)])
-                rnd = float(row[("round", h)])
-                parts.append(f" H{h} {win:5.1f}%/{mean:+.3f}%/{rnd:5.1f}% ")
-            except Exception:
-                parts.append(f" H{h}   --/----/--- ")
-            if h != horizons[-1]:
-                parts.append("|")
-        print("".join(parts))
-
-    print()
-    print("SELECTED MAJOR MARKETS")
-    for symbol in ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]:
-        x = out[out.symbol == symbol].sort_values("horizon")
-        if x.empty:
-            continue
-        print(symbol)
-        for _, r in x.iterrows():
-            print(
-                f"  H{int(r.horizon)} n={int(r.n):4d} win={r.win:6.2f}% "
-                f"move={r['mean']:+.3f}% half={r.half:6.2f}% round={r['round']:6.2f}%"
-            )
+            r = out[(out.symbol == symbol) & (out.horizon == h)].iloc[0]
+            if int(r.n) == 0:
+                chunks.append(f"H{h} -- / -- / --")
+            else:
+                chunks.append(f"H{h} {r.win:5.1f}% / {r['mean']:+6.3f}% / {r['round']:5.1f}%")
+        print(f"{symbol:20s} | " + " | ".join(chunks))
 
     print()
     print(f"Detailed CSV: {args.output}")
-    print("=" * 140)
+    print("=" * 150)
 
 
 if __name__ == "__main__":
