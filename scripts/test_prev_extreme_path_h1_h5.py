@@ -10,7 +10,7 @@ LOOKBACK = 1
 ROOM_THRESHOLD = 0.02
 TARGETS = [0.003, 0.005, 0.0075, 0.010]
 STOPS = [0.005, 0.0075, 0.010, 0.015]
-FEE_PER_SIDE = 0.0013
+DEFAULT_FEE_PER_SIDE = 0.0013
 
 
 def load_symbol(path: Path) -> pd.DataFrame:
@@ -38,6 +38,7 @@ def one_trade(
     horizon: int,
     target: float,
     stop: float,
+    fee_per_side: float,
 ) -> tuple[float, str] | None:
     o, h, l, c = map(float, df.loc[i, ["open", "high", "low", "close"]])
     direction = score_direction(o, h, l, c)
@@ -51,31 +52,27 @@ def one_trade(
         return None
 
     end = min(i + horizon, len(df) - 1)
+    target_price = c * (1.0 + target) if direction == 1 else c * (1.0 - target)
+    stop_price = c * (1.0 - stop) if direction == 1 else c * (1.0 + stop)
+    round_trip_fee = 2 * fee_per_side
+
     for j in range(i + 1, end + 1):
         hj = float(df.loc[j, "high"])
         lj = float(df.loc[j, "low"])
-        if direction == 1:
-            target_price = c * (1.0 + target)
-            stop_price = c * (1.0 - stop)
-            hit_target = hj >= target_price
-            hit_stop = lj <= stop_price
-        else:
-            target_price = c * (1.0 - target)
-            stop_price = c * (1.0 + stop)
-            hit_target = lj <= target_price
-            hit_stop = hj >= stop_price
+        hit_target = hj >= target_price if direction == 1 else lj <= target_price
+        hit_stop = lj <= stop_price if direction == 1 else hj >= stop_price
 
         # Conservative same-candle rule: stop is assumed first.
         if hit_stop and hit_target:
-            return -stop - 2 * FEE_PER_SIDE, "STOP"
+            return -stop - round_trip_fee, "STOP"
         if hit_stop:
-            return -stop - 2 * FEE_PER_SIDE, "STOP"
+            return -stop - round_trip_fee, "STOP"
         if hit_target:
-            return target - 2 * FEE_PER_SIDE, "TARGET"
+            return target - round_trip_fee, "TARGET"
 
     final_c = float(df.loc[end, "close"])
     gross = (final_c - c) / c if direction == 1 else (c - final_c) / c
-    return gross - 2 * FEE_PER_SIDE, "TIME"
+    return gross - round_trip_fee, "TIME"
 
 
 def evaluate(
@@ -83,11 +80,12 @@ def evaluate(
     horizon: int,
     target: float,
     stop: float,
+    fee_per_side: float,
 ) -> tuple[int, float, float, float, float, float, int, int, int]:
     returns: list[float] = []
     target_hits = stop_hits = time_exits = 0
     for i in range(LOOKBACK, len(df) - 1):
-        result = one_trade(df, i, horizon, target, stop)
+        result = one_trade(df, i, horizon, target, stop, fee_per_side)
         if result is None:
             continue
         ret, reason = result
@@ -119,6 +117,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--symbols", default=SYMBOLS)
+    ap.add_argument("--fee", type=float, default=DEFAULT_FEE_PER_SIDE)
     args = ap.parse_args()
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -127,7 +126,7 @@ def main() -> None:
 
     print("=" * 112)
     print("PREVIOUS EXTREME PATH TEST — H1 TO H5")
-    print("Lookback=1 | Room>=2% | Entry at current Close | Fee=0.13%/side")
+    print(f"Lookback=1 | Room>=2% | Entry at current Close | Fee={args.fee*100:.2f}%/side")
     print("Target/stop are fixed % from entry; same-candle target+stop => STOP (conservative)")
     print("=" * 112)
 
@@ -136,7 +135,7 @@ def main() -> None:
         print(" TARGET  STOP     N   RETURN%   WIN%  AVG%    PF  TARGET STOP TIME")
         for target in TARGETS:
             for stop in STOPS:
-                parts = [evaluate(loaded[s], horizon, target, stop) for s in symbols]
+                parts = [evaluate(loaded[s], horizon, target, stop, args.fee) for s in symbols]
                 n = sum(x[0] for x in parts)
                 if n == 0:
                     continue
