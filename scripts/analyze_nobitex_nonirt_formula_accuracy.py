@@ -73,16 +73,37 @@ def direction_metrics(df: pd.DataFrame) -> dict[str, float | int]:
     }
 
 
+def _empty_mag() -> dict[str, float | int]:
+    return {
+        "mag_n": 0,
+        "mag_dir_accuracy": 0.0,
+        "mag_mae": np.nan,
+        "mag_nmae": np.nan,
+        "mag_rmse": np.nan,
+        "mag_corr": np.nan,
+        "mag_r2": np.nan,
+        "mag_within_25pct": np.nan,
+        "mag_within_50pct": np.nan,
+        "mag_within_100pct": np.nan,
+        "mag_mean_abs_actual": np.nan,
+        "mag_mean_abs_pred": np.nan,
+    }
+
+
 def magnitude_walkforward(df: pd.DataFrame, folds: int = 5, train_ratio: float = 0.5) -> dict[str, float | int]:
     features = ["J", "K", "L"]
     n = len(df)
     if n < max(100, folds * 20):
-        return {"mag_n": 0, "mag_dir_accuracy": 0.0, "mag_mae": np.nan, "mag_corr": np.nan, "mag_r2": np.nan}
+        return _empty_mag()
+
     initial_train = max(20, int(n * train_ratio))
     remaining = n - initial_train
     if remaining < folds * 10:
         folds = max(2, remaining // 10)
     test_size = remaining // folds
+    if test_size <= 0:
+        return _empty_mag()
+
     ys = []
     ps = []
 
@@ -93,9 +114,11 @@ def magnitude_walkforward(df: pd.DataFrame, folds: int = 5, train_ratio: float =
         test = df.iloc[start:end]
         if len(test) == 0:
             continue
+
         x_train = np.column_stack([np.ones(len(train)), train[features].to_numpy(float)])
         y_train = train["U"].to_numpy(float)
         coef = np.linalg.lstsq(x_train, y_train, rcond=None)[0]
+
         x_test = np.column_stack([np.ones(len(test)), test[features].to_numpy(float)])
         y = test["U"].to_numpy(float)
         p = x_test @ coef
@@ -103,21 +126,50 @@ def magnitude_walkforward(df: pd.DataFrame, folds: int = 5, train_ratio: float =
         ps.append(p)
 
     if not ys:
-        return {"mag_n": 0, "mag_dir_accuracy": 0.0, "mag_mae": np.nan, "mag_corr": np.nan, "mag_r2": np.nan}
+        return _empty_mag()
+
     y = np.concatenate(ys)
     p = np.concatenate(ps)
+    err = p - y
+    abs_y = np.abs(y)
+    abs_p = np.abs(p)
+
     mask = (np.sign(y) != 0) & (np.sign(p) != 0)
     acc = float(np.mean(np.sign(y[mask]) == np.sign(p[mask]))) if mask.any() else 0.0
-    mae = float(np.mean(np.abs(y - p)))
+
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    mean_abs_y = float(np.mean(abs_y))
+    nmae = mae / mean_abs_y if mean_abs_y > 0 else np.nan
+
     corr = float(np.corrcoef(y, p)[0, 1]) if len(y) > 1 and np.std(y) > 0 and np.std(p) > 0 else 0.0
     sst = float(np.sum((y - np.mean(y)) ** 2))
     sse = float(np.sum((y - p) ** 2))
     r2 = 1.0 - sse / sst if sst > 0 else np.nan
-    return {"mag_n": len(y), "mag_dir_accuracy": acc, "mag_mae": mae, "mag_corr": corr, "mag_r2": r2}
+
+    # Relative-error buckets are reported only where the realized |U| is non-zero.
+    nz = abs_y > 0
+    rel_err = np.full_like(abs_y, np.nan, dtype=float)
+    rel_err[nz] = np.abs(err[nz]) / abs_y[nz]
+
+    return {
+        "mag_n": len(y),
+        "mag_dir_accuracy": acc,
+        "mag_mae": mae,
+        "mag_nmae": nmae,
+        "mag_rmse": rmse,
+        "mag_corr": corr,
+        "mag_r2": r2,
+        "mag_within_25pct": float(np.mean(rel_err[nz] <= 0.25)) if nz.any() else np.nan,
+        "mag_within_50pct": float(np.mean(rel_err[nz] <= 0.50)) if nz.any() else np.nan,
+        "mag_within_100pct": float(np.mean(rel_err[nz] <= 1.00)) if nz.any() else np.nan,
+        "mag_mean_abs_actual": mean_abs_y,
+        "mag_mean_abs_pred": float(np.mean(abs_p)),
+    }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Per-market formula direction and magnitude accuracy on all non-IRT Nobitex markets.")
+    ap = argparse.ArgumentParser(description="Per-market formula direction and direct magnitude accuracy on all non-IRT Nobitex markets.")
     ap.add_argument("--data-dir", default="reports/nobitex_1h")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--train-ratio", type=float, default=0.5)
@@ -149,21 +201,27 @@ def main() -> None:
         raise SystemExit("No valid non-IRT markets found.")
     out["dir_accuracy_pct"] = out["dir_accuracy"] * 100
     out["mag_dir_accuracy_pct"] = out["mag_dir_accuracy"] * 100
+    out["mag_within_25pct_pct"] = out["mag_within_25pct"] * 100
+    out["mag_within_50pct_pct"] = out["mag_within_50pct"] * 100
+    out["mag_within_100pct_pct"] = out["mag_within_100pct"] * 100
     out = out.sort_values(["dir_accuracy", "mag_dir_accuracy"], ascending=False).reset_index(drop=True)
     path = Path(args.output)
     path.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(path, index=False)
 
-    print("=" * 120)
-    print("NOBITEX NON-IRT | PER-MARKET FORMULA ACCURACY")
-    print("=" * 120)
+    print("=" * 150)
+    print("NOBITEX NON-IRT | PER-MARKET FORMULA + DIRECT MAGNITUDE ACCURACY")
+    print("=" * 150)
     print(f"Markets found       : {len(files)}")
     print(f"Markets tested      : {len(out)}")
     print(f"Skipped             : {skipped}")
     print("Direction formula   : score 0/1 SHORT, score 2/3 LONG + ambiguity filter")
     print("Direction target    : next candle body sign (Close-Open)")
-    print("Magnitude model     : walk-forward U = J_next - J_current, features J,K,L")
+    print("Magnitude target    : U = J_next - J_current")
+    print("Magnitude features  : J,K,L | walk-forward OOS linear regression")
     print(f"Walk-forward        : folds={args.folds} train_ratio={args.train_ratio:.2f}")
+    print("nMAE                : MAE / mean(|actual U|); lower is better")
+    print("Within X%           : |prediction-actual| / |actual| <= X%, excluding exact-zero U")
     print()
     print("AGGREGATE")
     print(f"Direction mean accuracy       : {out.dir_accuracy.mean()*100:.2f}%")
@@ -174,13 +232,27 @@ def main() -> None:
     print(f"Magnitude median corr         : {out.mag_corr.median():+.3f}")
     print(f"Magnitude mean OOS dir acc    : {out.mag_dir_accuracy.mean()*100:.2f}%")
     print(f"Magnitude median OOS dir acc  : {out.mag_dir_accuracy.median()*100:.2f}%")
+    print(f"Magnitude mean nMAE           : {out.mag_nmae.mean()*100:.2f}%")
+    print(f"Magnitude median nMAE         : {out.mag_nmae.median()*100:.2f}%")
+    print(f"Magnitude mean within 25%     : {out.mag_within_25pct.mean()*100:.2f}%")
+    print(f"Magnitude median within 25%   : {out.mag_within_25pct.median()*100:.2f}%")
+    print(f"Magnitude mean within 50%     : {out.mag_within_50pct.mean()*100:.2f}%")
+    print(f"Magnitude median within 50%   : {out.mag_within_50pct.median()*100:.2f}%")
     print()
     print("ALL MARKETS — SORTED BY DIRECTION ACCURACY")
     for _, r in out.iterrows():
-        print(f"{r.symbol:20s} candles={int(r.candles):3d} dir={r.dir_accuracy_pct:6.2f}% n={int(r.dir_n):3d} cov={r.dir_coverage*100:5.1f}% | long={r.dir_long_accuracy*100:6.2f}% short={r.dir_short_accuracy*100:6.2f}% | mag_dir={r.mag_dir_accuracy_pct:6.2f}% corr={r.mag_corr:+.3f} r2={r.mag_r2:+.3f} mae={r.mag_mae:.6f}")
+        print(
+            f"{r.symbol:20s} candles={int(r.candles):3d} "
+            f"dir={r.dir_accuracy_pct:6.2f}% n={int(r.dir_n):3d} cov={r.dir_coverage*100:5.1f}% "
+            f"| long={r.dir_long_accuracy*100:6.2f}% short={r.dir_short_accuracy*100:6.2f}% "
+            f"| mag_dir={r.mag_dir_accuracy_pct:6.2f}% corr={r.mag_corr:+.3f} "
+            f"r2={r.mag_r2:+.3f} nMAE={r.mag_nmae*100:6.2f}% "
+            f"W25={r.mag_within_25pct_pct:6.2f}% W50={r.mag_within_50pct_pct:6.2f}% "
+            f"MAE={r.mag_mae:.6f}"
+        )
     print()
     print(f"Detailed CSV: {path}")
-    print("=" * 120)
+    print("=" * 150)
 
 
 if __name__ == "__main__":
