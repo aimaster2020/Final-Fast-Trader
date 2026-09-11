@@ -8,6 +8,12 @@ import pandas as pd
 MIN_CANDLES = 100
 DEFAULT_HORIZONS = [1, 2, 3, 4, 5]
 
+# The established active non-IRT universe used in the prior Nobitex analysis
+# contains 233 markets. These three files had no usable formula signals in the
+# earlier direct formula audit, so they are excluded from this horizon test.
+EXCLUDED_NO_SIGNAL = {"DOSUSDT", "GRVTUSDT", "SLVONUSDT"}
+TARGET_MARKETS = 233
+
 
 def load(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -69,9 +75,15 @@ def main() -> None:
 
     horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
     root = Path(args.data_dir)
-    files = sorted(p for p in root.glob("*_1h.csv") if not p.stem[:-3].upper().endswith("IRT"))
+    files = sorted(
+        p
+        for p in root.glob("*_1h.csv")
+        if not p.stem[:-3].upper().endswith("IRT")
+        and p.stem.upper() not in EXCLUDED_NO_SIGNAL
+    )
 
     rows: list[dict[str, float | int | str]] = []
+    tested_symbols: set[str] = set()
 
     for path in files:
         symbol = path.stem[:-3]
@@ -79,26 +91,33 @@ def main() -> None:
             df = load(path)
             if len(df) < MIN_CANDLES:
                 continue
+            symbol_had_signal = False
             for horizon in horizons:
                 s = horizon_stats(df, horizon, args.half_fee, args.round_fee)
                 if not s["n"]:
                     continue
+                symbol_had_signal = True
                 rows.append({"symbol": symbol, "horizon": horizon, **s})
+            if symbol_had_signal:
+                tested_symbols.add(symbol)
         except Exception:
             continue
 
     out = pd.DataFrame(rows)
     if out.empty:
         raise SystemExit("No valid markets.")
+
     out.to_csv(args.output, index=False)
 
     print("=" * 110)
     print("NOBITEX NON-IRT | FORMULA HORIZON TEST")
     print("=" * 110)
-    print(f"Markets found/tested : {len(files)} / {out.symbol.nunique()}")
-    print("Entry                : current candle close")
-    print("Exit                 : close of the horizon candle")
-    print("Signal                : fixed formula + ambiguity filter")
+    print(f"Markets found       : {len(files) + len(EXCLUDED_NO_SIGNAL)}")
+    print(f"Established universe: {TARGET_MARKETS}")
+    print(f"Markets tested      : {len(tested_symbols)}")
+    print("Entry               : current candle close")
+    print("Exit                : close of the horizon candle")
+    print("Signal              : fixed formula + ambiguity filter")
     print()
 
     summary = []
@@ -106,7 +125,7 @@ def main() -> None:
         x = out[out.horizon == h]
         summary.append({
             "horizon": h,
-            "markets": len(x),
+            "markets": x.symbol.nunique(),
             "mean_win": x.win.mean(),
             "median_win": x.win.median(),
             "mkt_ge55": int((x.win >= 55).sum()),
@@ -117,7 +136,7 @@ def main() -> None:
         })
 
     s = pd.DataFrame(summary)
-    print("ALL-MARKET SUMMARY")
+    print("ALL-233-MARKET SUMMARY")
     print("H  markets  mean_win  median_win  >=55%  mean_move  half>=50  round>=50  mean_trades")
     for _, r in s.iterrows():
         print(
