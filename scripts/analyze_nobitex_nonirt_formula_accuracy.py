@@ -16,7 +16,10 @@ def load(path: Path) -> pd.DataFrame:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["open", "high", "low", "close"]).copy()
-    df = df.sort_values("timestamp" if "timestamp" in df.columns else df.index.name or df.columns[0]).reset_index(drop=True)
+    if "timestamp" in df.columns:
+        df = df.sort_values("timestamp").reset_index(drop=True)
+    else:
+        df = df.reset_index(drop=True)
 
     body = df["close"] - df["open"]
     hc = df["high"] - df["close"]
@@ -29,17 +32,13 @@ def load(path: Path) -> pd.DataFrame:
     lower = (df["open"] - df["low"]).abs()
     side_formula = np.where(lower > upper, 1, np.where(upper > lower, -1, 0)).astype(int)
 
-    # Exact direction used by the current trading formula: score direction plus
-    # the ambiguity filter already used in the baseline strategy.
     trade_direction = formula_dir.copy()
     trade_direction[(score == 1) & (side_formula == 1)] = 0
     trade_direction[(score == 2) & (side_formula == -1)] = 0
 
-    # Next candle actual body sign is the prediction target.
     next_body = body.shift(-1)
     actual_dir = np.sign(next_body).astype(float)
 
-    # Magnitude target follows the previous body-move work: U = J_next - J_current.
     J = body
     K = df["high"] - df["close"]
     L = df["close"] - df["low"]
@@ -57,7 +56,6 @@ def load(path: Path) -> pd.DataFrame:
 
 
 def direction_metrics(df: pd.DataFrame) -> dict[str, float | int]:
-    # Test non-ambiguous predictions only.
     m = (df["pred_direction"] != 0) & (df["actual_direction"] != 0)
     y = df.loc[m, "actual_direction"].to_numpy(float)
     p = df.loc[m, "pred_direction"].to_numpy(float)
@@ -124,11 +122,11 @@ def main() -> None:
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--train-ratio", type=float, default=0.5)
     ap.add_argument("--min-candles", type=int, default=MIN_CANDLES)
+    ap.add_argument("--output", default="reports/nobitex_1h/nonirt_formula_accuracy_by_market.csv")
     args = ap.parse_args()
 
     root = Path(args.data_dir)
-    files = sorted(p for p in root.glob("*_1h.csv") if not p.stem.upper().endswith("IRT_1H"))
-    files = [p for p in files if not p.stem[:-3].upper().endswith("IRT")]
+    files = sorted(p for p in root.glob("*_1h.csv") if not p.stem[:-3].upper().endswith("IRT"))
     results = []
     skipped = 0
 
@@ -152,7 +150,8 @@ def main() -> None:
     out["dir_accuracy_pct"] = out["dir_accuracy"] * 100
     out["mag_dir_accuracy_pct"] = out["mag_dir_accuracy"] * 100
     out = out.sort_values(["dir_accuracy", "mag_dir_accuracy"], ascending=False).reset_index(drop=True)
-    path = root / "nonirt_formula_accuracy_by_market.csv"
+    path = Path(args.output)
+    path.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(path, index=False)
 
     print("=" * 120)
@@ -176,13 +175,9 @@ def main() -> None:
     print(f"Magnitude mean OOS dir acc    : {out.mag_dir_accuracy.mean()*100:.2f}%")
     print(f"Magnitude median OOS dir acc  : {out.mag_dir_accuracy.median()*100:.2f}%")
     print()
-    print("TOP 20 BY DIRECTION ACCURACY")
-    for _, r in out.head(20).iterrows():
-        print(f"{r.symbol:20s} candles={int(r.candles):3d} dir={r.dir_accuracy_pct:6.2f}% n={int(r.dir_n):3d} cov={r.dir_coverage*100:5.1f}% | mag_dir={r.mag_dir_accuracy_pct:6.2f}% corr={r.mag_corr:+.3f}")
-    print()
-    print("BOTTOM 20 BY DIRECTION ACCURACY")
-    for _, r in out.tail(20).sort_values("dir_accuracy").iterrows():
-        print(f"{r.symbol:20s} candles={int(r.candles):3d} dir={r.dir_accuracy_pct:6.2f}% n={int(r.dir_n):3d} cov={r.dir_coverage*100:5.1f}% | mag_dir={r.mag_dir_accuracy_pct:6.2f}% corr={r.mag_corr:+.3f}")
+    print("ALL MARKETS — SORTED BY DIRECTION ACCURACY")
+    for _, r in out.iterrows():
+        print(f"{r.symbol:20s} candles={int(r.candles):3d} dir={r.dir_accuracy_pct:6.2f}% n={int(r.dir_n):3d} cov={r.dir_coverage*100:5.1f}% | long={r.dir_long_accuracy*100:6.2f}% short={r.dir_short_accuracy*100:6.2f}% | mag_dir={r.mag_dir_accuracy_pct:6.2f}% corr={r.mag_corr:+.3f} r2={r.mag_r2:+.3f} mae={r.mag_mae:.6f}")
     print()
     print(f"Detailed CSV: {path}")
     print("=" * 120)
