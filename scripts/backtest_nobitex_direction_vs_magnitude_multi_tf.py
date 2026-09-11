@@ -31,19 +31,22 @@ def load(path: Path) -> pd.DataFrame:
     df["J"] = body
     df["K"] = df["high"] - df["close"]
     df["L"] = df["close"] - df["low"]
+
+    # Original body-change target, kept for diagnostics only.
     df["J_next"] = df["J"].shift(-1)
     df["U"] = df["J_next"] - df["J"]
-    df["next_body_return"] = (
-        (df["close"].shift(-1) - df["open"].shift(-1))
-        / df["open"].shift(-1)
-    )
 
-    return df.dropna(subset=["J_next", "U", "next_body_return"]).reset_index(drop=True)
+    # True trading target: current close -> next close.
+    df["close_next"] = df["close"].shift(-1)
+    df["V"] = df["close_next"] - df["close"]
+    df["next_close_return"] = df["V"] / df["close"]
+
+    return df.dropna(subset=["J_next", "U", "close_next", "V", "next_close_return"]).reset_index(drop=True)
 
 
 def fit_model(train: pd.DataFrame) -> np.ndarray:
     x = np.column_stack([np.ones(len(train)), train[["J", "K", "L"]].to_numpy(float)])
-    y = train["U"].to_numpy(float)
+    y = train["V"].to_numpy(float)
     return np.linalg.lstsq(x, y, rcond=None)[0]
 
 
@@ -74,9 +77,8 @@ def walk_forward_predictions(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         model = fit_model(train)
-        test["pred_U"] = predict(model, test)
-        test["pred_J_next"] = test["J"] + test["pred_U"]
-        test["magnitude_direction"] = np.where(test["pred_J_next"] >= 0, 1, -1)
+        test["pred_V"] = predict(model, test)
+        test["magnitude_direction"] = np.where(test["pred_V"] >= 0, 1, -1)
         parts.append(test)
 
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
@@ -86,13 +88,13 @@ def evaluate(symbol: str, timeframe: str, pred: pd.DataFrame) -> dict:
     if pred.empty:
         return {"timeframe": timeframe, "symbol": symbol, "samples": 0}
 
-    actual_direction = np.where(pred["next_body_return"] >= 0, 1, -1)
+    actual_direction = np.where(pred["V"] >= 0, 1, -1)
     formula_direction = pred["formula_direction"].to_numpy(int)
     magnitude_direction = pred["magnitude_direction"].to_numpy(int)
 
-    actual_move = pred["J_next"].to_numpy(float)
-    predicted_move = pred["pred_J_next"].to_numpy(float)
-    actual_return = pred["next_body_return"].to_numpy(float)
+    actual_move = pred["V"].to_numpy(float)
+    predicted_move = pred["pred_V"].to_numpy(float)
+    actual_return = pred["next_close_return"].to_numpy(float)
 
     formula_accuracy = (formula_direction == actual_direction).mean()
     magnitude_accuracy = (magnitude_direction == actual_direction).mean()
@@ -108,10 +110,10 @@ def evaluate(symbol: str, timeframe: str, pred: pd.DataFrame) -> dict:
     else:
         corr = np.nan
 
-    actual_open = pred["open"].shift(-1).to_numpy(float)
-    valid = np.isfinite(predicted_move) & np.isfinite(actual_move) & np.isfinite(actual_open) & (actual_open != 0)
-    error_pct = np.abs(predicted_move[valid] - actual_move[valid]) / actual_open[valid]
-    actual_abs_pct = np.abs(actual_move[valid]) / actual_open[valid]
+    current_close = pred["close"].to_numpy(float)
+    valid = np.isfinite(predicted_move) & np.isfinite(actual_move) & np.isfinite(current_close) & (current_close != 0)
+    error_pct = np.abs(predicted_move[valid] - actual_move[valid]) / np.abs(current_close[valid])
+    actual_abs_pct = np.abs(actual_move[valid]) / np.abs(current_close[valid])
 
     return {
         "timeframe": timeframe,
@@ -129,17 +131,38 @@ def evaluate(symbol: str, timeframe: str, pred: pd.DataFrame) -> dict:
     }
 
 
+def print_aggregate(tf: str, out: pd.DataFrame) -> None:
+    formula_correct = (out["formula_accuracy_pct"] / 100.0 * out["samples"]).sum()
+    magnitude_correct = (out["magnitude_direction_accuracy_pct"] / 100.0 * out["samples"]).sum()
+    total_samples = out["samples"].sum()
+
+    pooled_formula_acc = 100.0 * formula_correct / total_samples if total_samples else np.nan
+    pooled_magnitude_acc = 100.0 * magnitude_correct / total_samples if total_samples else np.nan
+
+    print(f"\n{tf} AGGREGATE:")
+    print(f"Formula direction accuracy (pooled): {pooled_formula_acc:.2f}%")
+    print(f"Formula direction accuracy (mean)  : {out['formula_accuracy_pct'].mean():.2f}%")
+    print(f"Formula gross return mean          : {out['formula_gross_return_pct'].mean():+.2f}%")
+    print(f"Magnitude direction accuracy (pooled): {pooled_magnitude_acc:.2f}%")
+    print(f"Magnitude direction accuracy (mean)  : {out['magnitude_direction_accuracy_pct'].mean():.2f}%")
+    print(f"Magnitude gross return mean          : {out['magnitude_gross_return_pct'].mean():+.2f}%")
+    print(f"Magnitude correlation mean           : {out['magnitude_corr'].mean():+.3f}")
+    print(f"Magnitude MAE mean                   : {out['magnitude_mae_pct'].mean():.3f}%")
+    print(f"Actual mean absolute move            : {out['actual_mean_abs_move_pct'].mean():.3f}%")
+
+
 def main() -> None:
     all_rows = []
 
     print("=" * 180)
-    print("NOBITEX NON-IRT | DIRECTION VS MAGNITUDE | NO COMMISSION | NEXT-CANDLE TEST")
+    print("NOBITEX NON-IRT | DIRECTION VS MAGNITUDE | NO COMMISSION | CURRENT CLOSE -> NEXT CLOSE")
     print("=" * 180)
     print("Formula direction : score <=1 SHORT | score >=2 LONG")
-    print("Magnitude model    : U = J_next - J | X = J,K,L")
-    print("Magnitude direction: sign(predicted J_next)")
-    print("Evaluation         : next candle Open -> Close")
+    print("Magnitude model    : V = Close_next - Close_current | X = J,K,L")
+    print("Magnitude direction: sign(predicted V)")
+    print("Evaluation         : current Close -> next Close")
     print("Training           : walk-forward, no future leakage")
+    print("Fee                : 0")
     print()
 
     for tf in TIMEFRAMES:
@@ -183,13 +206,7 @@ def main() -> None:
                 f"{r['magnitude_corr']:+6.3f} {r['magnitude_mae_pct']:6.3f}%"
             )
 
-        print(f"\n{tf} AGGREGATE:")
-        print(f"Formula direction accuracy : {out['formula_accuracy_pct'].mean():.2f}%")
-        print(f"Formula gross return mean   : {out['formula_gross_return_pct'].mean():+.2f}%")
-        print(f"Magnitude direction accuracy: {out['magnitude_direction_accuracy_pct'].mean():.2f}%")
-        print(f"Magnitude gross return mean : {out['magnitude_gross_return_pct'].mean():+.2f}%")
-        print(f"Magnitude correlation mean  : {out['magnitude_corr'].mean():+.3f}")
-        print(f"Magnitude MAE mean          : {out['magnitude_mae_pct'].mean():.3f}%")
+        print_aggregate(tf, out)
 
     result_df = pd.DataFrame(all_rows)
     output_dir = ROOT / "multi_tf"
