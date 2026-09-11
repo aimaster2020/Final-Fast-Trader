@@ -11,6 +11,13 @@ ROOT = Path("reports/nobitex_intraday_native")
 MIN_TRAIN = 50
 FOLDS = 5
 
+# Commission reference: 0.13% entry + 0.13% exit = 0.26% round trip.
+# This test keeps only predictions whose absolute expected move covers 50%
+# of the round-trip commission: 0.13%.
+ROUND_TRIP_FEE_PCT = 0.26
+HALF_ROUND_TRIP_FEE_PCT = ROUND_TRIP_FEE_PCT / 2.0
+HALF_ROUND_TRIP_FEE = HALF_ROUND_TRIP_FEE_PCT / 100.0
+
 
 def load(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -79,6 +86,8 @@ def walk_forward_predictions(df: pd.DataFrame) -> pd.DataFrame:
         model = fit_model(train)
         test["pred_V"] = predict(model, test)
         test["magnitude_direction"] = np.where(test["pred_V"] >= 0, 1, -1)
+        test["pred_abs_move_pct"] = np.abs(test["pred_V"]) / np.abs(test["close"]) * 100.0
+        test["magnitude_threshold"] = test["pred_abs_move_pct"] >= HALF_ROUND_TRIP_FEE_PCT
         parts.append(test)
 
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
@@ -120,6 +129,25 @@ def evaluate(symbol: str, timeframe: str, pred: pd.DataFrame) -> dict:
     error_pct = np.abs(predicted_move[valid] - actual_move[valid]) / np.abs(current_close[valid])
     actual_abs_pct = np.abs(actual_move[valid]) / np.abs(current_close[valid])
 
+    selected = pred["magnitude_threshold"].to_numpy(bool)
+    selected_n = int(selected.sum())
+    selected_coverage_pct = 100.0 * selected_n / len(pred)
+
+    if selected_n:
+        selected_actual_direction = actual_direction[selected]
+        selected_direction = magnitude_direction[selected]
+        selected_returns = magnitude_returns[selected]
+        selected_accuracy = float((selected_direction == selected_actual_direction).mean())
+        selected_gross_return = float(np.prod(1.0 + selected_returns) - 1.0)
+        selected_fee_adjusted_returns = selected_returns - ROUND_TRIP_FEE
+        selected_fee_adjusted_return = float(np.prod(1.0 + selected_fee_adjusted_returns) - 1.0)
+        selected_abs_move_pct = float(np.abs(actual_return[selected]).mean() * 100.0)
+    else:
+        selected_accuracy = np.nan
+        selected_gross_return = np.nan
+        selected_fee_adjusted_return = np.nan
+        selected_abs_move_pct = np.nan
+
     return {
         "timeframe": timeframe,
         "symbol": symbol,
@@ -133,6 +161,12 @@ def evaluate(symbol: str, timeframe: str, pred: pd.DataFrame) -> dict:
         "magnitude_corr": corr,
         "magnitude_mae_pct": error_pct.mean() * 100.0,
         "actual_mean_abs_move_pct": actual_abs_pct.mean() * 100.0,
+        "threshold_n": selected_n,
+        "threshold_coverage_pct": selected_coverage_pct,
+        "threshold_accuracy_pct": selected_accuracy * 100.0 if np.isfinite(selected_accuracy) else np.nan,
+        "threshold_gross_return_pct": selected_gross_return * 100.0 if np.isfinite(selected_gross_return) else np.nan,
+        "threshold_fee_adjusted_return_pct": selected_fee_adjusted_return * 100.0 if np.isfinite(selected_fee_adjusted_return) else np.nan,
+        "threshold_actual_mean_abs_move_pct": selected_abs_move_pct,
     }
 
 
@@ -140,17 +174,26 @@ def aggregate_metrics(out: pd.DataFrame) -> dict[str, float]:
     total_samples = int(out["samples"].sum())
     formula_correct = (out["formula_accuracy_pct"] / 100.0 * out["samples"]).sum()
     magnitude_correct = (out["magnitude_direction_accuracy_pct"] / 100.0 * out["samples"]).sum()
+    threshold_n = int(out["threshold_n"].sum())
+    threshold_correct = (
+        out["threshold_accuracy_pct"].fillna(0.0) / 100.0 * out["threshold_n"]
+    ).sum()
 
     return {
         "formula_pooled_acc": 100.0 * formula_correct / total_samples,
-        "formula_mean_acc": out["formula_accuracy_pct"].mean(),
-        "formula_mean_return": out["formula_gross_return_pct"].mean(),
         "magnitude_pooled_acc": 100.0 * magnitude_correct / total_samples,
         "magnitude_mean_acc": out["magnitude_direction_accuracy_pct"].mean(),
         "magnitude_mean_return": out["magnitude_gross_return_pct"].mean(),
         "magnitude_mean_corr": out["magnitude_corr"].mean(),
         "magnitude_mean_mae": out["magnitude_mae_pct"].mean(),
         "actual_mean_abs_move": out["actual_mean_abs_move_pct"].mean(),
+        "threshold_n": threshold_n,
+        "threshold_coverage": 100.0 * threshold_n / total_samples,
+        "threshold_pooled_acc": 100.0 * threshold_correct / threshold_n if threshold_n else np.nan,
+        "threshold_mean_acc": out.loc[out["threshold_n"] > 0, "threshold_accuracy_pct"].mean(),
+        "threshold_mean_return": out["threshold_gross_return_pct"].mean(),
+        "threshold_mean_fee_adjusted_return": out["threshold_fee_adjusted_return_pct"].mean(),
+        "threshold_mean_abs_move": out["threshold_actual_mean_abs_move_pct"].mean(),
     }
 
 
@@ -158,10 +201,11 @@ def main() -> None:
     all_rows = []
 
     print("=" * 110)
-    print("NOBITEX | MAJOR ASSETS | DIRECTION VS MAGNITUDE | NO COMMISSION")
+    print("NOBITEX | MAJOR ASSETS | MAGNITUDE THRESHOLD TEST")
     print("=" * 110)
     print("Target: current Close -> next Close | Model: V = Close_next - Close_current | X = J,K,L")
-    print("Formula: score <=1 SHORT | score >=2 LONG | Walk-forward: 5 folds | MIN_TRAIN=50")
+    print("Threshold: |predicted move| >= 0.13% = 50% of 0.26% round-trip commission")
+    print("Walk-forward: 5 folds | MIN_TRAIN=50 | Baseline has no threshold")
     print()
 
     for tf in TIMEFRAMES:
@@ -191,32 +235,33 @@ def main() -> None:
 
         out = pd.DataFrame(rows).sort_values("symbol")
         print(f"TIMEFRAME = {tf}")
-        print("SYMBOL      N    F_ACC  F_RET   M_ACC  M_RET   CORR    MAE")
+        print("SYMBOL      N   M_ACC  TH_N  COV    TH_ACC  TH_RET  TH_NET")
         print("-" * 72)
         for _, r in out.iterrows():
             print(
                 f"{r['symbol']:8s} {int(r['samples']):4d} "
-                f"{r['formula_accuracy_pct']:7.2f}% {r['formula_gross_return_pct']:+7.2f}% "
-                f"{r['magnitude_direction_accuracy_pct']:7.2f}% {r['magnitude_gross_return_pct']:+7.2f}% "
-                f"{r['magnitude_corr']:+6.3f} {r['magnitude_mae_pct']:6.3f}%"
+                f"{r['magnitude_direction_accuracy_pct']:7.2f}% "
+                f"{int(r['threshold_n']):5d} {r['threshold_coverage_pct']:6.2f}% "
+                f"{r['threshold_accuracy_pct']:7.2f}% "
+                f"{r['threshold_gross_return_pct']:+7.2f}% "
+                f"{r['threshold_fee_adjusted_return_pct']:+7.2f}%"
             )
 
         agg = aggregate_metrics(out)
         print(
-            f"AGG {tf}: F_ACC={agg['formula_pooled_acc']:.2f}% "
-            f"M_ACC={agg['magnitude_pooled_acc']:.2f}% "
-            f"F_RET={agg['formula_mean_return']:+.2f}% "
-            f"M_RET={agg['magnitude_mean_return']:+.2f}% "
-            f"CORR={agg['magnitude_mean_corr']:+.3f} "
-            f"MAE={agg['magnitude_mean_mae']:.3f}% "
-            f"MOVE={agg['actual_mean_abs_move']:.3f}%"
+            f"AGG {tf}: BASE_M_ACC={agg['magnitude_pooled_acc']:.2f}% "
+            f"TH_M_ACC={agg['threshold_pooled_acc']:.2f}% "
+            f"DELTA={agg['threshold_pooled_acc'] - agg['magnitude_pooled_acc']:+.2f}pp "
+            f"COV={agg['threshold_coverage']:.2f}% "
+            f"TH_RET={agg['threshold_mean_return']:+.2f}% "
+            f"TH_NET={agg['threshold_mean_fee_adjusted_return']:+.2f}%"
         )
         print()
 
     result_df = pd.DataFrame(all_rows)
     output_dir = ROOT / "multi_tf"
     output_dir.mkdir(parents=True, exist_ok=True)
-    output = output_dir / "direction_vs_magnitude_major_assets.csv"
+    output = output_dir / "magnitude_half_commission_threshold_major_assets.csv"
     result_df.to_csv(output, index=False)
 
     print("=" * 110)
