@@ -15,18 +15,28 @@ HOLD_MONTHS = ["2026-05", "2026-06", "2026-07", "2026-08"]
 
 def load(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
-    df.columns = [str(c).strip().lower() for c in df.columns]
+    df.columns = [str(c).strip().lower().lstrip("\ufeff") for c in df.columns]
     for c in ("open", "high", "low", "close"):
         if c not in df.columns:
             raise ValueError(f"{path}: missing {c}")
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    if "timestamp" in df.columns:
-        ts = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+
+    if "month" in df.columns:
+        month = df["month"].astype(str).str.strip()
+    elif "timestamp" in df.columns:
+        raw_ts = pd.to_numeric(df["timestamp"], errors="coerce")
+        unit = "ms" if raw_ts.dropna().median() > 10**11 else "s"
+        ts = pd.to_datetime(raw_ts, errors="coerce", unit=unit, utc=True)
+        month = ts.dt.strftime("%Y-%m").fillna("")
     elif "datetime" in df.columns:
         ts = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
+        month = ts.dt.strftime("%Y-%m").fillna("")
     else:
-        ts = pd.Series(pd.NaT, index=df.index)
-    df = df.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+        raise ValueError(f"{path}: need month, timestamp, or datetime column")
+
+    df = df.dropna(subset=["open", "high", "low", "close"])
+    month = month.loc[df.index].reset_index(drop=True)
+    df = df.reset_index(drop=True)
 
     body = df.close - df.open
     hc = df.high - df.close
@@ -45,7 +55,7 @@ def load(path: Path) -> pd.DataFrame:
     out["direction"] = direction
     out["magnitude_pct"] = magnitude / out.close
     out["body"] = body
-    out["month"] = ts.dt.strftime("%Y-%m").fillna("").values
+    out["month"] = month
     return out
 
 
