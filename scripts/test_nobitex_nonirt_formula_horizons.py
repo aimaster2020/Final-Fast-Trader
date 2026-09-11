@@ -7,11 +7,8 @@ import pandas as pd
 
 MIN_CANDLES = 100
 DEFAULT_HORIZONS = [1, 2, 3, 4, 5]
-
-# The established active non-IRT universe used in the prior Nobitex analysis
-# contains 233 markets. These three files had no usable formula signals in the
-# earlier direct formula audit, so they are excluded from this horizon test.
-EXCLUDED_NO_SIGNAL = {"DOSUSDT", "GRVTUSDT", "SLVONUSDT"}
+NO_SIGNAL_MARKETS = {"DOSUSDT", "GRVTUSDT", "SLVONUSDT"}
+UNIVERSE_REPORT = "reports/nobitex_1h/nonirt_oos_direction_magnitude_stability.csv"
 TARGET_MARKETS = 233
 
 
@@ -46,11 +43,10 @@ def load(path: Path) -> pd.DataFrame:
 
 
 def horizon_stats(df: pd.DataFrame, horizon: int, half_fee: float, round_fee: float) -> dict[str, float | int]:
-    frame = df.copy()
-    future_close = frame["close"].shift(-horizon)
-    move_pct = (future_close / frame["close"] - 1.0) * 100.0
-    signed = frame["signal_dir"] * move_pct
-    valid = frame["signal_dir"].ne(0) & move_pct.notna() & move_pct.ne(0)
+    future_close = df["close"].shift(-horizon)
+    move_pct = (future_close / df["close"] - 1.0) * 100.0
+    signed = df["signal_dir"] * move_pct
+    valid = df["signal_dir"].ne(0) & move_pct.notna() & move_pct.ne(0)
     signed = signed[valid]
     if signed.empty:
         return {"n": 0, "win": np.nan, "mean": np.nan, "median": np.nan, "half": np.nan, "round": np.nan}
@@ -64,6 +60,27 @@ def horizon_stats(df: pd.DataFrame, horizon: int, half_fee: float, round_fee: fl
     }
 
 
+def established_universe(root: Path) -> list[str]:
+    report = root / "nonirt_oos_direction_magnitude_stability.csv"
+    if report.exists():
+        try:
+            prior = pd.read_csv(report)
+            symbols = set(prior["symbol"].astype(str).str.upper())
+            symbols.update(NO_SIGNAL_MARKETS)
+            if len(symbols) == TARGET_MARKETS:
+                return sorted(symbols)
+        except Exception:
+            pass
+
+    files = sorted(
+        p for p in root.glob("*_1h.csv")
+        if not p.stem[:-3].upper().endswith("IRT")
+    )
+    symbols = [p.stem[:-3].upper() for p in files]
+    symbols = sorted(set(symbols) | NO_SIGNAL_MARKETS)
+    return symbols[:TARGET_MARKETS]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Test the fixed Nobitex formula across multiple holding horizons.")
     ap.add_argument("--data-dir", default="reports/nobitex_1h")
@@ -73,51 +90,46 @@ def main() -> None:
     ap.add_argument("--output", default="reports/nobitex_1h/nonirt_formula_horizons.csv")
     args = ap.parse_args()
 
-    horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
     root = Path(args.data_dir)
-    files = sorted(
-        p
-        for p in root.glob("*_1h.csv")
-        if not p.stem[:-3].upper().endswith("IRT")
-        and p.stem.upper() not in EXCLUDED_NO_SIGNAL
-    )
+    horizons = [int(x) for x in args.horizons.split(",") if x.strip()]
+    universe = established_universe(root)
+    if len(universe) != TARGET_MARKETS:
+        raise SystemExit(f"Expected the established 233-market universe, found {len(universe)} symbols.")
 
     rows: list[dict[str, float | int | str]] = []
-    tested_symbols: set[str] = set()
+    path_map = {p.stem[:-3].upper(): p for p in root.glob("*_1h.csv")}
 
-    for path in files:
-        symbol = path.stem[:-3]
+    for symbol in universe:
+        path = path_map.get(symbol)
+        if path is None:
+            continue
         try:
             df = load(path)
             if len(df) < MIN_CANDLES:
                 continue
-            symbol_had_signal = False
             for horizon in horizons:
                 s = horizon_stats(df, horizon, args.half_fee, args.round_fee)
                 if not s["n"]:
                     continue
-                symbol_had_signal = True
                 rows.append({"symbol": symbol, "horizon": horizon, **s})
-            if symbol_had_signal:
-                tested_symbols.add(symbol)
         except Exception:
             continue
 
     out = pd.DataFrame(rows)
     if out.empty:
         raise SystemExit("No valid markets.")
-
     out.to_csv(args.output, index=False)
 
     print("=" * 110)
     print("NOBITEX NON-IRT | FORMULA HORIZON TEST")
     print("=" * 110)
-    print(f"Markets found       : {len(files) + len(EXCLUDED_NO_SIGNAL)}")
-    print(f"Established universe: {TARGET_MARKETS}")
-    print(f"Markets tested      : {len(tested_symbols)}")
-    print("Entry               : current candle close")
-    print("Exit                : close of the horizon candle")
-    print("Signal              : fixed formula + ambiguity filter")
+    print(f"Established universe : {TARGET_MARKETS} markets")
+    print(f"Markets with data    : {out.symbol.nunique()}")
+    print("Entry                : current candle close")
+    print("Exit                 : close of the horizon candle")
+    print("Horizon              : 1, 2, 3, 4, 5 x 1H")
+    print("Signal                : fixed formula + ambiguity filter")
+    print("Fees reference       : 0.13% half-fee / 0.26% round-trip")
     print()
 
     summary = []
