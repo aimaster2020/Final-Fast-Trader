@@ -72,12 +72,8 @@ def established_universe(root: Path) -> list[str]:
         except Exception:
             pass
 
-    files = sorted(
-        p for p in root.glob("*_1h.csv")
-        if not p.stem[:-3].upper().endswith("IRT")
-    )
-    symbols = [p.stem[:-3].upper() for p in files]
-    symbols = sorted(set(symbols) | NO_SIGNAL_MARKETS)
+    files = sorted(p for p in root.glob("*_1h.csv") if not p.stem[:-3].upper().endswith("IRT"))
+    symbols = sorted(set(p.stem[:-3].upper() for p in files) | NO_SIGNAL_MARKETS)
     return symbols[:TARGET_MARKETS]
 
 
@@ -120,15 +116,15 @@ def main() -> None:
         raise SystemExit("No valid markets.")
     out.to_csv(args.output, index=False)
 
-    print("=" * 110)
+    print("=" * 140)
     print("NOBITEX NON-IRT | FORMULA HORIZON TEST")
-    print("=" * 110)
+    print("=" * 140)
     print(f"Established universe : {TARGET_MARKETS} markets")
     print(f"Markets with data    : {out.symbol.nunique()}")
     print("Entry                : current candle close")
-    print("Exit                 : close of the horizon candle")
+    print("Exit                 : close after H candles")
     print("Horizon              : 1, 2, 3, 4, 5 x 1H")
-    print("Signal                : fixed formula + ambiguity filter")
+    print("Signal               : fixed formula + ambiguity filter")
     print("Fees reference       : 0.13% half-fee / 0.26% round-trip")
     print()
 
@@ -146,8 +142,8 @@ def main() -> None:
             "round_ge50": int((x["round"] >= 50).sum()),
             "mean_trades": x.n.mean(),
         })
-
     s = pd.DataFrame(summary)
+
     print("ALL-233-MARKET SUMMARY")
     print("H  markets  mean_win  median_win  >=55%  mean_move  half>=50  round>=50  mean_trades")
     for _, r in s.iterrows():
@@ -156,6 +152,27 @@ def main() -> None:
             f"{int(r.mkt_ge55):>5d}  {r.mean_move:>+9.3f}%  {int(r.half_ge50):>9d}  "
             f"{int(r.round_ge50):>9d}  {r.mean_trades:>11.1f}"
         )
+
+    print()
+    print("ALL-233-MARKET DETAIL")
+    print("symbol               | H1 win/mean/round | H2 win/mean/round | H3 win/mean/round | H4 win/mean/round | H5 win/mean/round")
+    print("-" * 140)
+
+    pivot = out.pivot(index="symbol", columns="horizon", values=["win", "mean", "round"])
+    pivot = pivot.sort_index()
+    for symbol, row in pivot.iterrows():
+        parts = [symbol.ljust(20), "|"]
+        for h in horizons:
+            try:
+                win = float(row[("win", h)])
+                mean = float(row[("mean", h)])
+                rnd = float(row[("round", h)])
+                parts.append(f" H{h} {win:5.1f}%/{mean:+.3f}%/{rnd:5.1f}% ")
+            except Exception:
+                parts.append(f" H{h}   --/----/--- ")
+            if h != horizons[-1]:
+                parts.append("|")
+        print("".join(parts))
 
     print()
     print("SELECTED MAJOR MARKETS")
@@ -171,16 +188,8 @@ def main() -> None:
             )
 
     print()
-    print("TOP MARKETS BY HORIZON")
-    for h in horizons:
-        x = out[out.horizon == h].sort_values(["win", "n"], ascending=[False, False]).head(10)
-        print(f"H{h}:")
-        for _, r in x.iterrows():
-            print(f"  {r.symbol:18s} n={int(r.n):4d} win={r.win:6.2f}% move={r['mean']:+.3f}% round={r['round']:6.2f}%")
-
-    print()
     print(f"Detailed CSV: {args.output}")
-    print("=" * 110)
+    print("=" * 140)
 
 
 if __name__ == "__main__":
