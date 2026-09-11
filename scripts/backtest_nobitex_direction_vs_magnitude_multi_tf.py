@@ -16,6 +16,7 @@ FOLDS = 5
 # of the round-trip commission: 0.13%.
 ROUND_TRIP_FEE_PCT = 0.26
 HALF_ROUND_TRIP_FEE_PCT = ROUND_TRIP_FEE_PCT / 2.0
+ROUND_TRIP_FEE = ROUND_TRIP_FEE_PCT / 100.0
 HALF_ROUND_TRIP_FEE = HALF_ROUND_TRIP_FEE_PCT / 100.0
 
 
@@ -98,21 +99,13 @@ def evaluate(symbol: str, timeframe: str, pred: pd.DataFrame) -> dict:
         return {"timeframe": timeframe, "symbol": symbol, "samples": 0}
 
     actual_direction = np.where(pred["V"] >= 0, 1, -1)
-    formula_direction = pred["formula_direction"].to_numpy(int)
     magnitude_direction = pred["magnitude_direction"].to_numpy(int)
-
     actual_move = pred["V"].to_numpy(float)
     predicted_move = pred["pred_V"].to_numpy(float)
     actual_return = pred["next_close_return"].to_numpy(float)
-
-    formula_accuracy = (formula_direction == actual_direction).mean()
     magnitude_accuracy = (magnitude_direction == actual_direction).mean()
 
-    formula_returns = formula_direction * actual_return
     magnitude_returns = magnitude_direction * actual_return
-
-    formula_return = np.prod(1.0 + formula_returns) - 1.0
-    magnitude_return = np.prod(1.0 + magnitude_returns) - 1.0
 
     if np.std(predicted_move) > 0 and np.std(actual_move) > 0:
         corr = float(np.corrcoef(predicted_move, actual_move)[0, 1])
@@ -142,22 +135,20 @@ def evaluate(symbol: str, timeframe: str, pred: pd.DataFrame) -> dict:
         selected_fee_adjusted_returns = selected_returns - ROUND_TRIP_FEE
         selected_fee_adjusted_return = float(np.prod(1.0 + selected_fee_adjusted_returns) - 1.0)
         selected_abs_move_pct = float(np.abs(actual_return[selected]).mean() * 100.0)
+        selected_mean_predicted_move_pct = float(np.abs(predicted_move[selected] / current_close[selected]).mean() * 100.0)
     else:
         selected_accuracy = np.nan
         selected_gross_return = np.nan
         selected_fee_adjusted_return = np.nan
         selected_abs_move_pct = np.nan
+        selected_mean_predicted_move_pct = np.nan
 
     return {
         "timeframe": timeframe,
         "symbol": symbol,
         "samples": len(pred),
-        "formula_accuracy_pct": formula_accuracy * 100.0,
-        "formula_gross_return_pct": formula_return * 100.0,
-        "formula_mean_trade_pct": formula_returns.mean() * 100.0,
         "magnitude_direction_accuracy_pct": magnitude_accuracy * 100.0,
-        "magnitude_gross_return_pct": magnitude_return * 100.0,
-        "magnitude_mean_trade_pct": magnitude_returns.mean() * 100.0,
+        "magnitude_gross_return_pct": (np.prod(1.0 + magnitude_returns) - 1.0) * 100.0,
         "magnitude_corr": corr,
         "magnitude_mae_pct": error_pct.mean() * 100.0,
         "actual_mean_abs_move_pct": actual_abs_pct.mean() * 100.0,
@@ -167,33 +158,31 @@ def evaluate(symbol: str, timeframe: str, pred: pd.DataFrame) -> dict:
         "threshold_gross_return_pct": selected_gross_return * 100.0 if np.isfinite(selected_gross_return) else np.nan,
         "threshold_fee_adjusted_return_pct": selected_fee_adjusted_return * 100.0 if np.isfinite(selected_fee_adjusted_return) else np.nan,
         "threshold_actual_mean_abs_move_pct": selected_abs_move_pct,
+        "threshold_mean_predicted_abs_move_pct": selected_mean_predicted_move_pct,
     }
 
 
 def aggregate_metrics(out: pd.DataFrame) -> dict[str, float]:
     total_samples = int(out["samples"].sum())
-    formula_correct = (out["formula_accuracy_pct"] / 100.0 * out["samples"]).sum()
     magnitude_correct = (out["magnitude_direction_accuracy_pct"] / 100.0 * out["samples"]).sum()
     threshold_n = int(out["threshold_n"].sum())
     threshold_correct = (
         out["threshold_accuracy_pct"].fillna(0.0) / 100.0 * out["threshold_n"]
     ).sum()
 
+    base_acc = 100.0 * magnitude_correct / total_samples
+    threshold_acc = 100.0 * threshold_correct / threshold_n if threshold_n else np.nan
+
     return {
-        "formula_pooled_acc": 100.0 * formula_correct / total_samples,
-        "magnitude_pooled_acc": 100.0 * magnitude_correct / total_samples,
-        "magnitude_mean_acc": out["magnitude_direction_accuracy_pct"].mean(),
-        "magnitude_mean_return": out["magnitude_gross_return_pct"].mean(),
-        "magnitude_mean_corr": out["magnitude_corr"].mean(),
-        "magnitude_mean_mae": out["magnitude_mae_pct"].mean(),
-        "actual_mean_abs_move": out["actual_mean_abs_move_pct"].mean(),
+        "magnitude_pooled_acc": base_acc,
+        "threshold_pooled_acc": threshold_acc,
+        "delta_pp": threshold_acc - base_acc if np.isfinite(threshold_acc) else np.nan,
         "threshold_n": threshold_n,
-        "threshold_coverage": 100.0 * threshold_n / total_samples,
-        "threshold_pooled_acc": 100.0 * threshold_correct / threshold_n if threshold_n else np.nan,
-        "threshold_mean_acc": out.loc[out["threshold_n"] > 0, "threshold_accuracy_pct"].mean(),
-        "threshold_mean_return": out["threshold_gross_return_pct"].mean(),
-        "threshold_mean_fee_adjusted_return": out["threshold_fee_adjusted_return_pct"].mean(),
-        "threshold_mean_abs_move": out["threshold_actual_mean_abs_move_pct"].mean(),
+        "threshold_coverage": 100.0 * threshold_n / total_samples if total_samples else np.nan,
+        "threshold_mean_return": out.loc[out["threshold_n"] > 0, "threshold_gross_return_pct"].mean(),
+        "threshold_mean_fee_adjusted_return": out.loc[out["threshold_n"] > 0, "threshold_fee_adjusted_return_pct"].mean(),
+        "threshold_mean_abs_move": out.loc[out["threshold_n"] > 0, "threshold_actual_mean_abs_move_pct"].mean(),
+        "threshold_mean_predicted_abs_move": out.loc[out["threshold_n"] > 0, "threshold_mean_predicted_abs_move_pct"].mean(),
     }
 
 
@@ -251,7 +240,7 @@ def main() -> None:
         print(
             f"AGG {tf}: BASE_M_ACC={agg['magnitude_pooled_acc']:.2f}% "
             f"TH_M_ACC={agg['threshold_pooled_acc']:.2f}% "
-            f"DELTA={agg['threshold_pooled_acc'] - agg['magnitude_pooled_acc']:+.2f}pp "
+            f"DELTA={agg['delta_pp']:+.2f}pp "
             f"COV={agg['threshold_coverage']:.2f}% "
             f"TH_RET={agg['threshold_mean_return']:+.2f}% "
             f"TH_NET={agg['threshold_mean_fee_adjusted_return']:+.2f}%"
