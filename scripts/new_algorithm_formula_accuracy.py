@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 from pathlib import Path
 
 DEFAULT_FEE_PCT = 0.26
@@ -289,6 +290,8 @@ def main() -> None:
         stable = [r for r in subset if int(r["trades"]) >= args.min_trades]
         print(f"\nBEST {mode} WITH >= {args.min_trades} TRADES")
         for r in sorted(stable, key=sort_key, reverse=True)[:10]:
+            pf = r["profit_factor"]
+            pf_text = "inf" if math.isinf(float(pf)) else f"{float(pf):.3f}"
             print(
                 f"H={int(r['horizon'])} | threshold={float(r['threshold']):.2f}% | "
                 f"score>={int(r['min_score'])} | trades={int(r['trades'])} | "
@@ -296,7 +299,7 @@ def main() -> None:
                 f"avg_net={float(r['avg_net']):.5f}% | "
                 f"sum_net={float(r['sum_net']):.5f}% | "
                 f"compounded={float(r['compounded_net']):.5f}% | "
-                f"PF={('inf' if math.isinf(float(r['profit_factor'])) else f'{float(r['profit_factor']):.3f}')} | "
+                f"PF={pf_text} | "
                 f"maxDD={float(r['max_drawdown']):.3f}%"
             )
 
@@ -304,6 +307,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import math
-
     main()
