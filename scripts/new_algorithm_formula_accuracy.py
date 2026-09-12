@@ -28,8 +28,8 @@ def read_ohlc(path: Path) -> list[dict[str, float]]:
             except (TypeError, ValueError):
                 continue
 
-    if len(rows) < 2:
-        raise ValueError("Need at least 2 valid OHLC rows")
+    if len(rows) < 4:
+        raise ValueError("Need at least 4 valid OHLC rows")
     return rows
 
 
@@ -38,8 +38,9 @@ def b(value: bool) -> int:
 
 
 def calculate(rows: list[dict[str, float]], threshold_pct: float) -> list[dict[str, float | int | None]]:
-    """Reproduce the supplied Excel N:AE logic as written."""
-    out: list[dict[str, float | int | None]] = []
+    """Reproduce the supplied Excel logic, with the final prediction taken from column F."""
+    # First calculate the per-candle U values from the supplied N:AD rules.
+    base: list[dict[str, float | int | None]] = []
 
     for i, row in enumerate(rows):
         open_ = row["open"]
@@ -53,13 +54,7 @@ def calculate(rows: list[dict[str, float]], threshold_pct: float) -> list[dict[s
         lc = close - low
         ho = high - open_
 
-        # Excel:
-        # N = --(H>G)
-        # O = 0
-        # P = --(H>J)
-        # R = --(H<G)
-        # S = 0
-        # T = --(H<J)
+        # Excel N: T exactly as supplied.
         n = b(hc > co)
         o = 0
         p = b(hc > ho)
@@ -67,35 +62,65 @@ def calculate(rows: list[dict[str, float]], threshold_pct: float) -> list[dict[s
         s = 0
         t = b(hc < ho)
 
-        # Exact supplied Excel AD formula:
-        # =IF(OR(N="",O="",P="",R="",S="",T=""),"",IF(AND(SUM(N:P)=2,(C-B)>50),1,IF(AND(SUM(R:T)=2,(D-B))<50,-1,0)))
-        # The bearish comparison is outside AND(). Excel therefore compares
-        # the TRUE/FALSE result of AND(...) with 50; both 1 and 0 are < 50.
-        # Consequently, the bearish branch is selected whenever SUM(R:T)=2.
+        # Exact AD formula as supplied. The misplaced closing parenthesis
+        # means the bearish branch is selected whenever SUM(R:T)=2.
         if (n + o + p == 2) and ((high - open_) > 50):
             ad = 1
-        elif (r + s + t == 2):
+        elif r + s + t == 2:
             ad = -1
         else:
             ad = 0
 
-        # Excel U:
-        # =IF(OR(AD="",B="",C="",D="",E=""),"",IF(AD=1,C-B+E,IF(AD=-1,D-B+E,IF(AD=0,B,""))))
+        # Excel U formula.
         if ad == 1:
-            predicted_close = high - open_ + close
+            u = high - open_ + close
         elif ad == -1:
-            predicted_close = low - open_ + close
+            u = low - open_ + close
         else:
-            predicted_close = open_
+            u = open_
 
-        # Excel Q: valid flag.
-        q = 1 if next_close is not None else None
+        base.append({
+            **row,
+            "CO": co,
+            "HC": hc,
+            "LC": lc,
+            "HO": ho,
+            "N": n,
+            "O": o,
+            "P": p,
+            "R": r,
+            "S": s,
+            "T": t,
+            "U": u,
+            "AD": ad,
+            "NEXT_CLOSE": next_close,
+        })
+
+    out: list[dict[str, float | int | None]] = []
+
+    # Excel F formula supplied for row 25:
+    # =IF(E25-B25>0,AVERAGE(U23:U25),IF(E25-B25<0,AVERAGE(D23:D25),E25))
+    # Therefore F uses the current candle plus the prior two candles.
+    for i, row in enumerate(base):
+        close = float(row["close"])
+        open_ = float(row["open"])
+        next_close = row["NEXT_CLOSE"]
+
+        if i >= 2:
+            if close - open_ > 0:
+                predicted_close = sum(float(base[j]["U"]) for j in range(i - 2, i + 1)) / 3.0
+            elif close - open_ < 0:
+                predicted_close = sum(float(base[j]["low"]) for j in range(i - 2, i + 1)) / 3.0
+            else:
+                predicted_close = close
+        else:
+            predicted_close = None
 
         v = w = x = y = z = aa = ab = ac = ae = None
-        if q == 1:
+        if predicted_close is not None and next_close is not None:
             predicted_move = predicted_close - close
+            actual_move = float(next_close) - close
             predicted_move_pct = abs(predicted_move) / abs(close) * 100 if close != 0 else None
-            actual_move = next_close - close
             actual_move_pct = abs(actual_move) / abs(close) * 100 if close != 0 else None
 
             w = predicted_move
@@ -109,51 +134,38 @@ def calculate(rows: list[dict[str, float]], threshold_pct: float) -> list[dict[s
                 aa = abs(x - z)
                 ab = b((x >= threshold_pct) == (z >= threshold_pct))
 
-            ac = 1 if ad > 0 else (-1 if ad < 0 else 0)
+            ad = int(row["AD"])
+            ac = 1 if predicted_move > 0 else (-1 if predicted_move < 0 else 0)
             actual_direction = 1 if actual_move > 0 else (-1 if actual_move < 0 else 0)
-            ae = 0 if ad == 0 or actual_direction == 0 else b(ad == actual_direction)
+            ae = 0 if actual_direction == 0 or ac == 0 else b(ac == actual_direction)
 
-        out.append(
-            {
-                **row,
-                "CO": co,
-                "HC": hc,
-                "LC": lc,
-                "HO": ho,
-                "N": n,
-                "O": o,
-                "P": p,
-                "Q": q,
-                "R": r,
-                "S": s,
-                "T": t,
-                "U": predicted_close,
-                "V": v,
-                "W": w,
-                "X": x,
-                "Y": y,
-                "Z": z,
-                "AA": aa,
-                "AB": ab,
-                "AC": ac,
-                "AD": ad,
-                "AE": ae,
-            }
-        )
+        out.append({
+            **row,
+            "F": predicted_close,
+            "V": v,
+            "W": w,
+            "X": x,
+            "Y": y,
+            "Z": z,
+            "AA": aa,
+            "AB": ab,
+            "AC": ac,
+            "AE": ae,
+        })
 
     return out
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Test the supplied Excel candle direction + move formula")
+    ap = argparse.ArgumentParser(description="Test the supplied Excel prediction formula using column F")
     ap.add_argument("--input", required=True)
     ap.add_argument("--threshold-pct", type=float, default=DEFAULT_THRESHOLD_PCT)
     args = ap.parse_args()
 
     data = calculate(read_ohlc(Path(args.input)), args.threshold_pct)
 
-    test_rows = [r for r in data if r["AD"] is not None]
-    direction_rows = [r for r in test_rows if r["AD"] != 0 and r["AE"] is not None]
+    test_rows = [r for r in data if r["F"] is not None and r["Y"] is not None]
+    direction_rows = [r for r in test_rows if r["AC"] != 0 and r["AE"] is not None]
     magnitude_rows = [r for r in test_rows if r["AB"] is not None]
     threshold_rows = [r for r in test_rows if r["V"] == 1]
 
@@ -163,9 +175,10 @@ def main() -> None:
     direction_accuracy = direction_correct / len(direction_rows) if direction_rows else 0.0
     magnitude_accuracy = magnitude_correct / len(magnitude_rows) if magnitude_rows else 0.0
     threshold_coverage = len(threshold_rows) / len(test_rows) if test_rows else 0.0
-
-    precision_numerator = sum(int(r["AB"] == 1) for r in threshold_rows)
-    threshold_precision = precision_numerator / len(threshold_rows) if threshold_rows else 0.0
+    threshold_precision = (
+        sum(int(r["AB"] == 1) for r in threshold_rows) / len(threshold_rows)
+        if threshold_rows else 0.0
+    )
 
     predicted_pct = [float(r["X"]) for r in threshold_rows if r["X"] is not None]
     actual_pct = [float(r["Z"]) for r in threshold_rows if r["Z"] is not None]
@@ -173,7 +186,7 @@ def main() -> None:
     avg_actual = sum(actual_pct) / len(actual_pct) if actual_pct else 0.0
 
     print("=" * 72)
-    print("NEW ALGORITHM FORMULA ACCURACY - EXCEL EXACT")
+    print("NEW ALGORITHM FORMULA ACCURACY - COLUMN F")
     print("=" * 72)
     print(f"input               : {args.input}")
     print(f"OHLC rows           : {len(data)}")
