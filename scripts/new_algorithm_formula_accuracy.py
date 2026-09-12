@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 DEFAULT_THRESHOLD_PCT = 0.26
+DEFAULT_ROUND_TRIP_FEE_PCT = 0.26
 
 
 def norm(name: str) -> str:
@@ -96,7 +97,13 @@ def build_f(rows: list[dict[str, float]]) -> list[float | None]:
     return f
 
 
-def evaluate(rows: list[dict[str, float]], predictions: list[float | None], horizon: int, threshold_pct: float) -> dict[str, float | int]:
+def evaluate(
+    rows: list[dict[str, float]],
+    predictions: list[float | None],
+    horizon: int,
+    threshold_pct: float,
+    round_trip_fee_pct: float,
+) -> dict[str, float | int]:
     test_rows: list[tuple[float, float, float]] = []
 
     for i, predicted_close in enumerate(predictions):
@@ -110,7 +117,6 @@ def evaluate(rows: list[dict[str, float]], predictions: list[float | None], hori
         actual_close = rows[target_i]["close"]
         predicted_move = float(predicted_close) - current_close
         actual_move = actual_close - current_close
-
         test_rows.append((predicted_move, actual_move, current_close))
 
     direction_rows = [r for r in test_rows if r[0] != 0 and r[1] != 0]
@@ -125,6 +131,10 @@ def evaluate(rows: list[dict[str, float]], predictions: list[float | None], hori
     pred_pct_sum = 0.0
     actual_pct_sum = 0.0
 
+    gross_profit_sum = 0.0
+    net_profit_sum = 0.0
+    wins_net = 0
+
     for predicted_move, actual_move, current_close in magnitude_rows:
         pred_pct = abs(predicted_move) / abs(current_close) * 100.0
         actual_pct = abs(actual_move) / abs(current_close) * 100.0
@@ -136,11 +146,23 @@ def evaluate(rows: list[dict[str, float]], predictions: list[float | None], hori
             pred_pct_sum += pred_pct
             actual_pct_sum += actual_pct
 
+            # Trade in the direction predicted by F and hold for the selected horizon.
+            direction = 1.0 if predicted_move > 0 else (-1.0 if predicted_move < 0 else 0.0)
+            gross_return_pct = direction * (actual_move / current_close) * 100.0
+            net_return_pct = gross_return_pct - round_trip_fee_pct
+
+            gross_profit_sum += gross_return_pct
+            net_profit_sum += net_return_pct
+            wins_net += b(net_return_pct > 0)
+
     magnitude_accuracy = magnitude_correct / len(magnitude_rows) if magnitude_rows else 0.0
     coverage = threshold_rows / len(magnitude_rows) if magnitude_rows else 0.0
     precision = threshold_correct / threshold_rows if threshold_rows else 0.0
     avg_predicted = pred_pct_sum / threshold_rows if threshold_rows else 0.0
     avg_actual = actual_pct_sum / threshold_rows if threshold_rows else 0.0
+    avg_gross_profit = gross_profit_sum / threshold_rows if threshold_rows else 0.0
+    avg_net_profit = net_profit_sum / threshold_rows if threshold_rows else 0.0
+    win_rate_net = wins_net / threshold_rows if threshold_rows else 0.0
 
     return {
         "test_n": len(test_rows),
@@ -155,13 +177,18 @@ def evaluate(rows: list[dict[str, float]], predictions: list[float | None], hori
         "threshold_precision": precision,
         "avg_predicted": avg_predicted,
         "avg_actual": avg_actual,
+        "avg_gross_profit": avg_gross_profit,
+        "avg_net_profit": avg_net_profit,
+        "total_net_profit": net_profit_sum,
+        "win_rate_net": win_rate_net,
     }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Test supplied Excel column-F prediction across horizons")
+    ap = argparse.ArgumentParser(description="Test supplied Excel column-F prediction across horizons with profit metrics")
     ap.add_argument("--input", required=True)
     ap.add_argument("--threshold-pct", type=float, default=DEFAULT_THRESHOLD_PCT)
+    ap.add_argument("--round-trip-fee-pct", type=float, default=DEFAULT_ROUND_TRIP_FEE_PCT)
     ap.add_argument("--horizons", default="1,2,3,4,5")
     args = ap.parse_args()
 
@@ -172,35 +199,40 @@ def main() -> None:
     rows = read_ohlc(Path(args.input))
     predictions = build_f(rows)
 
-    print("=" * 118)
-    print("NEW ALGORITHM FORMULA ACCURACY - COLUMN F - HORIZON SWEEP")
-    print("=" * 118)
+    print("=" * 150)
+    print("NEW ALGORITHM FORMULA - COLUMN F - PROFIT HORIZON SWEEP")
+    print("=" * 150)
     print(f"input={args.input}")
     print(f"OHLC rows={len(rows)}")
     print(f"threshold={args.threshold_pct:.4f}%")
-    print("F is fixed; only target horizon changes: Close[t+horizon]")
-    print("-" * 118)
-    print("H  TestN  DirN  DirCorrect  DirAcc%  MagN  MagCorrect  MagAcc%  ThrN  Coverage%  Precision%  AvgPred%  AvgActual%")
+    print(f"round-trip fee={args.round_trip_fee_pct:.4f}%")
+    print("F is fixed; entry only when |F-Close| >= threshold; direction = sign(F-Close)")
+    print("profit target = Close[t+horizon]; net return = directional return - round-trip fee")
+    print("-" * 150)
+    print(
+        "H  TestN  ThrN  Coverage%  Precision%  DirAcc%  MagAcc%  "
+        "AvgPred%  AvgActual%  AvgGross%  AvgNet%  WinRateNet%  TotalNet%"
+    )
 
     for horizon in horizons:
-        m = evaluate(rows, predictions, horizon, args.threshold_pct)
+        m = evaluate(rows, predictions, horizon, args.threshold_pct, args.round_trip_fee_pct)
         print(
             f"{horizon:>1}  "
             f"{m['test_n']:>6}  "
-            f"{m['direction_n']:>5}  "
-            f"{m['direction_correct']:>10}  "
-            f"{m['direction_accuracy'] * 100:>7.2f}  "
-            f"{m['magnitude_n']:>4}  "
-            f"{m['magnitude_correct']:>10}  "
-            f"{m['magnitude_accuracy'] * 100:>8.2f}  "
             f"{m['threshold_n']:>4}  "
-            f"{m['threshold_coverage'] * 100:>10.2f}  "
-            f"{m['threshold_precision'] * 100:>11.2f}  "
+            f"{m['threshold_coverage'] * 100:>9.2f}  "
+            f"{m['threshold_precision'] * 100:>10.2f}  "
+            f"{m['direction_accuracy'] * 100:>7.2f}  "
+            f"{m['magnitude_accuracy'] * 100:>7.2f}  "
             f"{m['avg_predicted']:>9.6f}  "
-            f"{m['avg_actual']:>10.6f}"
+            f"{m['avg_actual']:>10.6f}  "
+            f"{m['avg_gross_profit']:>9.6f}  "
+            f"{m['avg_net_profit']:>8.6f}  "
+            f"{m['win_rate_net'] * 100:>11.2f}  "
+            f"{m['total_net_profit']:>10.4f}"
         )
 
-    print("=" * 118)
+    print("=" * 150)
 
 
 if __name__ == "__main__":
