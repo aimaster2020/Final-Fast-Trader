@@ -37,7 +37,6 @@ def build_signals(rows: list[dict[str, float]]) -> list[dict[str, float | int | 
         hc = h - c
         lc = c - l
         ho = h - o
-
         n = int(hc > co)
         oo = int(lc > co)
         p = int(hc > ho)
@@ -46,14 +45,12 @@ def build_signals(rows: list[dict[str, float]]) -> list[dict[str, float | int | 
         t = int(hc < ho)
         ac = 2 * n + oo + p - 2 * r - s - t
         ad = 1 if ac > 0 else -1 if ac < 0 else 0
-
         if ad == 1:
             u = h - o + c
         elif ad == -1:
             u = l - o + c
         else:
             u = None
-
         x = abs(u - c) / abs(c) * 100.0 if u is not None and c != 0 else None
         out.append({"index": i, "ac": ac, "ad": ad, "x": x})
     return out
@@ -66,17 +63,8 @@ def parse_list(value: str, cast):
     return result
 
 
-def collect_trades(
-    rows: list[dict[str, float]],
-    signals: list[dict[str, float | int | None]],
-    start: int,
-    end: int,
-    horizon: int,
-    threshold: float,
-    fee_pct: float,
-    min_score: int,
-) -> list[dict[str, float | int]]:
-    trades: list[dict[str, float | int]] = []
+def collect_trades(rows, signals, start, end, horizon, threshold, fee_pct, min_score):
+    trades = []
     next_free = start
     for sig in signals:
         i = int(sig["index"])
@@ -85,18 +73,15 @@ def collect_trades(
         target = i + horizon
         if target >= end:
             continue
-
         ad = int(sig["ad"])
         ac = int(sig["ac"])
         pred = sig["x"]
         if ad == 0 or pred is None or abs(ac) < min_score or float(pred) < threshold:
             continue
-
         entry = rows[i]["close"]
         exit_ = rows[target]["close"]
         if entry == 0:
             continue
-
         gross = ad * (exit_ - entry) / entry * 100.0
         net = gross - fee_pct
         trades.append({"index": i, "gross_pct": gross, "net_pct": net})
@@ -104,15 +89,13 @@ def collect_trades(
     return trades
 
 
-def metrics(trades: list[dict[str, float | int]]) -> dict[str, float | int]:
+def metrics(trades):
     if not trades:
         return {"trades": 0, "win_rate": 0.0, "avg_net": 0.0, "sum_net": 0.0, "compounded_net": 0.0, "profit_factor": 0.0, "max_drawdown": 0.0}
-
     nets = [float(t["net_pct"]) for t in trades]
     wins = sum(1 for x in nets if x > 0)
     gains = sum(x for x in nets if x > 0)
     losses = -sum(x for x in nets if x < 0)
-
     equity = 1.0
     peak = 1.0
     max_dd = 0.0
@@ -120,7 +103,6 @@ def metrics(trades: list[dict[str, float | int]]) -> dict[str, float | int]:
         equity *= 1.0 + net / 100.0
         peak = max(peak, equity)
         max_dd = max(max_dd, (peak - equity) / peak)
-
     return {
         "trades": len(nets),
         "win_rate": wins / len(nets),
@@ -132,13 +114,12 @@ def metrics(trades: list[dict[str, float | int]]) -> dict[str, float | int]:
     }
 
 
-def rank_key(r: dict[str, float | int]) -> tuple[float, float, float, int]:
-    return (
-        float(r["compounded_net"]),
-        float(r["sum_net"]),
-        float(r["profit_factor"]),
-        int(r["trades"]),
-    )
+def rank_key(r):
+    return (float(r["compounded_net"]), float(r["sum_net"]), float(r["profit_factor"]), int(r["trades"]))
+
+
+def pf_text(value: float) -> str:
+    return "inf" if math.isinf(value) else f"{value:.3f}"
 
 
 def main() -> None:
@@ -151,17 +132,14 @@ def main() -> None:
     ap.add_argument("--min-train-trades", type=int, default=10)
     ap.add_argument("--top", type=int, default=20)
     args = ap.parse_args()
-
     if not 0.3 <= args.train_frac <= 0.7:
         raise ValueError("--train-frac should normally be between 0.30 and 0.70")
-
     rows = read_ohlc(Path(args.input))
     signals = build_signals(rows)
     thresholds = parse_list(args.thresholds, float)
     horizons = parse_list(args.horizons, int)
     if any(h < 1 for h in horizons):
         raise ValueError("All horizons must be >= 1")
-
     split = int(len(rows) * args.train_frac)
     if split <= max(horizons):
         raise ValueError("Training section is too small for the selected horizons")
@@ -177,7 +155,7 @@ def main() -> None:
     print("Mode: NON_OVERLAP; trades must open and close entirely inside their section.")
     print("=" * 150)
 
-    candidates: list[dict[str, float | int]] = []
+    candidates = []
     for horizon in horizons:
         for threshold in thresholds:
             for min_score in (1, 2, 3, 4):
@@ -186,14 +164,13 @@ def main() -> None:
                 if int(m["trades"]) < args.min_train_trades:
                     continue
                 candidates.append({"horizon": horizon, "threshold": threshold, "min_score": min_score, **m})
-
     if not candidates:
         raise ValueError("No training configuration reached --min-train-trades")
-
     candidates.sort(key=rank_key, reverse=True)
+
     print(f"\nTOP {args.top} TRAIN CANDIDATES")
     for r in candidates[: args.top]:
-        pf = "inf" if math.isinf(float(r["profit_factor"])) else f"{float(r['profit_factor']):.3f}"
+        pf = pf_text(float(r["profit_factor"]))
         print(
             f"H={int(r['horizon']):>2} | thr={float(r['threshold']):.2f}% | score>={int(r['min_score'])} | "
             f"trades={int(r['trades']):>3} | win={float(r['win_rate'])*100:>6.2f}% | "
@@ -205,17 +182,16 @@ def main() -> None:
     h = int(best["horizon"])
     threshold = float(best["threshold"])
     min_score = int(best["min_score"])
-
     oos_trades = collect_trades(rows, signals, split, len(rows), h, threshold, args.fee_pct, min_score)
     oos = metrics(oos_trades)
-    pf = "inf" if math.isinf(float(oos["profit_factor"])) else f"{float(oos['profit_factor']):.3f}"
+    oos_pf = pf_text(float(oos["profit_factor"]))
 
     print("-" * 150)
     print("FROZEN PARAMETERS SELECTED ONLY FROM TRAIN")
     print(f"Horizon={h}h | Threshold={threshold:.2f}% | Min Score={min_score}")
     print(
         f"TRAIN: trades={int(best['trades'])} | win={float(best['win_rate'])*100:.2f}% | "
-        f"compounded={float(best['compounded_net']):.5f}% | PF={('inf' if math.isinf(float(best['profit_factor'])) else f'{float(best['profit_factor']):.3f}')} | "
+        f"compounded={float(best['compounded_net']):.5f}% | PF={pf_text(float(best['profit_factor']))} | "
         f"maxDD={float(best['max_drawdown']):.3f}%"
     )
     print("=" * 150)
@@ -223,7 +199,7 @@ def main() -> None:
     print(
         f"OOS: trades={int(oos['trades'])} | win={float(oos['win_rate'])*100:.2f}% | "
         f"avg_net={float(oos['avg_net']):.5f}% | sum_net={float(oos['sum_net']):.5f}% | "
-        f"compounded={float(oos['compounded_net']):.5f}% | PF={pf} | maxDD={float(oos['max_drawdown']):.3f}%"
+        f"compounded={float(oos['compounded_net']):.5f}% | PF={oos_pf} | maxDD={float(oos['max_drawdown']):.3f}%"
     )
     print("=" * 150)
 
