@@ -4,9 +4,10 @@ import argparse
 import csv
 from pathlib import Path
 
-
-DEFAULT_THRESHOLD_PCT = 0.26
-DEFAULT_ROUND_TRIP_FEE_PCT = 0.26
+DEFAULT_FEE_PCT = 0.26
+DEFAULT_THRESHOLD_GRID = (
+    "0.26,0.30,0.35,0.40,0.45,0.50,0.60,0.75,0.90,1.00,1.25,1.50,2.00,2.50,3.00"
+)
 
 
 def norm(name: str) -> str:
@@ -29,211 +30,280 @@ def read_ohlc(path: Path) -> list[dict[str, float]]:
             except (TypeError, ValueError):
                 continue
 
-    if len(rows) < 4:
-        raise ValueError("Need at least 4 valid OHLC rows")
+    if len(rows) < 10:
+        raise ValueError("Need at least 10 valid OHLC rows")
     return rows
 
 
-def b(value: bool) -> int:
-    return 1 if value else 0
+def excel_signal(rows: list[dict[str, float]]) -> list[dict[str, float | int | None]]:
+    """Rebuild the supplied workbook formulas exactly enough for live-safe trading.
 
+    N = HC > CO
+    O = LC > CO
+    P = HC > HO
+    R = HC < CO
+    S = LC < CO
+    T = HC < HO
+    AC = 2*N + O + P - 2*R - S - T
+    AD = sign(AC)
+    U = H-O+C for AD=+1, L-O+C for AD=-1, blank for AD=0
+    W = U-C
+    X = abs(W)/C*100
+    V = X >= threshold (threshold is applied later during the sweep)
+    """
+    out: list[dict[str, float | int | None]] = []
 
-def build_f(rows: list[dict[str, float]]) -> list[float | None]:
-    """Build U first, then the supplied Excel column-F prediction for each candle."""
-    u: list[float] = []
+    for i, row in enumerate(rows):
+        o = row["open"]
+        h = row["high"]
+        l = row["low"]
+        c = row["close"]
 
-    for row in rows:
-        open_ = row["open"]
-        high = row["high"]
-        low = row["low"]
-        close = row["close"]
+        co = c - o
+        hc = h - c
+        lc = c - l
+        ho = h - o
 
-        co = close - open_
-        hc = high - close
-        ho = high - open_
+        n = 1 if hc > co else 0
+        oo = 1 if lc > co else 0
+        p = 1 if hc > ho else 0
+        r = 1 if hc < co else 0
+        s = 1 if lc < co else 0
+        t = 1 if hc < ho else 0
 
-        n = b(hc > co)
-        o = 0
-        p = b(hc > ho)
-        r = b(hc < co)
-        s = 0
-        t = b(hc < ho)
-
-        # Exact supplied AD formula as written in Excel.
-        if (n + o + p == 2) and ((high - open_) > 50):
-            ad = 1
-        elif r + s + t == 2:
-            ad = -1
-        else:
-            ad = 0
+        ac = 2 * n + oo + p - 2 * r - s - t
+        ad = 1 if ac > 0 else -1 if ac < 0 else 0
 
         if ad == 1:
-            value = high - open_ + close
+            u = h - o + c
         elif ad == -1:
-            value = low - open_ + close
+            u = l - o + c
         else:
-            value = open_
+            u = None
 
-        u.append(value)
+        w = (u - c) if u is not None else None
+        x = (abs(w) / abs(c) * 100.0) if w is not None and c != 0 else None
 
-    f: list[float | None] = [None] * len(rows)
+        out.append(
+            {
+                "index": i,
+                "ac": ac,
+                "ad": ad,
+                "u": u,
+                "w": w,
+                "x": x,
+            }
+        )
 
-    # Exact supplied Excel F formula:
-    # =IF(E25-B25>0,AVERAGE(U23:U25),IF(E25-B25<0,AVERAGE(D23:D25),E25))
-    for i, row in enumerate(rows):
-        if i < 2:
-            continue
-
-        close = row["close"]
-        open_ = row["open"]
-
-        if close - open_ > 0:
-            f[i] = sum(u[j] for j in range(i - 2, i + 1)) / 3.0
-        elif close - open_ < 0:
-            f[i] = sum(rows[j]["low"] for j in range(i - 2, i + 1)) / 3.0
-        else:
-            f[i] = close
-
-    return f
+    return out
 
 
-def evaluate(
+def trade_metrics(
     rows: list[dict[str, float]],
-    predictions: list[float | None],
+    signals: list[dict[str, float | int | None]],
     horizon: int,
     threshold_pct: float,
-    round_trip_fee_pct: float,
+    fee_pct: float,
+    min_abs_score: int,
+    allow_overlap: bool,
 ) -> dict[str, float | int]:
-    test_rows: list[tuple[float, float, float]] = []
+    trades: list[tuple[int, float, float, float, int]] = []
+    next_free = 0
 
-    for i, predicted_close in enumerate(predictions):
-        if predicted_close is None:
+    for signal in signals:
+        i = int(signal["index"])
+        if not allow_overlap and i < next_free:
             continue
+
         target_i = i + horizon
         if target_i >= len(rows):
             continue
 
-        current_close = rows[i]["close"]
-        actual_close = rows[target_i]["close"]
-        predicted_move = float(predicted_close) - current_close
-        actual_move = actual_close - current_close
-        test_rows.append((predicted_move, actual_move, current_close))
+        ad = int(signal["ad"])
+        ac = int(signal["ac"])
+        pred_pct = signal["x"]
+        if ad == 0 or pred_pct is None:
+            continue
+        if abs(ac) < min_abs_score:
+            continue
+        if float(pred_pct) < threshold_pct:
+            continue
 
-    direction_rows = [r for r in test_rows if r[0] != 0 and r[1] != 0]
-    magnitude_rows = [r for r in test_rows if r[2] != 0]
+        entry = rows[i]["close"]
+        exit_ = rows[target_i]["close"]
+        if entry == 0:
+            continue
 
-    direction_correct = sum(b((r[0] > 0) == (r[1] > 0)) for r in direction_rows)
-    direction_accuracy = direction_correct / len(direction_rows) if direction_rows else 0.0
+        raw_return_pct = ad * (exit_ - entry) / entry * 100.0
+        net_return_pct = raw_return_pct - fee_pct
+        trades.append((i, raw_return_pct, net_return_pct, float(pred_pct), ac))
 
-    magnitude_correct = 0
-    threshold_rows = 0
-    threshold_correct = 0
-    pred_pct_sum = 0.0
-    actual_pct_sum = 0.0
+        if not allow_overlap:
+            next_free = target_i + 1
 
-    gross_profit_sum = 0.0
-    net_profit_sum = 0.0
-    wins_net = 0
+    if not trades:
+        return {
+            "trades": 0,
+            "wins": 0,
+            "win_rate": 0.0,
+            "avg_gross": 0.0,
+            "avg_net": 0.0,
+            "sum_net": 0.0,
+            "compounded_net": 0.0,
+            "profit_factor": 0.0,
+            "max_drawdown": 0.0,
+            "avg_predicted_move": 0.0,
+        }
 
-    for predicted_move, actual_move, current_close in magnitude_rows:
-        pred_pct = abs(predicted_move) / abs(current_close) * 100.0
-        actual_pct = abs(actual_move) / abs(current_close) * 100.0
-        magnitude_correct += b((pred_pct >= threshold_pct) == (actual_pct >= threshold_pct))
+    wins = sum(1 for _, _, net, _, _ in trades if net > 0)
+    gross_sum = sum(gross for _, gross, _, _, _ in trades)
+    net_sum = sum(net for _, _, net, _, _ in trades)
+    avg_net = net_sum / len(trades)
+    gains = sum(net for _, _, net, _, _ in trades if net > 0)
+    losses = -sum(net for _, _, net, _, _ in trades if net < 0)
+    profit_factor = gains / losses if losses else float("inf")
+    avg_predicted = sum(p for _, _, _, p, _ in trades) / len(trades)
 
-        if pred_pct >= threshold_pct:
-            threshold_rows += 1
-            threshold_correct += b(actual_pct >= threshold_pct)
-            pred_pct_sum += pred_pct
-            actual_pct_sum += actual_pct
-
-            # Trade in the direction predicted by F and hold for the selected horizon.
-            direction = 1.0 if predicted_move > 0 else (-1.0 if predicted_move < 0 else 0.0)
-            gross_return_pct = direction * (actual_move / current_close) * 100.0
-            net_return_pct = gross_return_pct - round_trip_fee_pct
-
-            gross_profit_sum += gross_return_pct
-            net_profit_sum += net_return_pct
-            wins_net += b(net_return_pct > 0)
-
-    magnitude_accuracy = magnitude_correct / len(magnitude_rows) if magnitude_rows else 0.0
-    coverage = threshold_rows / len(magnitude_rows) if magnitude_rows else 0.0
-    precision = threshold_correct / threshold_rows if threshold_rows else 0.0
-    avg_predicted = pred_pct_sum / threshold_rows if threshold_rows else 0.0
-    avg_actual = actual_pct_sum / threshold_rows if threshold_rows else 0.0
-    avg_gross_profit = gross_profit_sum / threshold_rows if threshold_rows else 0.0
-    avg_net_profit = net_profit_sum / threshold_rows if threshold_rows else 0.0
-    win_rate_net = wins_net / threshold_rows if threshold_rows else 0.0
+    equity = 1.0
+    peak = 1.0
+    max_dd = 0.0
+    for _, _, net, _, _ in trades:
+        equity *= 1.0 + net / 100.0
+        peak = max(peak, equity)
+        drawdown = (peak - equity) / peak
+        max_dd = max(max_dd, drawdown)
 
     return {
-        "test_n": len(test_rows),
-        "direction_n": len(direction_rows),
-        "direction_correct": direction_correct,
-        "direction_accuracy": direction_accuracy,
-        "magnitude_n": len(magnitude_rows),
-        "magnitude_correct": magnitude_correct,
-        "magnitude_accuracy": magnitude_accuracy,
-        "threshold_n": threshold_rows,
-        "threshold_coverage": coverage,
-        "threshold_precision": precision,
-        "avg_predicted": avg_predicted,
-        "avg_actual": avg_actual,
-        "avg_gross_profit": avg_gross_profit,
-        "avg_net_profit": avg_net_profit,
-        "total_net_profit": net_profit_sum,
-        "win_rate_net": win_rate_net,
+        "trades": len(trades),
+        "wins": wins,
+        "win_rate": wins / len(trades),
+        "avg_gross": gross_sum / len(trades),
+        "avg_net": avg_net,
+        "sum_net": net_sum,
+        "compounded_net": (equity - 1.0) * 100.0,
+        "profit_factor": profit_factor,
+        "max_drawdown": max_dd * 100.0,
+        "avg_predicted_move": avg_predicted,
     }
 
 
+def parse_floats(value: str) -> list[float]:
+    result = [float(x.strip()) for x in value.split(",") if x.strip()]
+    if not result:
+        raise ValueError("Grid cannot be empty")
+    return result
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Test supplied Excel column-F prediction across horizons with profit metrics")
+    ap = argparse.ArgumentParser(
+        description="Optimize net profit using the exact candle formulas from candle_direction_magnitude_rules_only.xlsx"
+    )
     ap.add_argument("--input", required=True)
-    ap.add_argument("--threshold-pct", type=float, default=DEFAULT_THRESHOLD_PCT)
-    ap.add_argument("--round-trip-fee-pct", type=float, default=DEFAULT_ROUND_TRIP_FEE_PCT)
-    ap.add_argument("--horizons", default="1,2,3,4,5")
+    ap.add_argument("--fee-pct", type=float, default=DEFAULT_FEE_PCT)
+    ap.add_argument("--thresholds", default=DEFAULT_THRESHOLD_GRID)
+    ap.add_argument("--horizons", default="1,2,3,4,5,6,8,12,24")
+    ap.add_argument("--min-trades", type=int, default=20)
+    ap.add_argument("--top", type=int, default=20)
     args = ap.parse_args()
 
-    horizons = [int(x.strip()) for x in args.horizons.split(",") if x.strip()]
-    if not horizons or any(h < 1 for h in horizons):
-        raise ValueError("--horizons must contain positive integers")
-
     rows = read_ohlc(Path(args.input))
-    predictions = build_f(rows)
+    signals = excel_signal(rows)
+    thresholds = parse_floats(args.thresholds)
+    horizons = [int(x.strip()) for x in args.horizons.split(",") if x.strip()]
+    if any(h < 1 for h in horizons):
+        raise ValueError("All horizons must be >= 1")
+
+    results: list[dict[str, float | int | str]] = []
+
+    for overlap in (False, True):
+        mode = "NON_OVERLAP" if not overlap else "OVERLAP"
+        for horizon in horizons:
+            for threshold in thresholds:
+                for min_score in (1, 2, 3, 4):
+                    m = trade_metrics(
+                        rows,
+                        signals,
+                        horizon,
+                        threshold,
+                        args.fee_pct,
+                        min_score,
+                        overlap,
+                    )
+                    if int(m["trades"]) == 0:
+                        continue
+                    results.append(
+                        {
+                            "mode": mode,
+                            "horizon": horizon,
+                            "threshold": threshold,
+                            "min_score": min_score,
+                            **m,
+                        }
+                    )
 
     print("=" * 150)
-    print("NEW ALGORITHM FORMULA - COLUMN F - PROFIT HORIZON SWEEP")
+    print("EXACT EXCEL FORMULA - PROFIT OPTIMIZER")
     print("=" * 150)
     print(f"input={args.input}")
     print(f"OHLC rows={len(rows)}")
-    print(f"threshold={args.threshold_pct:.4f}%")
-    print(f"round-trip fee={args.round_trip_fee_pct:.4f}%")
-    print("F is fixed; entry only when |F-Close| >= threshold; direction = sign(F-Close)")
-    print("profit target = Close[t+horizon]; net return = directional return - round-trip fee")
-    print("-" * 150)
-    print(
-        "H  TestN  ThrN  Coverage%  Precision%  DirAcc%  MagAcc%  "
-        "AvgPred%  AvgActual%  AvgGross%  AvgNet%  WinRateNet%  TotalNet%"
-    )
+    print(f"fee round-trip={args.fee_pct:.4f}%")
+    print("Signal uses only N,O,P,R,S,T -> AC -> AD -> U -> W -> X -> threshold.")
+    print("AC = 2*N + O + P - 2*R - S - T")
+    print("U = H-O+C for AD=+1; U = L-O+C for AD=-1")
+    print("No future values are used for entry.")
+    print("=" * 150)
 
-    for horizon in horizons:
-        m = evaluate(rows, predictions, horizon, args.threshold_pct, args.round_trip_fee_pct)
-        print(
-            f"{horizon:>1}  "
-            f"{m['test_n']:>6}  "
-            f"{m['threshold_n']:>4}  "
-            f"{m['threshold_coverage'] * 100:>9.2f}  "
-            f"{m['threshold_precision'] * 100:>10.2f}  "
-            f"{m['direction_accuracy'] * 100:>7.2f}  "
-            f"{m['magnitude_accuracy'] * 100:>7.2f}  "
-            f"{m['avg_predicted']:>9.6f}  "
-            f"{m['avg_actual']:>10.6f}  "
-            f"{m['avg_gross_profit']:>9.6f}  "
-            f"{m['avg_net_profit']:>8.6f}  "
-            f"{m['win_rate_net'] * 100:>11.2f}  "
-            f"{m['total_net_profit']:>10.4f}"
+    def sort_key(r: dict[str, float | int | str]) -> tuple[float, float, float, int]:
+        return (
+            float(r["compounded_net"]),
+            float(r["sum_net"]),
+            float(r["profit_factor"]),
+            int(r["trades"]),
         )
+
+    for mode in ("NON_OVERLAP", "OVERLAP"):
+        subset = [r for r in results if r["mode"] == mode]
+        print(f"\nTOP {args.top} - {mode} (ranked by compounded net return)")
+        print(
+            "Mode        H  Thr%  Score  Trades  Win%   AvgNet%  SumNet%  "
+            "CompNet%  PF     MaxDD%  AvgPred%"
+        )
+        for r in sorted(subset, key=sort_key, reverse=True)[: args.top]:
+            pf = r["profit_factor"]
+            pf_text = "inf" if math.isinf(float(pf)) else f"{float(pf):.2f}"
+            print(
+                f"{str(r['mode']):<11} "
+                f"{int(r['horizon']):>2}  "
+                f"{float(r['threshold']):>4.2f}  "
+                f"{int(r['min_score']):>5}  "
+                f"{int(r['trades']):>6}  "
+                f"{float(r['win_rate'])*100:>5.1f}  "
+                f"{float(r['avg_net']):>8.4f}  "
+                f"{float(r['sum_net']):>8.4f}  "
+                f"{float(r['compounded_net']):>9.4f}  "
+                f"{pf_text:>5}  "
+                f"{float(r['max_drawdown']):>7.3f}  "
+                f"{float(r['avg_predicted_move']):>8.4f}"
+            )
+
+        stable = [r for r in subset if int(r["trades"]) >= args.min_trades]
+        print(f"\nBEST {mode} WITH >= {args.min_trades} TRADES")
+        for r in sorted(stable, key=sort_key, reverse=True)[:10]:
+            print(
+                f"H={int(r['horizon'])} | threshold={float(r['threshold']):.2f}% | "
+                f"score>={int(r['min_score'])} | trades={int(r['trades'])} | "
+                f"win={float(r['win_rate'])*100:.2f}% | "
+                f"avg_net={float(r['avg_net']):.5f}% | "
+                f"sum_net={float(r['sum_net']):.5f}% | "
+                f"compounded={float(r['compounded_net']):.5f}% | "
+                f"PF={('inf' if math.isinf(float(r['profit_factor'])) else f'{float(r['profit_factor']):.3f}')} | "
+                f"maxDD={float(r['max_drawdown']):.3f}%"
+            )
 
     print("=" * 150)
 
 
 if __name__ == "__main__":
+    import math
+
     main()
