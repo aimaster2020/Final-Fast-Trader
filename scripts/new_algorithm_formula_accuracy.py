@@ -37,24 +37,20 @@ def b(value: bool) -> int:
     return 1 if value else 0
 
 
-def calculate(rows: list[dict[str, float]], threshold_pct: float) -> list[dict[str, float | int | None]]:
-    """Reproduce the supplied Excel logic, with the final prediction taken from column F."""
-    # First calculate the per-candle U values from the supplied N:AD rules.
-    base: list[dict[str, float | int | None]] = []
+def build_f(rows: list[dict[str, float]]) -> list[float | None]:
+    """Build U first, then the supplied Excel column-F prediction for each candle."""
+    u: list[float] = []
 
-    for i, row in enumerate(rows):
+    for row in rows:
         open_ = row["open"]
         high = row["high"]
         low = row["low"]
         close = row["close"]
-        next_close = rows[i + 1]["close"] if i + 1 < len(rows) else None
 
         co = close - open_
         hc = high - close
-        lc = close - low
         ho = high - open_
 
-        # Excel N: T exactly as supplied.
         n = b(hc > co)
         o = 0
         p = b(hc > ho)
@@ -62,8 +58,7 @@ def calculate(rows: list[dict[str, float]], threshold_pct: float) -> list[dict[s
         s = 0
         t = b(hc < ho)
 
-        # Exact AD formula as supplied. The misplaced closing parenthesis
-        # means the bearish branch is selected whenever SUM(R:T)=2.
+        # Exact supplied AD formula as written in Excel.
         if (n + o + p == 2) and ((high - open_) > 50):
             ad = 1
         elif r + s + t == 2:
@@ -71,139 +66,141 @@ def calculate(rows: list[dict[str, float]], threshold_pct: float) -> list[dict[s
         else:
             ad = 0
 
-        # Excel U formula.
         if ad == 1:
-            u = high - open_ + close
+            value = high - open_ + close
         elif ad == -1:
-            u = low - open_ + close
+            value = low - open_ + close
         else:
-            u = open_
+            value = open_
 
-        base.append({
-            **row,
-            "CO": co,
-            "HC": hc,
-            "LC": lc,
-            "HO": ho,
-            "N": n,
-            "O": o,
-            "P": p,
-            "R": r,
-            "S": s,
-            "T": t,
-            "U": u,
-            "AD": ad,
-            "NEXT_CLOSE": next_close,
-        })
+        u.append(value)
 
-    out: list[dict[str, float | int | None]] = []
+    f: list[float | None] = [None] * len(rows)
 
-    # Excel F formula supplied for row 25:
+    # Exact supplied Excel F formula:
     # =IF(E25-B25>0,AVERAGE(U23:U25),IF(E25-B25<0,AVERAGE(D23:D25),E25))
-    # Therefore F uses the current candle plus the prior two candles.
-    for i, row in enumerate(base):
-        close = float(row["close"])
-        open_ = float(row["open"])
-        next_close = row["NEXT_CLOSE"]
+    for i, row in enumerate(rows):
+        if i < 2:
+            continue
 
-        if i >= 2:
-            if close - open_ > 0:
-                predicted_close = sum(float(base[j]["U"]) for j in range(i - 2, i + 1)) / 3.0
-            elif close - open_ < 0:
-                predicted_close = sum(float(base[j]["low"]) for j in range(i - 2, i + 1)) / 3.0
-            else:
-                predicted_close = close
+        close = row["close"]
+        open_ = row["open"]
+
+        if close - open_ > 0:
+            f[i] = sum(u[j] for j in range(i - 2, i + 1)) / 3.0
+        elif close - open_ < 0:
+            f[i] = sum(rows[j]["low"] for j in range(i - 2, i + 1)) / 3.0
         else:
-            predicted_close = None
+            f[i] = close
 
-        v = w = x = y = z = aa = ab = ac = ae = None
-        if predicted_close is not None and next_close is not None:
-            predicted_move = predicted_close - close
-            actual_move = float(next_close) - close
-            predicted_move_pct = abs(predicted_move) / abs(close) * 100 if close != 0 else None
-            actual_move_pct = abs(actual_move) / abs(close) * 100 if close != 0 else None
+    return f
 
-            w = predicted_move
-            x = predicted_move_pct
-            y = actual_move
-            z = actual_move_pct
 
-            if x is not None:
-                v = b(x >= threshold_pct)
-            if x is not None and z is not None:
-                aa = abs(x - z)
-                ab = b((x >= threshold_pct) == (z >= threshold_pct))
+def evaluate(rows: list[dict[str, float]], predictions: list[float | None], horizon: int, threshold_pct: float) -> dict[str, float | int]:
+    test_rows: list[tuple[float, float, float]] = []
 
-            ad = int(row["AD"])
-            ac = 1 if predicted_move > 0 else (-1 if predicted_move < 0 else 0)
-            actual_direction = 1 if actual_move > 0 else (-1 if actual_move < 0 else 0)
-            ae = 0 if actual_direction == 0 or ac == 0 else b(ac == actual_direction)
+    for i, predicted_close in enumerate(predictions):
+        if predicted_close is None:
+            continue
+        target_i = i + horizon
+        if target_i >= len(rows):
+            continue
 
-        out.append({
-            **row,
-            "F": predicted_close,
-            "V": v,
-            "W": w,
-            "X": x,
-            "Y": y,
-            "Z": z,
-            "AA": aa,
-            "AB": ab,
-            "AC": ac,
-            "AE": ae,
-        })
+        current_close = rows[i]["close"]
+        actual_close = rows[target_i]["close"]
+        predicted_move = float(predicted_close) - current_close
+        actual_move = actual_close - current_close
 
-    return out
+        test_rows.append((predicted_move, actual_move, current_close))
+
+    direction_rows = [r for r in test_rows if r[0] != 0 and r[1] != 0]
+    magnitude_rows = [r for r in test_rows if r[2] != 0]
+
+    direction_correct = sum(b((r[0] > 0) == (r[1] > 0)) for r in direction_rows)
+    direction_accuracy = direction_correct / len(direction_rows) if direction_rows else 0.0
+
+    magnitude_correct = 0
+    threshold_rows = 0
+    threshold_correct = 0
+    pred_pct_sum = 0.0
+    actual_pct_sum = 0.0
+
+    for predicted_move, actual_move, current_close in magnitude_rows:
+        pred_pct = abs(predicted_move) / abs(current_close) * 100.0
+        actual_pct = abs(actual_move) / abs(current_close) * 100.0
+        magnitude_correct += b((pred_pct >= threshold_pct) == (actual_pct >= threshold_pct))
+
+        if pred_pct >= threshold_pct:
+            threshold_rows += 1
+            threshold_correct += b(actual_pct >= threshold_pct)
+            pred_pct_sum += pred_pct
+            actual_pct_sum += actual_pct
+
+    magnitude_accuracy = magnitude_correct / len(magnitude_rows) if magnitude_rows else 0.0
+    coverage = threshold_rows / len(magnitude_rows) if magnitude_rows else 0.0
+    precision = threshold_correct / threshold_rows if threshold_rows else 0.0
+    avg_predicted = pred_pct_sum / threshold_rows if threshold_rows else 0.0
+    avg_actual = actual_pct_sum / threshold_rows if threshold_rows else 0.0
+
+    return {
+        "test_n": len(test_rows),
+        "direction_n": len(direction_rows),
+        "direction_correct": direction_correct,
+        "direction_accuracy": direction_accuracy,
+        "magnitude_n": len(magnitude_rows),
+        "magnitude_correct": magnitude_correct,
+        "magnitude_accuracy": magnitude_accuracy,
+        "threshold_n": threshold_rows,
+        "threshold_coverage": coverage,
+        "threshold_precision": precision,
+        "avg_predicted": avg_predicted,
+        "avg_actual": avg_actual,
+    }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Test the supplied Excel prediction formula using column F")
+    ap = argparse.ArgumentParser(description="Test supplied Excel column-F prediction across horizons")
     ap.add_argument("--input", required=True)
     ap.add_argument("--threshold-pct", type=float, default=DEFAULT_THRESHOLD_PCT)
+    ap.add_argument("--horizons", default="1,2,3,4,5")
     args = ap.parse_args()
 
-    data = calculate(read_ohlc(Path(args.input)), args.threshold_pct)
+    horizons = [int(x.strip()) for x in args.horizons.split(",") if x.strip()]
+    if not horizons or any(h < 1 for h in horizons):
+        raise ValueError("--horizons must contain positive integers")
 
-    test_rows = [r for r in data if r["F"] is not None and r["Y"] is not None]
-    direction_rows = [r for r in test_rows if r["AC"] != 0 and r["AE"] is not None]
-    magnitude_rows = [r for r in test_rows if r["AB"] is not None]
-    threshold_rows = [r for r in test_rows if r["V"] == 1]
+    rows = read_ohlc(Path(args.input))
+    predictions = build_f(rows)
 
-    direction_correct = sum(int(r["AE"] == 1) for r in direction_rows)
-    magnitude_correct = sum(int(r["AB"] == 1) for r in magnitude_rows)
+    print("=" * 118)
+    print("NEW ALGORITHM FORMULA ACCURACY - COLUMN F - HORIZON SWEEP")
+    print("=" * 118)
+    print(f"input={args.input}")
+    print(f"OHLC rows={len(rows)}")
+    print(f"threshold={args.threshold_pct:.4f}%")
+    print("F is fixed; only target horizon changes: Close[t+horizon]")
+    print("-" * 118)
+    print("H  TestN  DirN  DirCorrect  DirAcc%  MagN  MagCorrect  MagAcc%  ThrN  Coverage%  Precision%  AvgPred%  AvgActual%")
 
-    direction_accuracy = direction_correct / len(direction_rows) if direction_rows else 0.0
-    magnitude_accuracy = magnitude_correct / len(magnitude_rows) if magnitude_rows else 0.0
-    threshold_coverage = len(threshold_rows) / len(test_rows) if test_rows else 0.0
-    threshold_precision = (
-        sum(int(r["AB"] == 1) for r in threshold_rows) / len(threshold_rows)
-        if threshold_rows else 0.0
-    )
+    for horizon in horizons:
+        m = evaluate(rows, predictions, horizon, args.threshold_pct)
+        print(
+            f"{horizon:>1}  "
+            f"{m['test_n']:>6}  "
+            f"{m['direction_n']:>5}  "
+            f"{m['direction_correct']:>10}  "
+            f"{m['direction_accuracy'] * 100:>7.2f}  "
+            f"{m['magnitude_n']:>4}  "
+            f"{m['magnitude_correct']:>10}  "
+            f"{m['magnitude_accuracy'] * 100:>8.2f}  "
+            f"{m['threshold_n']:>4}  "
+            f"{m['threshold_coverage'] * 100:>10.2f}  "
+            f"{m['threshold_precision'] * 100:>11.2f}  "
+            f"{m['avg_predicted']:>9.6f}  "
+            f"{m['avg_actual']:>10.6f}"
+        )
 
-    predicted_pct = [float(r["X"]) for r in threshold_rows if r["X"] is not None]
-    actual_pct = [float(r["Z"]) for r in threshold_rows if r["Z"] is not None]
-    avg_predicted = sum(predicted_pct) / len(predicted_pct) if predicted_pct else 0.0
-    avg_actual = sum(actual_pct) / len(actual_pct) if actual_pct else 0.0
-
-    print("=" * 72)
-    print("NEW ALGORITHM FORMULA ACCURACY - COLUMN F")
-    print("=" * 72)
-    print(f"input               : {args.input}")
-    print(f"OHLC rows           : {len(data)}")
-    print(f"test samples        : {len(test_rows)}")
-    print(f"threshold %         : {args.threshold_pct:.4f}")
-    print(f"direction N         : {len(direction_rows)}")
-    print(f"direction correct   : {direction_correct}")
-    print(f"direction accuracy  : {direction_accuracy * 100:.2f}%")
-    print(f"magnitude N         : {len(magnitude_rows)}")
-    print(f"magnitude correct   : {magnitude_correct}")
-    print(f"magnitude accuracy  : {magnitude_accuracy * 100:.2f}%")
-    print(f"threshold signal N  : {len(threshold_rows)}")
-    print(f"threshold coverage  : {threshold_coverage * 100:.2f}%")
-    print(f"threshold precision : {threshold_precision * 100:.2f}%")
-    print(f"avg predicted move% : {avg_predicted:.6f}%")
-    print(f"avg actual move%    : {avg_actual:.6f}%")
-    print("=" * 72)
+    print("=" * 118)
 
 
 if __name__ == "__main__":
