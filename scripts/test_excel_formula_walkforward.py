@@ -77,7 +77,7 @@ def evaluate(rows, g_threshold: float, h_threshold: float, commission_rate: floa
         if None in (o, h, l, c, next_c):
             continue
 
-        window = rows[i: i + 1] if False else rows[i - 5:i + 1]
+        window = rows[i - 5:i + 1]
         closes = [num(x.get("Close")) for x in window]
         highs = [num(x.get("High")) for x in window]
         if any(value is None for value in closes + highs):
@@ -101,19 +101,23 @@ def evaluate(rows, g_threshold: float, h_threshold: float, commission_rate: floa
         lc_gt_co = int(s > q)
         hc_gt_ho = int(r > t)
 
+        j_bullish_confirmation = int(hc_gt_co + lc_gt_co + hc_gt_ho == 3)
+
+        # Exact supplied Excel formula for L:
+        # =IF(SUM(X:Z)=0,-1,0)
+        # where X:Z are HC>CO, LC>CO, HC>HO.
+        l_bearish_confirmation = -1 if (hc_gt_co + lc_gt_co + hc_gt_ho) == 0 else 0
+
         hc_lt_co = int(r < q)
         lc_lt_co = int(s < q)
         hc_lt_ho = int(r < t)
-
-        j_bullish_confirmation = int(hc_gt_co + lc_gt_co + hc_gt_ho == 3)
-        l_bearish_confirmation = int(hc_lt_co + lc_lt_co + hc_lt_ho == 0)
 
         m_long_signal = int(pt == 1 and j_bullish_confirmation == 1)
         n_long_move = (next_c - c) if m_long_signal == 1 else 0.0
         n_long_move_pct = n_long_move / c * 100.0 if m_long_signal and c else 0.0
         n_long_net_pct = n_long_move_pct - commission_rate * 100.0 if m_long_signal else 0.0
 
-        o_short_signal = int(pt == -1 and l_bearish_confirmation == 1)
+        o_short_signal = int(pt == -1 and l_bearish_confirmation == -1)
         p_short_move = (c - next_c) if o_short_signal == 1 else 0.0
         p_short_move_pct = p_short_move / c * 100.0 if o_short_signal and c else 0.0
         p_short_net_pct = p_short_move_pct - commission_rate * 100.0 if o_short_signal else 0.0
@@ -130,6 +134,7 @@ def evaluate(rows, g_threshold: float, h_threshold: float, commission_rate: floa
             "HC>CO": hc_gt_co, "LC>CO": lc_gt_co, "HC>HO": hc_gt_ho,
             "M_long_signal": m_long_signal, "N_Long_Move": n_long_move,
             "N_Long_Move_Pct": n_long_move_pct, "N_Long_Net_Pct": n_long_net_pct,
+            "HC<CO": hc_lt_co, "LC>CO": lc_gt_co, "HC>HO": hc_gt_ho,
             "HC<CO": hc_lt_co, "LC<CO": lc_lt_co, "HC<HO": hc_lt_ho,
             "O_short_signal": o_short_signal, "P_Short_Move": p_short_move,
             "P_Short_Move_Pct": p_short_move_pct, "P_Short_Net_Pct": p_short_net_pct,
