@@ -6,51 +6,13 @@ from pathlib import Path
 from typing import Iterable
 
 
-BASE_FIELDS = ["Timestamp", "Open", "High", "Low", "Close"]
 RAW_FIELDS = ["Timestamp", "Open", "High", "Low", "Close", "Volume"]
 FINAL_FIELDS = [
-    "Timestamp",
-    "Open",
-    "High",
-    "Low",
-    "Close",
-    "predict",
-    "ct",
-    "pt",
-    "pt=ct",
-    "positive_pt=ct",
-    "negative_pt=ct",
-    "bullish_evidence",
-    "bearish_evidence",
-    "positive_direction_match",
-    "positive_move",
-    "negative_direction_match",
-    "negative_move",
-    "CO",
-    "HC",
-    "LC",
-    "HO",
-    "Close_next",
-    "V",
-    "Next_Return",
-    "HC>CO",
-    "LC>CO",
-    "HC>HO",
-    "Fold/Valid",
-    "HC<CO",
-    "LC<CO",
-    "HC<HO",
-    "Predicted Close",
-    "Threshold",
-    "Predicted Move",
-    "Predicted Move %",
-    "Actual Move",
-    "Actual Move %",
-    "Abs Error (pp)",
-    "Magnitude Correct",
-    "Direction Score",
-    "Direction",
-    "Direction Correct",
+    "Timestamp", "Open", "High", "Low", "Close",
+    "predict", "ct", "pt", "pt=ct", "positive_pt=ct", "negative_pt=ct",
+    "HC>CO", "LC>CO", "HC>HO", "M_long_signal", "N_Long_Move",
+    "HC<CO", "LC<CO", "HC<HO", "O_short_signal", "P_Short_Move",
+    "CO", "HC", "LC", "HO", "Close_next", "V", "Next_Return",
 ]
 
 
@@ -73,8 +35,7 @@ def sign(value: float, threshold: float) -> int:
 
 def looks_like_header(row: list[str]) -> bool:
     normalized = [str(x).strip().lower() for x in row]
-    required = {"timestamp", "open", "high", "low", "close"}
-    return required.issubset(set(normalized))
+    return {"timestamp", "open", "high", "low", "close"}.issubset(normalized)
 
 
 def load_rows(path: Path):
@@ -104,166 +65,103 @@ def load_rows(path: Path):
         ]
 
 
-def evaluate(
-    rows,
-    g_threshold: float,
-    h_threshold: float,
-    magnitude_threshold: float,
-    am_mode: str,
-):
+def evaluate(rows, g_threshold: float, h_threshold: float):
     out = []
 
     for i in range(5, len(rows) - 1):
         current, nxt = rows[i], rows[i + 1]
-        o, h, l, c = (
-            num(current.get(k)) for k in ("Open", "High", "Low", "Close")
-        )
+        o, h, l, c = (num(current.get(k)) for k in ("Open", "High", "Low", "Close"))
         next_c = num(nxt.get("Close"))
         if None in (o, h, l, c, next_c):
             continue
 
-        window = rows[i - 5 : i + 1]
+        window = rows[i - 5:i + 1]
         closes = [num(x.get("Close")) for x in window]
         highs = [num(x.get("High")) for x in window]
         if any(value is None for value in closes + highs):
             continue
 
+        # F: IF(E-B>0,AVERAGE(E_window),IF(E-B<0,AVERAGE(C_window),E))
         body = c - o
-        predict = (
-            sum(closes) / 6.0
-            if body > 0
-            else (sum(highs) / 6.0 if body < 0 else c)
-        )
+        predict = sum(closes) / 6.0 if body > 0 else (sum(highs) / 6.0 if body < 0 else c)
 
+        # G / H
         ct = sign(next_c - c, g_threshold)
         pt = sign(predict - c, h_threshold)
-
         pt_eq_ct = int(pt == ct and pt != 0)
         positive_pt_eq_ct = int(pt == ct and pt == 1)
         negative_pt_eq_ct = int(pt == ct and pt == -1)
 
-        q = c - o
-        r = h - c
-        s = l - c
-        t = h - o
+        # Q:T
+        q = c - o       # CO
+        r = h - c       # HC
+        s = l - c       # LC
+        t = h - o       # HO
 
+        # X:Y:Z
         hc_gt_co = int(r > q)
         lc_gt_co = int(s > q)
         hc_gt_ho = int(r > t)
+
+        # AB:AC:AD
         hc_lt_co = int(r < q)
         lc_lt_co = int(s < q)
         hc_lt_ho = int(r < t)
 
-        bullish_evidence = int(hc_gt_co + lc_gt_co + hc_gt_ho == 3)
-        bearish_evidence = -1 if hc_lt_co + lc_lt_co + hc_lt_ho == 3 else 0
+        # J = SUM(X:Z); L = SUM(AB:AD)
+        j_bullish_confirmation = int(hc_gt_co + lc_gt_co + hc_gt_ho == 3)
+        l_bearish_confirmation = int(hc_lt_co + lc_lt_co + hc_lt_ho == 0)
 
-        if am_mode == "literal":
-            bullish = int(hc_gt_co + lc_gt_co + hc_gt_ho == 2 and q > 50)
-            bearish = int(hc_lt_co + lc_lt_co + hc_lt_ho == 2)
-        elif am_mode == "corrected":
-            bullish = int(hc_gt_co + lc_gt_co + hc_gt_ho == 2 and (h - o) > 50)
-            bearish = int(hc_lt_co + lc_lt_co + hc_lt_ho == 2 and (l - o) < 50)
-        else:
-            raise ValueError(f"Unsupported am_mode: {am_mode}")
+        # FINAL EXCEL OUTPUTS:
+        # M26 = IF(AND(H26=1,J26=1),1,0)
+        # N26 = IF(M26=1,(E27-E26),0)
+        # O26 = IF(AND(H26=-1,L26=-1),1,0)
+        # P26 = IF(O26,E26-E27,0)
+        m_long_signal = int(pt == 1 and j_bullish_confirmation == 1)
+        n_long_move = (next_c - c) if m_long_signal == 1 else 0.0
+        o_short_signal = int(pt == -1 and l_bearish_confirmation == 1)
+        p_short_move = (c - next_c) if o_short_signal == 1 else 0.0
 
-        direction_score = 1 if bullish else (-1 if bearish else 0)
-        an = direction_score
-
-        positive_direction_match = int(pt == 1 and bullish_evidence == 1)
-        positive_move = (next_c - c) if positive_direction_match else 0.0
-        negative_direction_match = int(pt == -1 and bearish_evidence == -1)
-        negative_move = (c - next_c) if negative_direction_match else 0.0
-
-        fold_valid = 1
-        predicted_close = (
-            h - o + c
-            if an == 1
-            else (l - o + c if an == -1 else o)
-        )
-        predicted_move = predicted_close - c
-        predicted_move_pct = abs(predicted_move) / abs(c) * 100 if c else 0.0
-        threshold = int(predicted_move_pct >= magnitude_threshold)
         actual_move = next_c - c
-        actual_move_pct = abs(actual_move) / abs(c) * 100 if c else 0.0
-        abs_error_pp = abs(predicted_move_pct - actual_move_pct)
-        magnitude_correct = int(
-            (predicted_move_pct >= magnitude_threshold)
-            == (actual_move_pct >= magnitude_threshold)
-        )
-        actual_direction = 1 if actual_move > 0 else (-1 if actual_move < 0 else 0)
-        direction_correct = int(
-            an != 0
-            and actual_direction != 0
-            and an == actual_direction
-        )
 
-        out.append(
-            {
-                "Timestamp": current.get("Timestamp", ""),
-                "Open": o,
-                "High": h,
-                "Low": l,
-                "Close": c,
-                "predict": predict,
-                "ct": ct,
-                "pt": pt,
-                "pt=ct": pt_eq_ct,
-                "positive_pt=ct": positive_pt_eq_ct,
-                "negative_pt=ct": negative_pt_eq_ct,
-                "bullish_evidence": bullish_evidence,
-                "bearish_evidence": bearish_evidence,
-                "positive_direction_match": positive_direction_match,
-                "positive_move": positive_move,
-                "negative_direction_match": negative_direction_match,
-                "negative_move": negative_move,
-                "CO": q,
-                "HC": r,
-                "LC": s,
-                "HO": t,
-                "Close_next": next_c,
-                "V": actual_move,
-                "Next_Return": actual_move / c if c else 0.0,
-                "HC>CO": hc_gt_co,
-                "LC>CO": lc_gt_co,
-                "HC>HO": hc_gt_ho,
-                "Fold/Valid": fold_valid,
-                "HC<CO": hc_lt_co,
-                "LC<CO": lc_lt_co,
-                "HC<HO": hc_lt_ho,
-                "Predicted Close": predicted_close,
-                "Threshold": threshold,
-                "Predicted Move": predicted_move,
-                "Predicted Move %": predicted_move_pct,
-                "Actual Move": actual_move,
-                "Actual Move %": actual_move_pct,
-                "Abs Error (pp)": abs_error_pp,
-                "Magnitude Correct": magnitude_correct,
-                "Direction Score": direction_score,
-                "Direction": an,
-                "Direction Correct": direction_correct,
-            }
-        )
+        out.append({
+            "Timestamp": current.get("Timestamp", ""),
+            "Open": o, "High": h, "Low": l, "Close": c,
+            "predict": predict, "ct": ct, "pt": pt,
+            "pt=ct": pt_eq_ct,
+            "positive_pt=ct": positive_pt_eq_ct,
+            "negative_pt=ct": negative_pt_eq_ct,
+            "HC>CO": hc_gt_co, "LC>CO": lc_gt_co, "HC>HO": hc_gt_ho,
+            "M_long_signal": m_long_signal, "N_Long_Move": n_long_move,
+            "HC<CO": hc_lt_co, "LC<CO": lc_lt_co, "HC<HO": hc_lt_ho,
+            "O_short_signal": o_short_signal, "P_Short_Move": p_short_move,
+            "CO": q, "HC": r, "LC": s, "HO": t,
+            "Close_next": next_c, "V": actual_move,
+            "Next_Return": actual_move / c if c else 0.0,
+        })
 
-    signals = [r for r in out if r["Direction"] != 0]
-    correct = sum(int(r["Direction Correct"]) for r in signals)
-    magnitude_correct = sum(int(r["Magnitude Correct"]) for r in out)
+    long_signals = [r for r in out if r["M_long_signal"] == 1]
+    short_signals = [r for r in out if r["O_short_signal"] == 1]
+    long_moves = [float(r["N_Long_Move"]) for r in long_signals]
+    short_moves = [float(r["P_Short_Move"]) for r in short_signals]
+    all_moves = long_moves + short_moves
+
     stats = {
         "frames": len(out),
-        "signals": len(signals),
-        "signal_pct": len(signals) / len(out) * 100 if out else 0.0,
-        "direction_correct": correct,
-        "direction_accuracy_pct": correct / len(signals) * 100 if signals else 0.0,
-        "pt_ct": sum(int(r["pt=ct"]) for r in out),
-        "positive_pt_ct": sum(int(r["positive_pt=ct"]) for r in out),
-        "negative_pt_ct": sum(int(r["negative_pt=ct"]) for r in out),
-        "magnitude_correct": magnitude_correct,
-        "magnitude_accuracy_pct": magnitude_correct / len(out) * 100 if out else 0.0,
+        "long_signals": len(long_signals),
+        "short_signals": len(short_signals),
+        "total_signals": len(all_moves),
+        "long_avg_move": sum(long_moves) / len(long_moves) if long_moves else 0.0,
+        "short_avg_move": sum(short_moves) / len(short_moves) if short_moves else 0.0,
+        "combined_avg_move": sum(all_moves) / len(all_moves) if all_moves else 0.0,
+        "long_total_move": sum(long_moves),
+        "short_total_move": sum(short_moves),
+        "combined_total_move": sum(all_moves),
     }
     return out, stats
 
 
 def write_csv(path: Path, rows: Iterable[dict]):
-    rows = list(rows)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FINAL_FIELDS, extrasaction="ignore")
@@ -272,25 +170,17 @@ def write_csv(path: Path, rows: Iterable[dict]):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Final output equivalent of the supplied Excel formulas")
+    p = argparse.ArgumentParser(description="Final output matching the supplied Excel final move formulas")
     p.add_argument("--input", required=True)
     p.add_argument("--g", type=float, default=0.0)
     p.add_argument("--h", type=float, default=0.0)
-    p.add_argument("--magnitude-threshold", type=float, default=0.0)
-    p.add_argument("--am-mode", choices=("literal", "corrected"), default="literal")
     p.add_argument("--output", required=True)
     args = p.parse_args()
 
-    result, stats = evaluate(
-        load_rows(Path(args.input)),
-        args.g,
-        args.h,
-        args.magnitude_threshold,
-        args.am_mode,
-    )
+    result, stats = evaluate(load_rows(Path(args.input)), args.g, args.h)
     write_csv(Path(args.output), result)
 
-    print(f"G={args.g:g} H={args.h:g} MAGNITUDE_THRESHOLD={args.magnitude_threshold:g} AM_MODE={args.am_mode}")
+    print(f"G={args.g:g} H={args.h:g}")
     print(f"output={args.output}")
     for key, value in stats.items():
         print(f"{key}={value:.6f}" if isinstance(value, float) else f"{key}={value}")
