@@ -6,6 +6,53 @@ from pathlib import Path
 from typing import Iterable
 
 
+BASE_FIELDS = ["Timestamp", "Open", "High", "Low", "Close"]
+FINAL_FIELDS = [
+    "Timestamp",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "predict",
+    "ct",
+    "pt",
+    "pt=ct",
+    "positive_pt=ct",
+    "negative_pt=ct",
+    "bullish_evidence",
+    "bearish_evidence",
+    "positive_direction_match",
+    "positive_move",
+    "negative_direction_match",
+    "negative_move",
+    "CO",
+    "HC",
+    "LC",
+    "HO",
+    "Close_next",
+    "V",
+    "Next_Return",
+    "HC>CO",
+    "LC>CO",
+    "HC>HO",
+    "Fold/Valid",
+    "HC<CO",
+    "LC<CO",
+    "HC<HO",
+    "Predicted Close",
+    "Threshold",
+    "Predicted Move",
+    "Predicted Move %",
+    "Actual Move",
+    "Actual Move %",
+    "Abs Error (pp)",
+    "Magnitude Correct",
+    "Direction Score",
+    "Direction",
+    "Direction Correct",
+]
+
+
 def num(value):
     if value is None or value == "":
         return None
@@ -26,80 +73,196 @@ def sign(value: float, threshold: float) -> int:
 def load_rows(path: Path):
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f)
-        return [{k: raw.get(k, "") for k in (reader.fieldnames or [])} for raw in reader]
+        fields = reader.fieldnames or []
+        missing = [field for field in BASE_FIELDS if field not in fields]
+        if missing:
+            raise ValueError(f"Missing required columns: {missing}")
+        return [{k: raw.get(k, "") for k in fields} for raw in reader]
 
 
-def evaluate(rows, g_threshold: float, h_threshold: float, magnitude_threshold: float, am_mode: str):
+def evaluate(
+    rows,
+    g_threshold: float,
+    h_threshold: float,
+    magnitude_threshold: float,
+    am_mode: str,
+):
     out = []
+
     for i in range(5, len(rows) - 1):
         current, nxt = rows[i], rows[i + 1]
-        o, h, l, c = (num(current.get(k)) for k in ("Open", "High", "Low", "Close"))
+        o, h, l, c = (
+            num(current.get(k)) for k in ("Open", "High", "Low", "Close")
+        )
         next_c = num(nxt.get("Close"))
         if None in (o, h, l, c, next_c):
             continue
 
-        window = rows[i - 5:i + 1]
+        window = rows[i - 5 : i + 1]
         closes = [num(x.get("Close")) for x in window]
         highs = [num(x.get("High")) for x in window]
-        body = c - o
-        predict = sum(closes) / 6 if body > 0 else (sum(highs) / 6 if body < 0 else c)
-        ct, pt = sign(next_c - c, g_threshold), sign(predict - c, h_threshold)
-        positive_match = int(pt == ct and pt == 1)
-        negative_match = int(pt == ct and pt == -1)
+        if any(value is None for value in closes + highs):
+            continue
 
-        q, r, s, t = c - o, h - c, l - c, h - o
-        x, y, z = int(r > q), int(s > q), int(r > t)
-        ab, ac, ad = int(r < q), int(s < q), int(r < t)
+        # Excel F: IF(E-B>0,AVERAGE(E_window),IF(E-B<0,AVERAGE(C_window),E))
+        body = c - o
+        predict = (
+            sum(closes) / 6.0
+            if body > 0
+            else (sum(highs) / 6.0 if body < 0 else c)
+        )
+
+        # Excel G/H
+        ct = sign(next_c - c, g_threshold)
+        pt = sign(predict - c, h_threshold)
+
+        # Excel I/J/K/L/M/N/O/P. These are retained as explicit final outputs.
+        pt_eq_ct = int(pt == ct and pt != 0)
+        positive_pt_eq_ct = int(pt == ct and pt == 1)
+        negative_pt_eq_ct = int(pt == ct and pt == -1)
+
+        q = c - o       # CO
+        r = h - c       # HC
+        s = l - c       # LC (as used by the Excel formula)
+        t = h - o       # HO
+
+        hc_gt_co = int(r > q)
+        lc_gt_co = int(s > q)
+        hc_gt_ho = int(r > t)
+        hc_lt_co = int(r < q)
+        lc_lt_co = int(s < q)
+        hc_lt_ho = int(r < t)
+
+        # Exact Excel formulas from the supplied table.
+        bullish_evidence = int(hc_gt_co + lc_gt_co + hc_gt_ho == 3)
+        bearish_evidence = int(hc_lt_co + lc_lt_co + hc_lt_ho == 0)
+
         if am_mode == "literal":
-            bullish = int(x + y + z == 2 and (c - o) > 50)
-            bearish = int((ab + ac + ad == 2 and (l - o)) < 50)
+            # Literal interpretation of the supplied AM formula:
+            # IF(AND(SUM(AB:AD)=2,(D-B))<50,-1,0)
+            bullish = int(hc_gt_co + lc_gt_co + hc_gt_ho == 2 and q > 50)
+            bearish = int(
+                (hc_lt_co + lc_lt_co + hc_lt_ho == 2 and (l - o)) < 50
+            )
+        elif am_mode == "corrected":
+            # Intended/arithmetically corrected interpretation of the same condition.
+            bullish = int(hc_gt_co + lc_gt_co + hc_gt_ho == 2 and (h - o) > 50)
+            bearish = int(hc_lt_co + lc_lt_co + hc_lt_ho == 2 and (l - o) < 50)
         else:
-            bullish = int(x + y + z == 2 and (h - o) > 50)
-            bearish = int(ab + ac + ad == 2 and (l - o) < 50)
+            raise ValueError(f"Unsupported am_mode: {am_mode}")
 
         an = 1 if bullish else (-1 if bearish else 0)
-        actual_direction = 1 if next_c > c else (-1 if next_c < c else 0)
-        direction_correct = int(an != 0 and actual_direction != 0 and an == actual_direction)
-        predicted_close = h - o + c if an == 1 else (l - o + c if an == -1 else o)
+
+        # Excel M/N/O/P
+        positive_direction_match = int(pt == 1 and bullish_evidence == 1)
+        positive_move = (next_c - c) if positive_direction_match else 0.0
+        negative_direction_match = int(pt == -1 and bearish_evidence == 1)
+        negative_move = (c - next_c) if negative_direction_match else 0.0
+
+        # Excel Q:AO
+        fold_valid = 1
+        predicted_close = (
+            h - o + c
+            if an == 1
+            else (l - o + c if an == -1 else o)
+        )
+        threshold = int(abs(predicted_close - c) / abs(c) * 100 >= magnitude_threshold) if c else 0
         predicted_move = predicted_close - c
-        actual_move = next_c - c
         predicted_move_pct = abs(predicted_move) / abs(c) * 100 if c else 0.0
+        actual_move = next_c - c
         actual_move_pct = abs(actual_move) / abs(c) * 100 if c else 0.0
-        magnitude_correct = int((predicted_move_pct >= magnitude_threshold) == (actual_move_pct >= magnitude_threshold))
+        abs_error_pp = abs(predicted_move_pct - actual_move_pct)
+        magnitude_correct = int(
+            (predicted_move_pct >= magnitude_threshold)
+            == (actual_move_pct >= magnitude_threshold)
+        )
+        direction_score = (
+            1
+            if an > 0
+            else (-1 if an < 0 else 0)
+        )
+        direction_correct = int(
+            an != 0
+            and actual_move != 0
+            and an == (1 if actual_move > 0 else -1)
+        )
 
-        out.append({"Timestamp": current.get("Timestamp", ""), "Open": o, "High": h, "Low": l, "Close": c,
-                    "predict": predict, "ct": ct, "pt": pt, "positive_match": positive_match,
-                    "negative_match": negative_match, "AM": an, "AN": an, "actual_direction": actual_direction,
-                    "direction_correct": direction_correct, "predicted_close": predicted_close,
-                    "predicted_move": predicted_move, "predicted_move_pct": predicted_move_pct,
-                    "actual_move": actual_move, "actual_move_pct": actual_move_pct,
-                    "magnitude_correct": magnitude_correct})
+        out.append(
+            {
+                "Timestamp": current.get("Timestamp", ""),
+                "Open": o,
+                "High": h,
+                "Low": l,
+                "Close": c,
+                "predict": predict,
+                "ct": ct,
+                "pt": pt,
+                "pt=ct": pt_eq_ct,
+                "positive_pt=ct": positive_pt_eq_ct,
+                "negative_pt=ct": negative_pt_eq_ct,
+                "bullish_evidence": bullish_evidence,
+                "bearish_evidence": bearish_evidence,
+                "positive_direction_match": positive_direction_match,
+                "positive_move": positive_move,
+                "negative_direction_match": negative_direction_match,
+                "negative_move": negative_move,
+                "CO": q,
+                "HC": r,
+                "LC": s,
+                "HO": t,
+                "Close_next": next_c,
+                "V": actual_move,
+                "Next_Return": actual_move / c if c else 0.0,
+                "HC>CO": hc_gt_co,
+                "LC>CO": lc_gt_co,
+                "HC>HO": hc_gt_ho,
+                "Fold/Valid": fold_valid,
+                "HC<CO": hc_lt_co,
+                "LC<CO": lc_lt_co,
+                "HC<HO": hc_lt_ho,
+                "Predicted Close": predicted_close,
+                "Threshold": threshold,
+                "Predicted Move": predicted_move,
+                "Predicted Move %": predicted_move_pct,
+                "Actual Move": actual_move,
+                "Actual Move %": actual_move_pct,
+                "Abs Error (pp)": abs_error_pp,
+                "Magnitude Correct": magnitude_correct,
+                "Direction Score": direction_score,
+                "Direction": an,
+                "Direction Correct": direction_correct,
+            }
+        )
 
-    signals = [r for r in out if r["AN"] != 0]
-    correct = sum(int(r["direction_correct"]) for r in signals)
-    stats = {"frames": len(out), "signals": len(signals),
-             "signal_pct": len(signals) / len(out) * 100 if out else 0.0,
-             "direction_correct": correct,
-             "direction_accuracy_pct": correct / len(signals) * 100 if signals else 0.0,
-             "positive_matches": sum(int(r["positive_match"]) for r in out),
-             "negative_matches": sum(int(r["negative_match"]) for r in out),
-             "magnitude_correct": sum(int(r["magnitude_correct"]) for r in out)}
+    signals = [r for r in out if r["Direction"] != 0]
+    correct = sum(int(r["Direction Correct"]) for r in signals)
+    magnitude_correct = sum(int(r["Magnitude Correct"]) for r in out)
+    stats = {
+        "frames": len(out),
+        "signals": len(signals),
+        "signal_pct": len(signals) / len(out) * 100 if out else 0.0,
+        "direction_correct": correct,
+        "direction_accuracy_pct": correct / len(signals) * 100 if signals else 0.0,
+        "pt_ct": sum(int(r["pt=ct"]) for r in out),
+        "positive_pt_ct": sum(int(r["positive_pt=ct"]) for r in out),
+        "negative_pt_ct": sum(int(r["negative_pt=ct"]) for r in out),
+        "magnitude_correct": magnitude_correct,
+        "magnitude_accuracy_pct": magnitude_correct / len(out) * 100 if out else 0.0,
+    }
     return out, stats
 
 
 def write_csv(path: Path, rows: Iterable[dict]):
     rows = list(rows)
-    if not rows:
-        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=FINAL_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
 
 def main():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="Final output equivalent of the supplied Excel formulas")
     p.add_argument("--input", required=True)
     p.add_argument("--g", type=float, default=0.0)
     p.add_argument("--h", type=float, default=0.0)
@@ -107,9 +270,18 @@ def main():
     p.add_argument("--am-mode", choices=("literal", "corrected"), default="literal")
     p.add_argument("--output", required=True)
     args = p.parse_args()
-    result, stats = evaluate(load_rows(Path(args.input)), args.g, args.h, args.magnitude_threshold, args.am_mode)
+
+    result, stats = evaluate(
+        load_rows(Path(args.input)),
+        args.g,
+        args.h,
+        args.magnitude_threshold,
+        args.am_mode,
+    )
     write_csv(Path(args.output), result)
+
     print(f"G={args.g:g} H={args.h:g} MAGNITUDE_THRESHOLD={args.magnitude_threshold:g} AM_MODE={args.am_mode}")
+    print(f"output={args.output}")
     for key, value in stats.items():
         print(f"{key}={value:.6f}" if isinstance(value, float) else f"{key}={value}")
 
