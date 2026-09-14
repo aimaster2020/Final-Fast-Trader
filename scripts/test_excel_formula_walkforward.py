@@ -123,7 +123,7 @@ def evaluate(
 
         q = c - o       # CO
         r = h - c       # HC
-        s = l - c       # LC (as used by the Excel formula)
+        s = l - c       # LC (exact Excel expression: D-E)
         t = h - o       # HO
 
         hc_gt_co = int(r > q)
@@ -133,30 +133,33 @@ def evaluate(
         lc_lt_co = int(s < q)
         hc_lt_ho = int(r < t)
 
-        # Exact Excel formulas from the supplied table.
+        # Exact Excel J/L evidence columns.
         bullish_evidence = int(hc_gt_co + lc_gt_co + hc_gt_ho == 3)
-        bearish_evidence = int(hc_lt_co + lc_lt_co + hc_lt_ho == 0)
+        bearish_evidence = -1 if hc_lt_co + lc_lt_co + hc_lt_ho == 0 else 0
 
         if am_mode == "literal":
-            # Literal interpretation of the supplied AM formula:
+            # Exact behavioral translation of:
             # IF(AND(SUM(AB:AD)=2,(D-B))<50,-1,0)
+            # Excel coerces the second AND argument to TRUE/FALSE before <50,
+            # so the condition is determined by SUM(AB:AD)=2.
             bullish = int(hc_gt_co + lc_gt_co + hc_gt_ho == 2 and q > 50)
-            bearish = int(
-                (hc_lt_co + lc_lt_co + hc_lt_ho == 2 and (l - o)) < 50
-            )
+            bearish = int(hc_lt_co + lc_lt_co + hc_lt_ho == 2)
         elif am_mode == "corrected":
-            # Intended/arithmetically corrected interpretation of the same condition.
+            # Intended arithmetic interpretation if the malformed Excel formula
+            # is corrected to compare (D-B) with 50.
             bullish = int(hc_gt_co + lc_gt_co + hc_gt_ho == 2 and (h - o) > 50)
             bearish = int(hc_lt_co + lc_lt_co + hc_lt_ho == 2 and (l - o) < 50)
         else:
             raise ValueError(f"Unsupported am_mode: {am_mode}")
 
-        an = 1 if bullish else (-1 if bearish else 0)
+        # Exact Excel AM/AN direction score and direction.
+        direction_score = 1 if bullish else (-1 if bearish else 0)
+        an = direction_score
 
         # Excel M/N/O/P
         positive_direction_match = int(pt == 1 and bullish_evidence == 1)
         positive_move = (next_c - c) if positive_direction_match else 0.0
-        negative_direction_match = int(pt == -1 and bearish_evidence == 1)
+        negative_direction_match = int(pt == -1 and bearish_evidence == -1)
         negative_move = (c - next_c) if negative_direction_match else 0.0
 
         # Excel Q:AO
@@ -166,9 +169,9 @@ def evaluate(
             if an == 1
             else (l - o + c if an == -1 else o)
         )
-        threshold = int(abs(predicted_close - c) / abs(c) * 100 >= magnitude_threshold) if c else 0
         predicted_move = predicted_close - c
         predicted_move_pct = abs(predicted_move) / abs(c) * 100 if c else 0.0
+        threshold = int(predicted_move_pct >= magnitude_threshold)
         actual_move = next_c - c
         actual_move_pct = abs(actual_move) / abs(c) * 100 if c else 0.0
         abs_error_pp = abs(predicted_move_pct - actual_move_pct)
@@ -176,15 +179,11 @@ def evaluate(
             (predicted_move_pct >= magnitude_threshold)
             == (actual_move_pct >= magnitude_threshold)
         )
-        direction_score = (
-            1
-            if an > 0
-            else (-1 if an < 0 else 0)
-        )
+        actual_direction = 1 if actual_move > 0 else (-1 if actual_move < 0 else 0)
         direction_correct = int(
             an != 0
-            and actual_move != 0
-            and an == (1 if actual_move > 0 else -1)
+            and actual_direction != 0
+            and an == actual_direction
         )
 
         out.append(
