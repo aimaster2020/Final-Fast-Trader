@@ -7,6 +7,7 @@ from typing import Iterable
 
 
 BASE_FIELDS = ["Timestamp", "Open", "High", "Low", "Close"]
+RAW_FIELDS = ["Timestamp", "Open", "High", "Low", "Close", "Volume"]
 FINAL_FIELDS = [
     "Timestamp",
     "Open",
@@ -70,14 +71,37 @@ def sign(value: float, threshold: float) -> int:
     return 0
 
 
+def looks_like_header(row: list[str]) -> bool:
+    normalized = [str(x).strip().lower() for x in row]
+    required = {"timestamp", "open", "high", "low", "close"}
+    return required.issubset(set(normalized))
+
+
 def load_rows(path: Path):
     with path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        fields = reader.fieldnames or []
-        missing = [field for field in BASE_FIELDS if field not in fields]
-        if missing:
-            raise ValueError(f"Missing required columns: {missing}")
-        return [{k: raw.get(k, "") for k in fields} for raw in reader]
+        reader = csv.reader(f)
+        first = next(reader, None)
+        if first is None:
+            return []
+
+        if looks_like_header(first):
+            fields = [str(x).strip() for x in first]
+            return [
+                {k: raw[idx] if idx < len(raw) else "" for idx, k in enumerate(fields)}
+                for raw in reader
+            ]
+
+        if len(first) < 5:
+            raise ValueError(
+                "Input CSV has neither a recognized header nor at least 5 OHLC columns. "
+                "Expected headerless order: Timestamp,Open,High,Low,Close[,Volume]."
+            )
+
+        rows = [first] + list(reader)
+        return [
+            {k: raw[idx] if idx < len(raw) else "" for idx, k in enumerate(RAW_FIELDS)}
+            for raw in rows
+        ]
 
 
 def evaluate(
@@ -104,7 +128,6 @@ def evaluate(
         if any(value is None for value in closes + highs):
             continue
 
-        # Excel F: IF(E-B>0,AVERAGE(E_window),IF(E-B<0,AVERAGE(C_window),E))
         body = c - o
         predict = (
             sum(closes) / 6.0
@@ -112,19 +135,17 @@ def evaluate(
             else (sum(highs) / 6.0 if body < 0 else c)
         )
 
-        # Excel G/H
         ct = sign(next_c - c, g_threshold)
         pt = sign(predict - c, h_threshold)
 
-        # Excel I/J/K/L/M/N/O/P. These are retained as explicit final outputs.
         pt_eq_ct = int(pt == ct and pt != 0)
         positive_pt_eq_ct = int(pt == ct and pt == 1)
         negative_pt_eq_ct = int(pt == ct and pt == -1)
 
-        q = c - o       # CO
-        r = h - c       # HC
-        s = l - c       # LC (exact Excel expression: D-E)
-        t = h - o       # HO
+        q = c - o
+        r = h - c
+        s = l - c
+        t = h - o
 
         hc_gt_co = int(r > q)
         lc_gt_co = int(s > q)
@@ -133,36 +154,26 @@ def evaluate(
         lc_lt_co = int(s < q)
         hc_lt_ho = int(r < t)
 
-        # Exact Excel J/L evidence columns.
         bullish_evidence = int(hc_gt_co + lc_gt_co + hc_gt_ho == 3)
-        bearish_evidence = -1 if hc_lt_co + lc_lt_co + hc_lt_ho == 0 else 0
+        bearish_evidence = -1 if hc_lt_co + lc_lt_co + hc_lt_ho == 3 else 0
 
         if am_mode == "literal":
-            # Exact behavioral translation of:
-            # IF(AND(SUM(AB:AD)=2,(D-B))<50,-1,0)
-            # Excel coerces the second AND argument to TRUE/FALSE before <50,
-            # so the condition is determined by SUM(AB:AD)=2.
             bullish = int(hc_gt_co + lc_gt_co + hc_gt_ho == 2 and q > 50)
             bearish = int(hc_lt_co + lc_lt_co + hc_lt_ho == 2)
         elif am_mode == "corrected":
-            # Intended arithmetic interpretation if the malformed Excel formula
-            # is corrected to compare (D-B) with 50.
             bullish = int(hc_gt_co + lc_gt_co + hc_gt_ho == 2 and (h - o) > 50)
             bearish = int(hc_lt_co + lc_lt_co + hc_lt_ho == 2 and (l - o) < 50)
         else:
             raise ValueError(f"Unsupported am_mode: {am_mode}")
 
-        # Exact Excel AM/AN direction score and direction.
         direction_score = 1 if bullish else (-1 if bearish else 0)
         an = direction_score
 
-        # Excel M/N/O/P
         positive_direction_match = int(pt == 1 and bullish_evidence == 1)
         positive_move = (next_c - c) if positive_direction_match else 0.0
         negative_direction_match = int(pt == -1 and bearish_evidence == -1)
         negative_move = (c - next_c) if negative_direction_match else 0.0
 
-        # Excel Q:AO
         fold_valid = 1
         predicted_close = (
             h - o + c
