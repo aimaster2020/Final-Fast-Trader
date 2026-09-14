@@ -33,7 +33,8 @@ def evaluate(rows, g_threshold: float, h_threshold: float, magnitude_threshold: 
     out = []
     for i in range(5, len(rows) - 1):
         current, nxt = rows[i], rows[i + 1]
-        o, h, l, c, next_c = (num(current.get(k)) for k in ("Open", "High", "Low", "Close")) + (num(nxt.get("Close")),)
+        o, h, l, c = (num(current.get(k)) for k in ("Open", "High", "Low", "Close"))
+        next_c = num(nxt.get("Close"))
         if None in (o, h, l, c, next_c):
             continue
 
