@@ -40,6 +40,7 @@ def load_rows(path: Path, year: int) -> list[dict[str, str]]:
         first = next(reader, None)
         if first is None:
             return []
+
         if looks_like_header(first):
             fields = [str(x).strip() for x in first]
             raw_rows = [
@@ -130,30 +131,100 @@ def calculate(rows, ct_up: float, ct_down: float) -> list[dict[str, object]]:
 
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["Timestamp", "Open", "High", "Low", "Close", "predict", "ct", "pt", "pt=ct", "(-)pt=ct", "Long_Return", "Short_Return"]
+    fields = [
+        "Timestamp", "Open", "High", "Low", "Close",
+        "predict", "ct", "pt", "pt=ct", "(-)pt=ct",
+        "Long_Return", "Short_Return",
+    ]
     with path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
 
-def summarize(rows: list[dict[str, object]], commission: float) -> None:
+def commission_events(rows: list[dict[str, object]], commission_per_side: float) -> dict[str, float | int]:
+    """Charge commission only when the actual position changes.
+
+    PT=1 means desired Long, PT=-1 means desired Short, and PT=0 means no
+    new directional position. The existing Excel return formulas stay intact;
+    this function only determines real entry/exit fee events for those active
+    Long/Short runs. Repeated signals in an already-open position add no fee.
+    An open position at the end pays entry fee only; no artificial exit fee.
+    """
+    valid = [r for r in rows if r.get("pt") != ""]
+    position = 0
+    entry_count = 0
+    exit_count = 0
+    long_entries = 0
+    short_entries = 0
+    long_exits = 0
+    short_exits = 0
+
+    for row in valid:
+        pt = int(row["pt"])
+        desired = pt if pt in (-1, 1) else 0
+
+        if position == 0:
+            if desired != 0:
+                position = desired
+                entry_count += 1
+                if position == 1:
+                    long_entries += 1
+                else:
+                    short_entries += 1
+        elif position == 1:
+            if desired == -1:
+                exit_count += 1
+                long_exits += 1
+                position = -1
+                entry_count += 1
+                short_entries += 1
+        elif position == -1:
+            if desired == 1:
+                exit_count += 1
+                short_exits += 1
+                position = 1
+                entry_count += 1
+                long_entries += 1
+
+    # A PT=0 does not automatically create an exit. This matches the idea of
+    # avoiding artificial re-entries while a directional position remains active.
+    open_position = position
+    fees = (entry_count + exit_count) * commission_per_side
+
+    return {
+        "entry_count": entry_count,
+        "exit_count": exit_count,
+        "long_entries": long_entries,
+        "short_entries": short_entries,
+        "long_exits": long_exits,
+        "short_exits": short_exits,
+        "open_position": open_position,
+        "commission_total": fees,
+    }
+
+
+def summarize(rows: list[dict[str, object]], commission_per_side: float) -> None:
     valid = [r for r in rows if r.get("pt") != ""]
     up = [r for r in valid if r["pt"] == 1]
     down = [r for r in valid if r["pt"] == -1]
     hold = [r for r in valid if r["pt"] == 0]
     up_correct = sum(1 for r in up if r["ct"] == 1)
     down_correct = sum(1 for r in down if r["ct"] == -1)
+
     long_returns = [float(r["Long_Return"]) for r in rows if float(r["Long_Return"]) != 0.0]
     short_returns = [float(r["Short_Return"]) for r in rows if float(r["Short_Return"]) != 0.0]
     long_positive = [x for x in long_returns if x > 0]
     long_negative = [x for x in long_returns if x < 0]
     short_positive = [x for x in short_returns if x > 0]
     short_negative = [x for x in short_returns if x < 0]
-    long_net = [x - commission for x in long_returns]
-    short_net = [x - commission for x in short_returns]
+
     long_sum = sum(long_returns)
     short_sum = sum(short_returns)
+    gross_sum = long_sum + short_sum
+
+    fees = commission_events(rows, commission_per_side)
+    net_sum = gross_sum - float(fees["commission_total"])
 
     print("=" * 100)
     print("EXACT EXCEL SAMPLE / FORMULA TEST")
@@ -162,7 +233,7 @@ def summarize(rows: list[dict[str, object]], commission: float) -> None:
     print(f"YEAR={ARGS.year}")
     print(f"CT_UP={ARGS.ct_up:g}")
     print(f"CT_DOWN={ARGS.ct_down:g}")
-    print(f"COMMISSION_ROUND_TRIP={commission * 100:.4f}%")
+    print(f"COMMISSION_PER_SIDE={commission_per_side * 100:.4f}%")
     print()
     print("pt summary")
     print(f"all={len(valid)}")
@@ -171,22 +242,32 @@ def summarize(rows: list[dict[str, object]], commission: float) -> None:
     print(f"hold={len(hold)}")
     print()
     print("final Long formula")
-    print(f"signals={len(long_returns)} positive={len(long_positive)} negative={len(long_negative)} hit_rate={len(long_positive) / len(long_returns) * 100:.3f}%" if long_returns else "signals=0")
+    print(
+        f"signals={len(long_returns)} positive={len(long_positive)} negative={len(long_negative)} "
+        f"hit_rate={len(long_positive) / len(long_returns) * 100:.3f}%" if long_returns else "signals=0"
+    )
     print(f"avg_return={long_sum / len(long_returns) if long_returns else 0.0:.10f} total_return={long_sum:.10f}")
     print(f"avg_win={sum(long_positive) / len(long_positive) if long_positive else 0.0:.10f} avg_loss={sum(long_negative) / len(long_negative) if long_negative else 0.0:.10f}")
     print()
     print("final Short formula")
-    print(f"signals={len(short_returns)} positive={len(short_positive)} negative={len(short_negative)} hit_rate={len(short_positive) / len(short_returns) * 100:.3f}%" if short_returns else "signals=0")
+    print(
+        f"signals={len(short_returns)} positive={len(short_positive)} negative={len(short_negative)} "
+        f"hit_rate={len(short_positive) / len(short_returns) * 100:.3f}%" if short_returns else "signals=0"
+    )
     print(f"avg_return={short_sum / len(short_returns) if short_returns else 0.0:.10f} total_return={short_sum:.10f}")
     print(f"avg_win={sum(short_positive) / len(short_positive) if short_positive else 0.0:.10f} avg_loss={sum(short_negative) / len(short_negative) if short_negative else 0.0:.10f}")
     print()
+    print("actual position / commission")
+    print(f"entries={fees['entry_count']} exits={fees['exit_count']}")
+    print(f"long_entries={fees['long_entries']} short_entries={fees['short_entries']}")
+    print(f"long_exits={fees['long_exits']} short_exits={fees['short_exits']}")
+    print(f"open_position_at_end={fees['open_position']}")
+    print(f"commission_total={float(fees['commission_total']):.10f}")
+    print()
     print("combined")
     print(f"signal_count={len(long_returns) + len(short_returns)}")
-    print(f"total_return_sum={long_sum + short_sum:.10f}")
-    print()
-    print("net per-signal average")
-    print(f"long_avg_net={sum(long_net) / len(long_net) if long_net else 0.0:.10f}")
-    print(f"short_avg_net={sum(short_net) / len(short_net) if short_net else 0.0:.10f}")
+    print(f"gross_total_return_sum={gross_sum:.10f}")
+    print(f"net_total_return_sum={net_sum:.10f}")
 
 
 ARGS = None
@@ -199,11 +280,13 @@ def main() -> None:
     p.add_argument("--year", type=int, default=2026)
     p.add_argument("--ct-up", type=float, default=600.0)
     p.add_argument("--ct-down", type=float, default=100.0)
-    p.add_argument("--commission", type=float, default=0.0)
+    p.add_argument("--commission", type=float, default=0.0013, help="commission per actual entry/exit side; default 0.13%%")
     p.add_argument("--output", required=True)
     ARGS = p.parse_args()
+
     if ARGS.ct_up < 0 or ARGS.ct_down < 0 or ARGS.commission < 0:
         raise ValueError("thresholds and commission must be >= 0")
+
     rows = load_rows(Path(ARGS.input), ARGS.year)
     rows.sort(key=lambda row: row.get("Timestamp", ""))
     result = calculate(rows, ARGS.ct_up, ARGS.ct_down)
