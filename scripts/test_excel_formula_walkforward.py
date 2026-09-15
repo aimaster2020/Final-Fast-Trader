@@ -3,18 +3,21 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-from typing import Iterable
-
 
 RAW_FIELDS = ["Timestamp", "Open", "High", "Low", "Close", "Volume"]
-FINAL_FIELDS = [
-    "Timestamp", "Open", "High", "Low", "Close",
-    "predict", "ct", "pt", "pt=ct", "positive_pt=ct", "negative_pt=ct",
-    "HC>CO", "LC>CO", "HC>HO", "M_long_signal", "N_Long_Move",
-    "N_Long_Move_Pct", "N_Long_Net_Pct",
-    "HC<CO", "LC<CO", "HC<HO", "O_short_signal", "P_Short_Move",
-    "P_Short_Move_Pct", "P_Short_Net_Pct",
-    "CO", "HC", "LC", "HO", "Close_next", "V", "Next_Return",
+OUTPUT_FIELDS = [
+    "Timestamp",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "predict",
+    "ct",
+    "pt",
+    "pt=ct",
+    "(-)pt=ct",
+    "Long_Return",
+    "Short_Return",
 ]
 
 
@@ -27,10 +30,10 @@ def num(value):
         return None
 
 
-def sign(value: float, threshold: float) -> int:
-    if value > threshold:
+def sign_asymmetric(value: float, up_threshold: float, down_threshold: float) -> int:
+    if value > up_threshold:
         return 1
-    if value < -threshold:
+    if value < -down_threshold:
         return -1
     return 0
 
@@ -40,7 +43,7 @@ def looks_like_header(row: list[str]) -> bool:
     return {"timestamp", "open", "high", "low", "close"}.issubset(normalized)
 
 
-def load_rows(path: Path):
+def load_rows(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
         first = next(reader, None)
@@ -56,7 +59,6 @@ def load_rows(path: Path):
 
         if len(first) < 5:
             raise ValueError(
-                "Input CSV has neither a recognized header nor at least 5 OHLC columns. "
                 "Expected headerless order: Timestamp,Open,High,Low,Close[,Volume]."
             )
 
@@ -67,150 +69,195 @@ def load_rows(path: Path):
         ]
 
 
-def evaluate(rows, g_threshold: float, h_threshold: float, commission_rate: float):
-    out = []
+def build_rows(
+    rows: list[dict[str, str]],
+    ct_up_threshold: float,
+    ct_down_threshold: float,
+) -> list[dict[str, object]]:
+    """Match the supplied Excel formulas row-for-row.
 
-    for i in range(5, len(rows) - 1):
-        current, nxt = rows[i], rows[i + 1]
-        o, h, l, c = (num(current.get(k)) for k in ("Open", "High", "Low", "Close"))
+    Predict formula for row r (once six candles exist):
+      IF(Close-Open>0, AVERAGE(last 6 closes),
+         IF(Close-Open<0, AVERAGE(last 6 highs), Close))
+
+    ct formula:
+      +1 when next close - current close > ct_up_threshold
+      -1 when next close - current close < -ct_down_threshold
+
+    pt formula:
+      +1 when predict - current close > ct_up_threshold
+      -1 when predict - current close < -ct_down_threshold
+
+    pt=ct and (-)pt=ct are exact Excel-style agreement flags.
+
+    Final return formulas from the supplied sheet:
+      Long_Return  = IF(OR(pt_current=1, pt_previous=1),
+                         (next_close-current_close)/current_close, 0)
+      Short_Return = IFERROR(IF(OR(pt_current=-1, pt_previous=-1),
+                         (current_close-next_close)/next_close, 0), 0)
+    """
+    output: list[dict[str, object]] = []
+
+    # The Excel sample starts calculations after six candles are available.
+    for i in range(len(rows) - 1):
+        current = rows[i]
+        nxt = rows[i + 1]
+
+        o = num(current.get("Open"))
+        h = num(current.get("High"))
+        c = num(current.get("Close"))
         next_c = num(nxt.get("Close"))
-        if None in (o, h, l, c, next_c):
+        if None in (o, h, c, next_c):
             continue
 
-        window = rows[i - 5:i + 1]
-        closes = [num(x.get("Close")) for x in window]
-        highs = [num(x.get("High")) for x in window]
-        if any(value is None for value in closes + highs):
-            continue
+        predict: float | None = None
+        ct = ""
+        pt = ""
+        pt_eq_ct = ""
+        neg_pt_eq_ct = ""
+        long_return = 0.0
+        short_return = 0.0
 
-        body = c - o
-        predict = sum(closes) / 6.0 if body > 0 else (sum(highs) / 6.0 if body < 0 else c)
+        # Excel has blank formulas until the six-row moving window exists.
+        if i >= 5:
+            window = rows[i - 5 : i + 1]
+            closes = [num(x.get("Close")) for x in window]
+            highs = [num(x.get("High")) for x in window]
+            if all(v is not None for v in closes + highs):
+                body = c - o
+                if body > 0:
+                    predict = sum(closes) / 6.0
+                elif body < 0:
+                    predict = sum(highs) / 6.0
+                else:
+                    predict = c
 
-        ct = sign(next_c - c, g_threshold)
-        pt = sign(predict - c, h_threshold)
-        pt_eq_ct = int(pt == ct and pt != 0)
-        positive_pt_eq_ct = int(pt == ct and pt == 1)
-        negative_pt_eq_ct = int(pt == ct and pt == -1)
+                actual_delta = next_c - c
+                predicted_delta = predict - c
+                ct_value = sign_asymmetric(
+                    actual_delta, ct_up_threshold, ct_down_threshold
+                )
+                pt_value = sign_asymmetric(
+                    predicted_delta, ct_up_threshold, ct_down_threshold
+                )
+                ct = ct_value
+                pt = pt_value
+                pt_eq_ct = int(pt_value == ct_value and pt_value == 1)
+                neg_pt_eq_ct = int(pt_value == ct_value and pt_value == -1)
 
-        q = c - o
-        r = h - c
-        s = l - c
-        t = h - o
+                previous_pt = None
+                if i - 1 >= 5:
+                    previous_predict = output[i - 1].get("predict")
+                    previous_pt = output[i - 1].get("pt")
+                    # previous_pt is already the exact Excel pt value for row i-1.
+                    _ = previous_predict
 
-        hc_gt_co = int(r > q)
-        lc_gt_co = int(s > q)
-        hc_gt_ho = int(r > t)
+                if pt_value == 1 or previous_pt == 1:
+                    long_return = (next_c - c) / c if c else 0.0
 
-        j_bullish_confirmation = int(hc_gt_co + lc_gt_co + hc_gt_ho == 3)
+                if pt_value == -1 or previous_pt == -1:
+                    short_return = (c - next_c) / next_c if next_c else 0.0
 
-        # Exact supplied Excel formula for L:
-        # =IF(SUM(X:Z)=0,-1,0)
-        # where X:Z are HC>CO, LC>CO, HC>HO.
-        l_bearish_confirmation = -1 if (hc_gt_co + lc_gt_co + hc_gt_ho) == 0 else 0
+        output.append(
+            {
+                "Timestamp": current.get("Timestamp", ""),
+                "Open": o,
+                "High": h,
+                "Low": num(current.get("Low")),
+                "Close": c,
+                "predict": predict if predict is not None else "",
+                "ct": ct,
+                "pt": pt,
+                "pt=ct": pt_eq_ct,
+                "(-)pt=ct": neg_pt_eq_ct,
+                "Long_Return": long_return,
+                "Short_Return": short_return,
+            }
+        )
 
-        hc_lt_co = int(r < q)
-        lc_lt_co = int(s < q)
-        hc_lt_ho = int(r < t)
+    return output
 
-        m_long_signal = int(pt == 1 and j_bullish_confirmation == 1)
-        n_long_move = (next_c - c) if m_long_signal == 1 else 0.0
-        n_long_move_pct = n_long_move / c * 100.0 if m_long_signal and c else 0.0
-        n_long_net_pct = n_long_move_pct - commission_rate * 100.0 if m_long_signal else 0.0
 
-        o_short_signal = int(pt == -1 and l_bearish_confirmation == -1)
-        p_short_move = (c - next_c) if o_short_signal == 1 else 0.0
-        p_short_move_pct = p_short_move / c * 100.0 if o_short_signal and c else 0.0
-        p_short_net_pct = p_short_move_pct - commission_rate * 100.0 if o_short_signal else 0.0
+def summarize(result: list[dict[str, object]], commission_rate: float) -> dict[str, float | int]:
+    valid = [r for r in result if r["pt"] != ""]
+    up = [r for r in valid if r["pt"] == 1]
+    down = [r for r in valid if r["pt"] == -1]
+    hold = [r for r in valid if r["pt"] == 0]
+    long_returns = [float(r["Long_Return"]) for r in result if float(r["Long_Return"]) != 0.0]
+    short_returns = [float(r["Short_Return"]) for r in result if float(r["Short_Return"]) != 0.0]
 
-        actual_move = next_c - c
+    round_trip_pct = commission_rate * 100.0
+    long_net = [x - commission_rate for x in long_returns]
+    short_net = [x - commission_rate for x in short_returns]
 
-        out.append({
-            "Timestamp": current.get("Timestamp", ""),
-            "Open": o, "High": h, "Low": l, "Close": c,
-            "predict": predict, "ct": ct, "pt": pt,
-            "pt=ct": pt_eq_ct,
-            "positive_pt=ct": positive_pt_eq_ct,
-            "negative_pt=ct": negative_pt_eq_ct,
-            "HC>CO": hc_gt_co, "LC>CO": lc_gt_co, "HC>HO": hc_gt_ho,
-            "M_long_signal": m_long_signal, "N_Long_Move": n_long_move,
-            "N_Long_Move_Pct": n_long_move_pct, "N_Long_Net_Pct": n_long_net_pct,
-            "HC<CO": hc_lt_co, "LC>CO": lc_gt_co, "HC>HO": hc_gt_ho,
-            "HC<CO": hc_lt_co, "LC<CO": lc_lt_co, "HC<HO": hc_lt_ho,
-            "O_short_signal": o_short_signal, "P_Short_Move": p_short_move,
-            "P_Short_Move_Pct": p_short_move_pct, "P_Short_Net_Pct": p_short_net_pct,
-            "CO": q, "HC": r, "LC": s, "HO": t,
-            "Close_next": next_c, "V": actual_move,
-            "Next_Return": actual_move / c if c else 0.0,
-        })
-
-    long_signals = [r for r in out if r["M_long_signal"] == 1]
-    short_signals = [r for r in out if r["O_short_signal"] == 1]
-    long_moves = [float(r["N_Long_Move"]) for r in long_signals]
-    short_moves = [float(r["P_Short_Move"]) for r in short_signals]
-    long_move_pcts = [float(r["N_Long_Move_Pct"]) for r in long_signals]
-    short_move_pcts = [float(r["P_Short_Move_Pct"]) for r in short_signals]
-    long_net_pcts = [float(r["N_Long_Net_Pct"]) for r in long_signals]
-    short_net_pcts = [float(r["P_Short_Net_Pct"]) for r in short_signals]
-    all_moves = long_moves + short_moves
-    all_net_pcts = long_net_pcts + short_net_pcts
-
-    stats = {
-        "frames": len(out),
-        "commission_each_side_pct": commission_rate * 50.0,
-        "commission_round_trip_pct": commission_rate * 100.0,
-        "long_signals": len(long_signals),
-        "short_signals": len(short_signals),
-        "total_signals": len(all_moves),
-        "long_avg_move": sum(long_moves) / len(long_moves) if long_moves else 0.0,
-        "short_avg_move": sum(short_moves) / len(short_moves) if short_moves else 0.0,
-        "combined_avg_move": sum(all_moves) / len(all_moves) if all_moves else 0.0,
-        "long_total_move": sum(long_moves),
-        "short_total_move": sum(short_moves),
-        "combined_total_move": sum(all_moves),
-        "long_avg_move_pct": sum(long_move_pcts) / len(long_move_pcts) if long_move_pcts else 0.0,
-        "short_avg_move_pct": sum(short_move_pcts) / len(short_move_pcts) if short_move_pcts else 0.0,
-        "long_avg_net_pct": sum(long_net_pcts) / len(long_net_pcts) if long_net_pcts else 0.0,
-        "short_avg_net_pct": sum(short_net_pcts) / len(short_net_pcts) if short_net_pcts else 0.0,
-        "combined_avg_net_pct_per_trade": sum(all_net_pcts) / len(all_net_pcts) if all_net_pcts else 0.0,
-        "long_total_net_pct_sum": sum(long_net_pcts),
-        "short_total_net_pct_sum": sum(short_net_pcts),
-        "combined_total_net_pct_sum": sum(all_net_pcts),
-        "net_positive_trades": sum(1 for x in all_net_pcts if x > 0),
-        "net_negative_trades": sum(1 for x in all_net_pcts if x < 0),
-        "net_breakeven_trades": sum(1 for x in all_net_pcts if x == 0),
+    return {
+        "all_pt": len(valid),
+        "pt_up": len(up),
+        "pt_down": len(down),
+        "pt_hold": len(hold),
+        "pt_up_accuracy": sum(1 for r in up if r.get("ct") == 1) / len(up) if up else 0.0,
+        "pt_down_accuracy": sum(1 for r in down if r.get("ct") == -1) / len(down) if down else 0.0,
+        "pt_agreement_up": sum(int(r["pt=ct"] == 1) for r in valid),
+        "pt_agreement_down": sum(int(r["(-)pt=ct"] == 1) for r in valid),
+        "long_signals": len(long_returns),
+        "short_signals": len(short_returns),
+        "long_total_return": sum(long_returns),
+        "short_total_return": sum(short_returns),
+        "long_avg_return": sum(long_returns) / len(long_returns) if long_returns else 0.0,
+        "short_avg_return": sum(short_returns) / len(short_returns) if short_returns else 0.0,
+        "long_total_net": sum(long_net),
+        "short_total_net": sum(short_net),
+        "long_avg_net": sum(long_net) / len(long_net) if long_net else 0.0,
+        "short_avg_net": sum(short_net) / len(short_net) if short_net else 0.0,
+        "commission_round_trip_pct": round_trip_pct,
     }
-    return out, stats
 
 
-def write_csv(path: Path, rows: Iterable[dict]):
+def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=FINAL_FIELDS, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
 
-def main():
-    p = argparse.ArgumentParser(description="Final output matching the supplied Excel final move formulas")
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Exact implementation of the supplied Excel sample/formula logic"
+    )
     p.add_argument("--input", required=True)
-    p.add_argument("--g", type=float, default=0.0)
-    p.add_argument("--h", type=float, default=0.0)
-    p.add_argument("--commission", type=float, default=0.0026,
-                   help="Round-trip commission as decimal; default 0.0026 = 0.26%%")
+    p.add_argument("--ct-up", type=float, default=600.0,
+                   help="Excel F3-style upward threshold; default 600")
+    p.add_argument("--ct-down", type=float, default=100.0,
+                   help="Excel F4-style downward threshold; default 100")
+    p.add_argument("--commission", type=float, default=0.0,
+                   help="Round-trip commission as decimal; default 0")
     p.add_argument("--output", required=True)
     args = p.parse_args()
 
-    if args.commission < 0:
-        raise ValueError("--commission must be >= 0")
+    if args.ct_up < 0 or args.ct_down < 0 or args.commission < 0:
+        raise ValueError("thresholds and commission must be >= 0")
 
-    result, stats = evaluate(load_rows(Path(args.input)), args.g, args.h, args.commission)
+    result = build_rows(load_rows(Path(args.input)), args.ct_up, args.ct_down)
     write_csv(Path(args.output), result)
+    stats = summarize(result, args.commission)
 
-    print(f"G={args.g:g} H={args.h:g}")
+    print("=" * 100)
+    print("EXACT EXCEL SAMPLE / FORMULA TEST")
+    print("=" * 100)
+    print(f"CT_UP={args.ct_up:g}")
+    print(f"CT_DOWN={args.ct_down:g}")
     print(f"COMMISSION_ROUND_TRIP={args.commission * 100:.4f}%")
     print(f"output={args.output}")
+    print()
     for key, value in stats.items():
-        print(f"{key}={value:.6f}" if isinstance(value, float) else f"{key}={value}")
+        if isinstance(value, float):
+            if "accuracy" in key or "agreement" in key:
+                print(f"{key}={value * 100:.6f}%")
+            else:
+                print(f"{key}={value:.10f}")
+        else:
+            print(f"{key}={value}")
 
 
 if __name__ == "__main__":
