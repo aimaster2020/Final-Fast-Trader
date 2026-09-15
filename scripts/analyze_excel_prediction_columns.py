@@ -29,7 +29,12 @@ def looks_like_header(row: list[str]) -> bool:
     return {"timestamp", "open", "high", "low", "close"}.issubset(normalized)
 
 
-def load_rows(path: Path) -> list[dict[str, str]]:
+def is_year(value: str, year: int) -> bool:
+    text = str(value).strip()
+    return text.startswith(str(year))
+
+
+def load_rows(path: Path, year: int) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
         first = next(reader, None)
@@ -37,17 +42,22 @@ def load_rows(path: Path) -> list[dict[str, str]]:
             return []
         if looks_like_header(first):
             fields = [str(x).strip() for x in first]
-            return [
+            raw_rows = [
                 {k: raw[idx] if idx < len(raw) else "" for idx, k in enumerate(fields)}
                 for raw in reader
             ]
-        if len(first) < 5:
-            raise ValueError("Expected headerless order: Timestamp,Open,High,Low,Close[,Volume].")
-        rows = [first] + list(reader)
-        return [
-            {k: raw[idx] if idx < len(raw) else "" for idx, k in enumerate(RAW_FIELDS)}
-            for raw in rows
-        ]
+        else:
+            if len(first) < 5:
+                raise ValueError("Expected headerless order: Timestamp,Open,High,Low,Close[,Volume].")
+            raw_rows = [
+                {k: raw[idx] if idx < len(raw) else "" for idx, k in enumerate(RAW_FIELDS)}
+                for raw in [first] + list(reader)
+            ]
+
+    rows = [row for row in raw_rows if is_year(row.get("Timestamp", ""), year)]
+    if not rows:
+        raise ValueError(f"No rows found for year {year}.")
+    return rows
 
 
 def calculate(rows, ct_up: float, ct_down: float) -> list[dict[str, object]]:
@@ -64,7 +74,7 @@ def calculate(rows, ct_up: float, ct_down: float) -> list[dict[str, object]]:
         next_c = num(nxt.get("Close"))
 
         if None in (o, h, low, c, next_c):
-            result.append({"pt": "", "ct": "", "long_return": 0.0, "short_return": 0.0})
+            result.append({"pt": "", "ct": "", "Long_Return": 0.0, "Short_Return": 0.0})
             continue
 
         predict: float | None = None
@@ -75,7 +85,6 @@ def calculate(rows, ct_up: float, ct_down: float) -> list[dict[str, object]]:
         long_return = 0.0
         short_return = 0.0
 
-        # Exact Excel predict formula: six-candle window ending at current row.
         if i >= 5:
             window = rows[i - 5 : i + 1]
             closes = [num(x.get("Close")) for x in window]
@@ -94,9 +103,6 @@ def calculate(rows, ct_up: float, ct_down: float) -> list[dict[str, object]]:
                 pt_eq_ct = int(pt == ct and pt == 1)
                 neg_pt_eq_ct = int(pt == ct and pt == -1)
 
-                # Exact Excel L/M formulas:
-                # Long: OR(current PT=1, previous PT=1)
-                # Short: OR(current PT=-1, previous PT=-1)
                 if pt == 1 or previous_pt == 1:
                     long_return = (next_c - c) / c if c else 0.0
                 if pt == -1 or previous_pt == -1:
@@ -124,11 +130,7 @@ def calculate(rows, ct_up: float, ct_down: float) -> list[dict[str, object]]:
 
 def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fields = [
-        "Timestamp", "Open", "High", "Low", "Close",
-        "predict", "ct", "pt", "pt=ct", "(-)pt=ct",
-        "Long_Return", "Short_Return",
-    ]
+    fields = ["Timestamp", "Open", "High", "Low", "Close", "predict", "ct", "pt", "pt=ct", "(-)pt=ct", "Long_Return", "Short_Return"]
     with path.open("w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
@@ -140,31 +142,24 @@ def summarize(rows: list[dict[str, object]], commission: float) -> None:
     up = [r for r in valid if r["pt"] == 1]
     down = [r for r in valid if r["pt"] == -1]
     hold = [r for r in valid if r["pt"] == 0]
-
     up_correct = sum(1 for r in up if r["ct"] == 1)
     down_correct = sum(1 for r in down if r["ct"] == -1)
-
     long_returns = [float(r["Long_Return"]) for r in rows if float(r["Long_Return"]) != 0.0]
     short_returns = [float(r["Short_Return"]) for r in rows if float(r["Short_Return"]) != 0.0]
-
     long_positive = [x for x in long_returns if x > 0]
     long_negative = [x for x in long_returns if x < 0]
-    long_flat = [x for x in long_returns if x == 0]
     short_positive = [x for x in short_returns if x > 0]
     short_negative = [x for x in short_returns if x < 0]
-    short_flat = [x for x in short_returns if x == 0]
-
     long_net = [x - commission for x in long_returns]
     short_net = [x - commission for x in short_returns]
-
     long_sum = sum(long_returns)
     short_sum = sum(short_returns)
-    combined_sum = long_sum + short_sum
 
     print("=" * 100)
     print("EXACT EXCEL SAMPLE / FORMULA TEST")
     print("=" * 100)
     print(f"frames={len(valid)}")
+    print(f"YEAR={ARGS.year}")
     print(f"CT_UP={ARGS.ct_up:g}")
     print(f"CT_DOWN={ARGS.ct_down:g}")
     print(f"COMMISSION_ROUND_TRIP={commission * 100:.4f}%")
@@ -176,38 +171,18 @@ def summarize(rows: list[dict[str, object]], commission: float) -> None:
     print(f"hold={len(hold)}")
     print()
     print("final Long formula")
-    print(
-        f"signals={len(long_returns)} positive={len(long_positive)} "
-        f"negative={len(long_negative)} flat={len(long_flat)} "
-        f"hit_rate={len(long_positive) / len(long_returns) * 100:.3f}%" if long_returns else "signals=0"
-    )
-    print(
-        f"avg_return={long_sum / len(long_returns) if long_returns else 0.0:.10f} "
-        f"total_return={long_sum:.10f}"
-    )
-    print(
-        f"avg_win={sum(long_positive) / len(long_positive) if long_positive else 0.0:.10f} "
-        f"avg_loss={sum(long_negative) / len(long_negative) if long_negative else 0.0:.10f}"
-    )
+    print(f"signals={len(long_returns)} positive={len(long_positive)} negative={len(long_negative)} hit_rate={len(long_positive) / len(long_returns) * 100:.3f}%" if long_returns else "signals=0")
+    print(f"avg_return={long_sum / len(long_returns) if long_returns else 0.0:.10f} total_return={long_sum:.10f}")
+    print(f"avg_win={sum(long_positive) / len(long_positive) if long_positive else 0.0:.10f} avg_loss={sum(long_negative) / len(long_negative) if long_negative else 0.0:.10f}")
     print()
     print("final Short formula")
-    print(
-        f"signals={len(short_returns)} positive={len(short_positive)} "
-        f"negative={len(short_negative)} flat={len(short_flat)} "
-        f"hit_rate={len(short_positive) / len(short_returns) * 100:.3f}%" if short_returns else "signals=0"
-    )
-    print(
-        f"avg_return={short_sum / len(short_returns) if short_returns else 0.0:.10f} "
-        f"total_return={short_sum:.10f}"
-    )
-    print(
-        f"avg_win={sum(short_positive) / len(short_positive) if short_positive else 0.0:.10f} "
-        f"avg_loss={sum(short_negative) / len(short_negative) if short_negative else 0.0:.10f}"
-    )
+    print(f"signals={len(short_returns)} positive={len(short_positive)} negative={len(short_negative)} hit_rate={len(short_positive) / len(short_returns) * 100:.3f}%" if short_returns else "signals=0")
+    print(f"avg_return={short_sum / len(short_returns) if short_returns else 0.0:.10f} total_return={short_sum:.10f}")
+    print(f"avg_win={sum(short_positive) / len(short_positive) if short_positive else 0.0:.10f} avg_loss={sum(short_negative) / len(short_negative) if short_negative else 0.0:.10f}")
     print()
     print("combined")
     print(f"signal_count={len(long_returns) + len(short_returns)}")
-    print(f"total_return_sum={combined_sum:.10f}")
+    print(f"total_return_sum={long_sum + short_sum:.10f}")
     print()
     print("net per-signal average")
     print(f"long_avg_net={sum(long_net) / len(long_net) if long_net else 0.0:.10f}")
@@ -221,19 +196,21 @@ def main() -> None:
     global ARGS
     p = argparse.ArgumentParser(description="Exact implementation of the supplied Excel sample/formula logic")
     p.add_argument("--input", required=True)
+    p.add_argument("--year", type=int, default=2026)
     p.add_argument("--ct-up", type=float, default=600.0)
     p.add_argument("--ct-down", type=float, default=100.0)
     p.add_argument("--commission", type=float, default=0.0)
     p.add_argument("--output", required=True)
     ARGS = p.parse_args()
-
     if ARGS.ct_up < 0 or ARGS.ct_down < 0 or ARGS.commission < 0:
         raise ValueError("thresholds and commission must be >= 0")
-
-    rows = calculate(load_rows(Path(ARGS.input)), ARGS.ct_up, ARGS.ct_down)
-    write_csv(Path(ARGS.output), rows)
+    rows = load_rows(Path(ARGS.input), ARGS.year)
+    rows.sort(key=lambda row: row.get("Timestamp", ""))
+    result = calculate(rows, ARGS.ct_up, ARGS.ct_down)
+    write_csv(Path(ARGS.output), result)
     print(f"output={ARGS.output}")
-    summarize(rows, ARGS.commission)
+    print(f"input_rows_{ARGS.year}={len(rows)}")
+    summarize(result, ARGS.commission)
 
 
 if __name__ == "__main__":
