@@ -6,11 +6,16 @@ body > F3 -> average previous N closes
 body < F4 -> average previous N highs
 otherwise -> current close
 
+Prediction-range filter:
+A signal is tradable only when abs(pred - current_close) / current_close * 100
+is at least --min-prediction-pct. Signals below the threshold are treated as
+PT=0, so a flat position stays flat and an open position is held.
+
 Position logic:
 - PT=1 opens/holds long.
 - PT=-1 opens/holds short.
 - PT=0 holds an existing position; flat remains flat.
-- Opposite PT reverses at the current close.
+- Opposite qualifying PT reverses at the current close.
 
 Commission is charged on every real entry/exit side only.
 """
@@ -23,7 +28,7 @@ from typing import Optional
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Backtest previous-window formula with capital and commission.")
+    p = argparse.ArgumentParser(description="Backtest previous-window formula with capital, commission, and prediction-range filter.")
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--initial-capital", type=float, default=1000.0)
@@ -31,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--f4", type=float, default=-150.0)
     p.add_argument("--window", type=int, choices=range(1, 6), default=3)
     p.add_argument("--commission-per-side", type=float, default=0.0)
+    p.add_argument("--min-prediction-pct", type=float, default=0.0, help="Minimum predicted move magnitude in percent.")
     p.add_argument("--year", type=int, default=None)
     return p.parse_args()
 
@@ -79,9 +85,11 @@ def direction(move: float) -> int:
     return 1 if move > 0 else -1 if move < 0 else 0
 
 
-def run(rows, initial_capital: float, f3: float, f4: float, window: int, commission: float):
+def run(rows, initial_capital: float, f3: float, f4: float, window: int, commission: float, min_prediction_pct: float):
     if len(rows) <= window + 1:
         raise ValueError("Not enough rows")
+    if min_prediction_pct < 0:
+        raise ValueError("min_prediction_pct must be >= 0")
 
     capital = initial_capital
     position = 0
@@ -112,7 +120,8 @@ def run(rows, initial_capital: float, f3: float, f4: float, window: int, commiss
         else:
             pred = c
 
-        pt = direction(pred - c)
+        predicted_move_pct = abs(pred - c) / c * 100.0 if c else 0.0
+        pt = direction(pred - c) if predicted_move_pct >= min_prediction_pct else 0
         changed = False
 
         if position == 0 and pt != 0:
@@ -172,6 +181,7 @@ def run(rows, initial_capital: float, f3: float, f4: float, window: int, commiss
         equity_rows.append({
             "timestamp": ts,
             "close": c,
+            "predicted_move_pct": predicted_move_pct,
             "pt": pt,
             "position": position,
             "capital": capital,
@@ -200,13 +210,13 @@ def main() -> None:
     a = parse_args()
     rows = load_rows(Path(a.input), a.year)
     final_capital, entries, exits, wins, losses, fees, trades, open_trade, equity_rows = run(
-        rows, a.initial_capital, a.f3, a.f4, a.window, a.commission_per_side
+        rows, a.initial_capital, a.f3, a.f4, a.window, a.commission_per_side, a.min_prediction_pct
     )
 
     out = Path(a.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8", newline="") as f:
-        fields = ["timestamp", "close", "pt", "position", "capital", "mark_equity", "changed"]
+        fields = ["timestamp", "close", "predicted_move_pct", "pt", "position", "capital", "mark_equity", "changed"]
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(equity_rows)
@@ -220,6 +230,7 @@ def main() -> None:
     print(f"rows={len(rows)} frames={max(0, len(rows) - a.window - 1)}")
     print(f"initial_capital={a.initial_capital:.2f}")
     print(f"F3={a.f3:g} F4={a.f4:g} WINDOW={a.window}")
+    print(f"min_prediction_pct={a.min_prediction_pct:g}%")
     print(f"commission_per_side={a.commission_per_side*100:.4f}%")
     print()
     print("RESULT")
