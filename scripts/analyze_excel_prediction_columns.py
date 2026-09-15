@@ -94,6 +94,9 @@ def calculate(rows, ct_up: float, ct_down: float) -> list[dict[str, object]]:
                 pt_eq_ct = int(pt == ct and pt == 1)
                 neg_pt_eq_ct = int(pt == ct and pt == -1)
 
+                # Exact Excel L/M formulas:
+                # Long: OR(current PT=1, previous PT=1)
+                # Short: OR(current PT=-1, previous PT=-1)
                 if pt == 1 or previous_pt == 1:
                     long_return = (next_c - c) / c if c else 0.0
                 if pt == -1 or previous_pt == -1:
@@ -140,11 +143,23 @@ def summarize(rows: list[dict[str, object]], commission: float) -> None:
 
     up_correct = sum(1 for r in up if r["ct"] == 1)
     down_correct = sum(1 for r in down if r["ct"] == -1)
+
     long_returns = [float(r["Long_Return"]) for r in rows if float(r["Long_Return"]) != 0.0]
     short_returns = [float(r["Short_Return"]) for r in rows if float(r["Short_Return"]) != 0.0]
 
+    long_positive = [x for x in long_returns if x > 0]
+    long_negative = [x for x in long_returns if x < 0]
+    long_flat = [x for x in long_returns if x == 0]
+    short_positive = [x for x in short_returns if x > 0]
+    short_negative = [x for x in short_returns if x < 0]
+    short_flat = [x for x in short_returns if x == 0]
+
     long_net = [x - commission for x in long_returns]
     short_net = [x - commission for x in short_returns]
+
+    long_sum = sum(long_returns)
+    short_sum = sum(short_returns)
+    combined_sum = long_sum + short_sum
 
     print("=" * 100)
     print("EXACT EXCEL SAMPLE / FORMULA TEST")
@@ -160,9 +175,41 @@ def summarize(rows: list[dict[str, object]], commission: float) -> None:
     print(f"down={len(down)} accuracy_vs_ct={down_correct / len(down) * 100:.3f}%" if down else "down=0")
     print(f"hold={len(hold)}")
     print()
-    print("final return formulas")
-    print(f"long_signals={len(long_returns)} avg_return={sum(long_returns) / len(long_returns) if long_returns else 0.0:.10f} total_return={sum(long_returns):.10f}")
-    print(f"short_signals={len(short_returns)} avg_return={sum(short_returns) / len(short_returns) if short_returns else 0.0:.10f} total_return={sum(short_returns):.10f}")
+    print("final Long formula")
+    print(
+        f"signals={len(long_returns)} positive={len(long_positive)} "
+        f"negative={len(long_negative)} flat={len(long_flat)} "
+        f"hit_rate={len(long_positive) / len(long_returns) * 100:.3f}%" if long_returns else "signals=0"
+    )
+    print(
+        f"avg_return={long_sum / len(long_returns) if long_returns else 0.0:.10f} "
+        f"total_return={long_sum:.10f}"
+    )
+    print(
+        f"avg_win={sum(long_positive) / len(long_positive) if long_positive else 0.0:.10f} "
+        f"avg_loss={sum(long_negative) / len(long_negative) if long_negative else 0.0:.10f}"
+    )
+    print()
+    print("final Short formula")
+    print(
+        f"signals={len(short_returns)} positive={len(short_positive)} "
+        f"negative={len(short_negative)} flat={len(short_flat)} "
+        f"hit_rate={len(short_positive) / len(short_returns) * 100:.3f}%" if short_returns else "signals=0"
+    )
+    print(
+        f"avg_return={short_sum / len(short_returns) if short_returns else 0.0:.10f} "
+        f"total_return={short_sum:.10f}"
+    )
+    print(
+        f"avg_win={sum(short_positive) / len(short_positive) if short_positive else 0.0:.10f} "
+        f"avg_loss={sum(short_negative) / len(short_negative) if short_negative else 0.0:.10f}"
+    )
+    print()
+    print("combined")
+    print(f"signal_count={len(long_returns) + len(short_returns)}")
+    print(f"total_return_sum={combined_sum:.10f}")
+    print()
+    print("net per-signal average")
     print(f"long_avg_net={sum(long_net) / len(long_net) if long_net else 0.0:.10f}")
     print(f"short_avg_net={sum(short_net) / len(short_net) if short_net else 0.0:.10f}")
 
