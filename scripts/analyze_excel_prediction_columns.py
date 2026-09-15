@@ -142,15 +142,144 @@ def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
         writer.writerows(rows)
 
 
-def commission_events(rows: list[dict[str, object]], commission_per_side: float) -> dict[str, float | int]:
-    """Charge commission only when the actual position changes.
+def build_completed_trades(
+    rows: list[dict[str, object]],
+    commission_per_side: float,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    """Build actual position trades from PT signals.
 
-    PT=1 means desired Long, PT=-1 means desired Short, and PT=0 means no
-    new directional position. The existing Excel return formulas stay intact;
-    this function only determines real entry/exit fee events for those active
-    Long/Short runs. Repeated signals in an already-open position add no fee.
-    An open position at the end pays entry fee only; no artificial exit fee.
+    A position is opened on the first non-zero PT signal after being flat.
+    Repeated same-direction PT signals do not re-enter and do not add fees.
+    PT=0 does not exit an active position.
+    An opposite PT signal closes the current trade at that candle's Close and
+    immediately opens the opposite direction at the same Close. A position
+    still open on the final row is reported separately and excluded from the
+    completed-trade win/loss counts.
     """
+    valid = [
+        r for r in rows
+        if r.get("pt") != "" and r.get("Close") not in (None, "")
+    ]
+
+    trades: list[dict[str, object]] = []
+    position = 0
+    entry_price = None
+    entry_timestamp = None
+    entry_index = None
+
+    for idx, row in enumerate(valid):
+        pt = int(row["pt"])
+        close = float(row["Close"])
+        timestamp = row.get("Timestamp", "")
+        desired = pt if pt in (-1, 1) else 0
+
+        if position == 0:
+            if desired != 0:
+                position = desired
+                entry_price = close
+                entry_timestamp = timestamp
+                entry_index = idx
+            continue
+
+        if desired == 0 or desired == position:
+            continue
+
+        exit_price = close
+        if position == 1:
+            gross_return = (exit_price - entry_price) / entry_price
+            direction = "LONG"
+        else:
+            gross_return = (entry_price - exit_price) / entry_price
+            direction = "SHORT"
+
+        net_return = gross_return - (2.0 * commission_per_side)
+        trades.append({
+            "direction": direction,
+            "entry_timestamp": entry_timestamp,
+            "exit_timestamp": timestamp,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "gross_return": gross_return,
+            "net_return": net_return,
+            "win": net_return > 0,
+            "bars_held": idx - entry_index,
+        })
+
+        # Reverse at the same close: old position exits and new position enters.
+        position = desired
+        entry_price = close
+        entry_timestamp = timestamp
+        entry_index = idx
+
+    open_trade = None
+    if position != 0 and entry_price is not None:
+        direction = "LONG" if position == 1 else "SHORT"
+        last = valid[-1]
+        last_price = float(last["Close"])
+        if position == 1:
+            unrealized_return = (last_price - entry_price) / entry_price
+        else:
+            unrealized_return = (entry_price - last_price) / entry_price
+        open_trade = {
+            "direction": direction,
+            "entry_timestamp": entry_timestamp,
+            "last_timestamp": last.get("Timestamp", ""),
+            "entry_price": entry_price,
+            "last_price": last_price,
+            "gross_unrealized_return": unrealized_return,
+            "net_unrealized_after_entry_fee": unrealized_return - commission_per_side,
+            "bars_held": len(valid) - 1 - entry_index,
+        }
+
+    return trades, {
+        "completed_trades": len(trades),
+        "open_trade": open_trade,
+    }
+
+
+def summarize_actual_trades(
+    trades: list[dict[str, object]],
+    open_trade: dict[str, object] | None,
+    commission_per_side: float,
+) -> None:
+    long_trades = [t for t in trades if t["direction"] == "LONG"]
+    short_trades = [t for t in trades if t["direction"] == "SHORT"]
+
+    def print_side(name: str, side_trades: list[dict[str, object]]) -> None:
+        wins = [t for t in side_trades if t["win"]]
+        losses = [t for t in side_trades if not t["win"]]
+        gross = sum(float(t["gross_return"]) for t in side_trades)
+        net = sum(float(t["net_return"]) for t in side_trades)
+        print(f"{name} trades={len(side_trades)} wins={len(wins)} losses={len(losses)}")
+        print(
+            f"{name} win_rate={len(wins) / len(side_trades) * 100:.3f}% "
+            f"avg_net={net / len(side_trades) if side_trades else 0.0:.10f} "
+            f"sum_gross={gross:.10f} sum_net={net:.10f}"
+        )
+
+    print()
+    print("ACTUAL COMPLETED TRADES")
+    print("commission is charged only on actual entry/exit events")
+    print_side("LONG", long_trades)
+    print_side("SHORT", short_trades)
+    print(f"TOTAL completed_trades={len(trades)}")
+    print(f"TOTAL wins={sum(1 for t in trades if t['win'])} losses={sum(1 for t in trades if not t['win'])}")
+    print(f"COMMISSION_PER_SIDE={commission_per_side * 100:.4f}%")
+    print(f"COMPLETED_GROSS_RETURN_SUM={sum(float(t['gross_return']) for t in trades):.10f}")
+    print(f"COMPLETED_NET_RETURN_SUM={sum(float(t['net_return']) for t in trades):.10f}")
+
+    if open_trade is None:
+        print("OPEN_TRADE=none")
+    else:
+        print(
+            f"OPEN_TRADE={open_trade['direction']} "
+            f"gross_unrealized={float(open_trade['gross_unrealized_return']):.10f} "
+            f"net_after_entry_fee={float(open_trade['net_unrealized_after_entry_fee']):.10f}"
+        )
+
+
+def commission_events(rows: list[dict[str, object]], commission_per_side: float) -> dict[str, float | int]:
+    """Charge commission only when the actual position changes."""
     valid = [r for r in rows if r.get("pt") != ""]
     position = 0
     entry_count = 0
@@ -172,25 +301,18 @@ def commission_events(rows: list[dict[str, object]], commission_per_side: float)
                     long_entries += 1
                 else:
                     short_entries += 1
-        elif position == 1:
-            if desired == -1:
-                exit_count += 1
-                long_exits += 1
-                position = -1
-                entry_count += 1
-                short_entries += 1
-        elif position == -1:
-            if desired == 1:
-                exit_count += 1
-                short_exits += 1
-                position = 1
-                entry_count += 1
-                long_entries += 1
-
-    # A PT=0 does not automatically create an exit. This matches the idea of
-    # avoiding artificial re-entries while a directional position remains active.
-    open_position = position
-    fees = (entry_count + exit_count) * commission_per_side
+        elif position == 1 and desired == -1:
+            exit_count += 1
+            long_exits += 1
+            position = -1
+            entry_count += 1
+            short_entries += 1
+        elif position == -1 and desired == 1:
+            exit_count += 1
+            short_exits += 1
+            position = 1
+            entry_count += 1
+            long_entries += 1
 
     return {
         "entry_count": entry_count,
@@ -199,8 +321,8 @@ def commission_events(rows: list[dict[str, object]], commission_per_side: float)
         "short_entries": short_entries,
         "long_exits": long_exits,
         "short_exits": short_exits,
-        "open_position": open_position,
-        "commission_total": fees,
+        "open_position": position,
+        "commission_total": (entry_count + exit_count) * commission_per_side,
     }
 
 
@@ -225,6 +347,8 @@ def summarize(rows: list[dict[str, object]], commission_per_side: float) -> None
 
     fees = commission_events(rows, commission_per_side)
     net_sum = gross_sum - float(fees["commission_total"])
+
+    actual_trades, trade_state = build_completed_trades(rows, commission_per_side)
 
     print("=" * 100)
     print("EXACT EXCEL SAMPLE / FORMULA TEST")
@@ -268,6 +392,8 @@ def summarize(rows: list[dict[str, object]], commission_per_side: float) -> None
     print(f"signal_count={len(long_returns) + len(short_returns)}")
     print(f"gross_total_return_sum={gross_sum:.10f}")
     print(f"net_total_return_sum={net_sum:.10f}")
+
+    summarize_actual_trades(actual_trades, trade_state["open_trade"], commission_per_side)
 
 
 ARGS = None
