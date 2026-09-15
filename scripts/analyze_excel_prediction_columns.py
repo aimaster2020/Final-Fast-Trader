@@ -16,26 +16,12 @@ def num(value):
         return None
 
 
-def sign(value: float, threshold: float) -> int:
-    if value > threshold:
+def sign_asymmetric(value: float, up_threshold: float, down_threshold: float) -> int:
+    if value > up_threshold:
         return 1
-    if value < -threshold:
+    if value < -down_threshold:
         return -1
     return 0
-
-
-def value_range(start: float, end: float, step: float) -> list[float]:
-    if step <= 0:
-        raise ValueError("step must be > 0")
-    if end < start:
-        raise ValueError("end must be >= start")
-    values: list[float] = []
-    x = start
-    epsilon = step * 1e-9
-    while x <= end + epsilon:
-        values.append(round(x, 10))
-        x += step
-    return values
 
 
 def looks_like_header(row: list[str]) -> bool:
@@ -43,7 +29,7 @@ def looks_like_header(row: list[str]) -> bool:
     return {"timestamp", "open", "high", "low", "close"}.issubset(normalized)
 
 
-def load_rows(path: Path):
+def load_rows(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f)
         first = next(reader, None)
@@ -64,183 +50,143 @@ def load_rows(path: Path):
         ]
 
 
-def build_observations(rows, h_threshold: float):
-    observations = []
-    for i in range(5, len(rows) - 1):
-        current, nxt = rows[i], rows[i + 1]
-        o, high, low, c = (num(current.get(k)) for k in ("Open", "High", "Low", "Close"))
+def calculate(rows, ct_up: float, ct_down: float) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    previous_pt: int | None = None
+
+    for i in range(len(rows) - 1):
+        current = rows[i]
+        nxt = rows[i + 1]
+        o = num(current.get("Open"))
+        h = num(current.get("High"))
+        low = num(current.get("Low"))
+        c = num(current.get("Close"))
         next_c = num(nxt.get("Close"))
-        if None in (o, high, low, c, next_c):
+
+        if None in (o, h, low, c, next_c):
+            result.append({"pt": "", "ct": "", "long_return": 0.0, "short_return": 0.0})
             continue
 
-        window = rows[i - 5:i + 1]
-        closes = [num(x.get("Close")) for x in window]
-        highs = [num(x.get("High")) for x in window]
-        if any(v is None for v in closes + highs):
-            continue
+        predict: float | None = None
+        ct: int | None = None
+        pt: int | None = None
+        pt_eq_ct = 0
+        neg_pt_eq_ct = 0
+        long_return = 0.0
+        short_return = 0.0
 
-        body = c - o
-        predict = sum(closes) / 6.0 if body > 0 else (sum(highs) / 6.0 if body < 0 else c)
-        pt = sign(predict - c, h_threshold)
+        # Exact Excel predict formula: six-candle window ending at current row.
+        if i >= 5:
+            window = rows[i - 5 : i + 1]
+            closes = [num(x.get("Close")) for x in window]
+            highs = [num(x.get("High")) for x in window]
+            if all(v is not None for v in closes + highs):
+                body = c - o
+                if body > 0:
+                    predict = sum(closes) / 6.0
+                elif body < 0:
+                    predict = sum(highs) / 6.0
+                else:
+                    predict = c
 
-        q = c - o
-        r = high - c
-        s = low - c
-        t = high - o
-        x = int(r > q)
-        y = int(s > q)
-        z = int(r > t)
-        j = int(x + y + z == 3)
-        l = -1 if x + y + z == 0 else 0
+                ct = sign_asymmetric(next_c - c, ct_up, ct_down)
+                pt = sign_asymmetric(predict - c, ct_up, ct_down)
+                pt_eq_ct = int(pt == ct and pt == 1)
+                neg_pt_eq_ct = int(pt == ct and pt == -1)
 
-        actual_move = next_c - c
-        actual_dir = 1 if actual_move > 0 else (-1 if actual_move < 0 else 0)
-        move_pct = actual_move / c * 100.0 if c else 0.0
-        observations.append({
-            "pt": pt,
-            "J": j,
-            "L": l,
-            "actual_dir": actual_dir,
-            "move_pct": move_pct,
+                if pt == 1 or previous_pt == 1:
+                    long_return = (next_c - c) / c if c else 0.0
+                if pt == -1 or previous_pt == -1:
+                    short_return = (c - next_c) / next_c if next_c else 0.0
+
+                previous_pt = pt
+
+        result.append({
+            "Timestamp": current.get("Timestamp", ""),
+            "Open": o,
+            "High": h,
+            "Low": low,
+            "Close": c,
+            "predict": predict if predict is not None else "",
+            "ct": ct if ct is not None else "",
+            "pt": pt if pt is not None else "",
+            "pt=ct": pt_eq_ct,
+            "(-)pt=ct": neg_pt_eq_ct,
+            "Long_Return": long_return,
+            "Short_Return": short_return,
         })
-    return observations
+
+    return result
 
 
-def metric(selected, expected_dir: int, commission_rate: float):
-    correct = sum(r["actual_dir"] == expected_dir for r in selected)
-    directional_moves = [r["move_pct"] * expected_dir for r in selected]
-    net = [x - commission_rate * 100.0 for x in directional_moves]
-    return {
-        "signals": len(selected),
-        "correct": correct,
-        "accuracy_pct": correct / len(selected) * 100.0 if selected else 0.0,
-        "avg_directional_move_pct": sum(directional_moves) / len(directional_moves) if directional_moves else 0.0,
-        "avg_net_pct": sum(net) / len(net) if net else 0.0,
-    }
-
-
-def analyze(rows, h_threshold: float, commission_rate: float):
-    observations = build_observations(rows, h_threshold)
-    total = len(observations)
-    return total, [
-        ("H LONG", metric([r for r in observations if r["pt"] == 1], 1, commission_rate)),
-        ("H SHORT", metric([r for r in observations if r["pt"] == -1], -1, commission_rate)),
-        ("J LONG", metric([r for r in observations if r["J"] == 1], 1, commission_rate)),
-        ("L SHORT", metric([r for r in observations if r["L"] == -1], -1, commission_rate)),
+def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "Timestamp", "Open", "High", "Low", "Close",
+        "predict", "ct", "pt", "pt=ct", "(-)pt=ct",
+        "Long_Return", "Short_Return",
     ]
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def sweep_pair(observations, pair: str, weight_start: float, weight_end: float, weight_step: float,
-               threshold_start: float, threshold_end: float, threshold_step: float,
-               commission_rate: float, top: int):
-    weights = value_range(weight_start, weight_end, weight_step)
-    thresholds = value_range(threshold_start, threshold_end, threshold_step)
-    results = []
+def summarize(rows: list[dict[str, object]], commission: float) -> None:
+    valid = [r for r in rows if r.get("pt") != ""]
+    up = [r for r in valid if r["pt"] == 1]
+    down = [r for r in valid if r["pt"] == -1]
+    hold = [r for r in valid if r["pt"] == 0]
 
-    expected_dir = 1 if pair == "LONG H+J" else -1
-    other_key = "J" if pair == "LONG H+J" else "L"
+    up_correct = sum(1 for r in up if r["ct"] == 1)
+    down_correct = sum(1 for r in down if r["ct"] == -1)
+    long_returns = [float(r["Long_Return"]) for r in rows if float(r["Long_Return"]) != 0.0]
+    short_returns = [float(r["Short_Return"]) for r in rows if float(r["Short_Return"]) != 0.0]
 
-    for other_weight in weights:
-        for threshold in thresholds:
-            selected = []
-            for r in observations:
-                h_vote = 1 if r["pt"] == expected_dir else 0
-                other_vote = 1 if (r[other_key] == (1 if expected_dir == 1 else -1)) else 0
-                score = h_vote + other_weight * other_vote
-                if score >= threshold:
-                    selected.append(r)
+    long_net = [x - commission for x in long_returns]
+    short_net = [x - commission for x in short_returns]
 
-            m = metric(selected, expected_dir, commission_rate)
-            results.append({
-                "other_weight": other_weight,
-                "threshold": threshold,
-                **m,
-            })
-
-    results.sort(key=lambda r: (
-        r["accuracy_pct"],
-        r["avg_directional_move_pct"],
-        r["signals"],
-    ), reverse=True)
-    return results[:top]
-
-
-def main():
-    p = argparse.ArgumentParser(description="Independent H/J/L accuracy and separate weight sweeps")
-    p.add_argument("--input", required=True)
-    p.add_argument("--h", type=float, default=500.0)
-    p.add_argument("--commission", type=float, default=0.0,
-                   help="Round-trip commission as decimal; default 0")
-    p.add_argument("--sweep-weights", action="store_true")
-    p.add_argument("--weight-start", type=float, default=0.0)
-    p.add_argument("--weight-end", type=float, default=2.0)
-    p.add_argument("--weight-step", type=float, default=0.25)
-    p.add_argument("--threshold-start", type=float, default=0.25)
-    p.add_argument("--threshold-end", type=float, default=2.0)
-    p.add_argument("--threshold-step", type=float, default=0.25)
-    p.add_argument("--top", type=int, default=15)
-    args = p.parse_args()
-
-    if min(args.h, args.commission, args.weight_start, args.threshold_start) < 0:
-        raise ValueError("numeric parameters must be >= 0")
-    if args.top <= 0:
-        raise ValueError("--top must be > 0")
-
-    rows = load_rows(Path(args.input))
-    observations = build_observations(rows, args.h)
-    total = len(observations)
-
-    if args.sweep_weights:
-        print("=" * 115)
-        print("SEPARATE WEIGHT SWEEP: LONG H+J / SHORT H+L")
-        print("=" * 115)
-        print(f"frames={total}")
-        print(f"H_THRESHOLD={args.h:g}")
-        print(f"COMMISSION_ROUND_TRIP={args.commission * 100:.4f}%")
-        print(f"other_weight={args.weight_start:g}..{args.weight_end:g} step={args.weight_step:g}")
-        print(f"threshold={args.threshold_start:g}..{args.threshold_end:g} step={args.threshold_step:g}")
-        print()
-
-        for pair in ("LONG H+J", "SHORT H+L"):
-            results = sweep_pair(
-                observations,
-                pair,
-                args.weight_start,
-                args.weight_end,
-                args.weight_step,
-                args.threshold_start,
-                args.threshold_end,
-                args.threshold_step,
-                args.commission,
-                args.top,
-            )
-            print(pair)
-            print("rank  other_w  threshold  signals  accuracy%  avg_move%  avg_net%")
-            print("-" * 75)
-            for rank, r in enumerate(results, 1):
-                print(
-                    f"{rank:>4}  {r['other_weight']:>8.2f}  {r['threshold']:>9.2f}  "
-                    f"{r['signals']:>7}  {r['accuracy_pct']:>9.3f}  "
-                    f"{r['avg_directional_move_pct']:>9.5f}  {r['avg_net_pct']:>9.5f}"
-                )
-            print()
-        return
-
-    total, results = analyze(rows, args.h, args.commission)
-    print("=" * 105)
-    print("INDEPENDENT PREDICTION ACCURACY: H / J / L")
-    print("=" * 105)
-    print(f"frames={total}")
-    print(f"H_THRESHOLD={args.h:g}")
-    print(f"COMMISSION_ROUND_TRIP={args.commission * 100:.4f}%")
+    print("=" * 100)
+    print("EXACT EXCEL SAMPLE / FORMULA TEST")
+    print("=" * 100)
+    print(f"frames={len(valid)}")
+    print(f"CT_UP={ARGS.ct_up:g}")
+    print(f"CT_DOWN={ARGS.ct_down:g}")
+    print(f"COMMISSION_ROUND_TRIP={commission * 100:.4f}%")
     print()
-    print("prediction  signals  correct  accuracy%  avg_directional%  avg_net%")
-    print("-" * 80)
-    for name, r in results:
-        print(
-            f"{name:<10}  {r['signals']:>7}  {r['correct']:>7}  {r['accuracy_pct']:>9.3f}  "
-            f"{r['avg_directional_move_pct']:>17.5f}  {r['avg_net_pct']:>9.5f}"
-        )
+    print("pt summary")
+    print(f"all={len(valid)}")
+    print(f"up={len(up)} accuracy_vs_ct={up_correct / len(up) * 100:.3f}%" if up else "up=0")
+    print(f"down={len(down)} accuracy_vs_ct={down_correct / len(down) * 100:.3f}%" if down else "down=0")
+    print(f"hold={len(hold)}")
+    print()
+    print("final return formulas")
+    print(f"long_signals={len(long_returns)} avg_return={sum(long_returns) / len(long_returns) if long_returns else 0.0:.10f} total_return={sum(long_returns):.10f}")
+    print(f"short_signals={len(short_returns)} avg_return={sum(short_returns) / len(short_returns) if short_returns else 0.0:.10f} total_return={sum(short_returns):.10f}")
+    print(f"long_avg_net={sum(long_net) / len(long_net) if long_net else 0.0:.10f}")
+    print(f"short_avg_net={sum(short_net) / len(short_net) if short_net else 0.0:.10f}")
+
+
+ARGS = None
+
+
+def main() -> None:
+    global ARGS
+    p = argparse.ArgumentParser(description="Exact implementation of the supplied Excel sample/formula logic")
+    p.add_argument("--input", required=True)
+    p.add_argument("--ct-up", type=float, default=600.0)
+    p.add_argument("--ct-down", type=float, default=100.0)
+    p.add_argument("--commission", type=float, default=0.0)
+    p.add_argument("--output", required=True)
+    ARGS = p.parse_args()
+
+    if ARGS.ct_up < 0 or ARGS.ct_down < 0 or ARGS.commission < 0:
+        raise ValueError("thresholds and commission must be >= 0")
+
+    rows = calculate(load_rows(Path(ARGS.input)), ARGS.ct_up, ARGS.ct_down)
+    write_csv(Path(ARGS.output), rows)
+    print(f"output={ARGS.output}")
+    summarize(rows, ARGS.commission)
 
 
 if __name__ == "__main__":
