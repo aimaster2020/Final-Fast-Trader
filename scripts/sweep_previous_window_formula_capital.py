@@ -14,6 +14,7 @@ def parse_args():
     p.add_argument("--initial-capital", type=float, default=1000.0)
     p.add_argument("--window", type=int, default=3)
     p.add_argument("--commission-per-side", type=float, default=0.0013)
+    p.add_argument("--min-prediction-pct", type=float, default=0.0, help="Minimum predicted move magnitude in percent.")
     p.add_argument("--year", type=int, default=None)
     p.add_argument("--f3-min", type=float, default=0)
     p.add_argument("--f3-max", type=float, default=250)
@@ -57,8 +58,9 @@ def frange(a,b,s):
     return [a+i*s for i in range(n+1)]
 
 
-def backtest(rows, initial, f3, f4, window, fee):
+def backtest(rows, initial, f3, f4, window, fee, min_prediction_pct):
     if len(rows) <= window+1: return None
+    if min_prediction_pct < 0: raise ValueError("min_prediction_pct must be >= 0")
     capital=initial; pos=0; entry=0.0; trades=0; wins=losses=0; fees=0.0
     for i in range(window, len(rows)-1):
         _,o,_,c=rows[i]
@@ -69,7 +71,10 @@ def backtest(rows, initial, f3, f4, window, fee):
             pred=sum(rows[j][2] for j in range(i-window,i))/window
         else:
             pred=c
+        predicted_move_pct=abs(pred-c)/c*100.0 if c else 0.0
         pt=1 if pred>c else -1 if pred<c else 0
+        if predicted_move_pct < min_prediction_pct:
+            pt=0
         if pos==0 and pt:
             fee_amt=capital*fee; capital-=fee_amt; fees+=fee_amt
             entry=c; pos=pt
@@ -81,7 +86,7 @@ def backtest(rows, initial, f3, f4, window, fee):
             trades+=1
             fee_amt=capital*fee; capital-=fee_amt; fees+=fee_amt
             entry=c; pos=pt
-    return {"f3":f3,"f4":f4,"trades":trades,"wins":wins,"losses":losses,
+    return {"f3":f3,"f4":f4,"min_prediction_pct":min_prediction_pct,"trades":trades,"wins":wins,"losses":losses,
             "win_rate":(wins/trades*100 if trades else 0.0),"commission":fees,
             "final_capital":capital,"net_return":(capital/initial-1)*100}
 
@@ -91,7 +96,7 @@ def main():
     results=[]
     for f3 in frange(a.f3_min,a.f3_max,a.step):
         for f4 in frange(a.f4_min,a.f4_max,a.step):
-            r=backtest(rows,a.initial_capital,f3,f4,a.window,a.commission_per_side)
+            r=backtest(rows,a.initial_capital,f3,f4,a.window,a.commission_per_side,a.min_prediction_pct)
             if r: results.append(r)
     results.sort(key=lambda r:(-r["net_return"],-r["trades"],-r["win_rate"]))
     out=Path(a.output); out.parent.mkdir(parents=True,exist_ok=True)
@@ -99,9 +104,10 @@ def main():
         w=csv.DictWriter(f,fieldnames=list(results[0].keys())); w.writeheader(); w.writerows(results)
     print(f"input={a.input}"); print(f"output={out}"); print(f"rows={len(rows)} window={a.window}")
     print(f"initial_capital={a.initial_capital:.2f} commission_per_side={a.commission_per_side*100:.4f}%")
+    print(f"min_prediction_pct={a.min_prediction_pct:g}%")
     print(f"combinations={len(results)}")
     print("TOP 20 BY NET RETURN")
     for i,r in enumerate(results[:20],1):
-        print(f"{i:2d}. F3={r['f3']:g} F4={r['f4']:g} net={r['net_return']:.4f}% final={r['final_capital']:.2f} trades={r['trades']} wins={r['wins']} losses={r['losses']} win_rate={r['win_rate']:.2f}% fees={r['commission']:.2f}")
+        print(f"{i:2d}. F3={r['f3']:g} F4={r['f4']:g} min_pred={r['min_prediction_pct']:g}% net={r['net_return']:.4f}% final={r['final_capital']:.2f} trades={r['trades']} wins={r['wins']} losses={r['losses']} win_rate={r['win_rate']:.2f}% fees={r['commission']:.2f}")
 
 if __name__=='__main__': main()
