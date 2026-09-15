@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+"""Backtest previous-window formula with compounding capital.
+
+Formula:
+body > F3 -> average previous N closes
+body < F4 -> average previous N highs
+otherwise -> current close
+
+Position logic:
+- PT=1 opens/holds long.
+- PT=-1 opens/holds short.
+- PT=0 holds an existing position; flat remains flat.
+- Opposite PT reverses at the current close.
+
+Commission is charged on every real entry/exit side only.
+"""
 from __future__ import annotations
 
 import argparse
@@ -8,14 +23,14 @@ from typing import Optional
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Backtest 3-window previous-candle formula with capital and optional commission.")
+    p = argparse.ArgumentParser(description="Backtest previous-window formula with capital and commission.")
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--initial-capital", type=float, default=1000.0)
     p.add_argument("--f3", type=float, default=100.0)
     p.add_argument("--f4", type=float, default=-150.0)
-    p.add_argument("--window", type=int, default=3)
-    p.add_argument("--commission-per-side", type=float, default=0.0, help="Commission rate per entry/exit side, e.g. 0.0013")
+    p.add_argument("--window", type=int, choices=range(1, 6), default=3)
+    p.add_argument("--commission-per-side", type=float, default=0.0)
     p.add_argument("--year", type=int, default=None)
     return p.parse_args()
 
@@ -38,31 +53,29 @@ def load_rows(path: Path, year: Optional[int]):
         raise ValueError("Input CSV is empty")
 
     header = [x.strip().lower() for x in rows[0]]
-    headered = any(x in header for x in ("timestamp", "open", "high", "low", "close"))
+    headered = all(x in header for x in ("timestamp", "open", "high", "close"))
     out = []
     if headered:
         idx = {name: i for i, name in enumerate(header)}
-        for req in ("timestamp", "open", "high", "close"):
-            if req not in idx:
-                raise ValueError(f"Missing column: {req}")
         for r in rows[1:]:
             if len(r) <= max(idx["timestamp"], idx["open"], idx["high"], idx["close"]):
                 continue
-            if year is not None and year_of(r[idx["timestamp"]]) != year:
+            ts = r[idx["timestamp"]]
+            if year is not None and year_of(ts) != year:
                 continue
-            out.append((r[idx["timestamp"]], float(r[idx["open"]]), float(r[idx["high"]]), float(r[idx["close"]])))
+            out.append((ts, float(r[idx["open"]]), float(r[idx["high"]]), float(r[idx["close"]])))
     else:
         for r in rows:
             if len(r) < 5:
                 continue
-            if year is not None and year_of(r[0]) != year:
+            ts = r[0]
+            if year is not None and year_of(ts) != year:
                 continue
-            out.append((r[0], float(r[1]), float(r[2]), float(r[4])))
+            out.append((ts, float(r[1]), float(r[2]), float(r[4])))
     return out
 
 
-def signal(pred: float, close: float) -> int:
-    move = pred - close
+def direction(move: float) -> int:
     return 1 if move > 0 else -1 if move < 0 else 0
 
 
@@ -73,25 +86,23 @@ def run(rows, initial_capital: float, f3: float, f4: float, window: int, commiss
     capital = initial_capital
     position = 0
     entry_price = None
-    entry_equity = None
+    entry_capital = None
     entry_timestamp = None
     trades = []
     entries = exits = 0
     wins = losses = 0
     commission_paid = 0.0
-
     equity_rows = []
 
-    def apply_commission(amount: float) -> float:
-        nonlocal commission_paid, capital
-        fee = amount * commission
-        commission_paid += fee
+    def charge_fee() -> float:
+        nonlocal capital, commission_paid
+        fee = capital * commission
         capital -= fee
+        commission_paid += fee
         return fee
 
     for i in range(window, len(rows) - 1):
         ts, o, h, c = rows[i]
-        next_c = rows[i + 1][3]
 
         body = c - o
         if body > f3:
@@ -101,30 +112,36 @@ def run(rows, initial_capital: float, f3: float, f4: float, window: int, commiss
         else:
             pred = c
 
-        pt = signal(pred, c)
+        pt = direction(pred - c)
         changed = False
 
-        if position == 0:
-            if pt != 0:
-                position = pt
-                entry_price = c
-                entry_equity = capital
-                entry_timestamp = ts
-                if commission:
-                    apply_commission(entry_equity)
-                entries += 1
-                changed = True
-        elif pt != 0 and pt != position:
-            # Exit old position at current close, then immediately enter new side at same close.
+        if position == 0 and pt != 0:
+            charge_fee()
+            position = pt
+            entry_price = c
+            entry_capital = capital
+            entry_timestamp = ts
+            entries += 1
+            changed = True
+
+        elif position != 0 and pt != 0 and pt != position:
+            if entry_price is None or entry_capital is None:
+                raise RuntimeError("Missing open trade state")
+
             exit_price = c
             gross_return = ((exit_price - entry_price) / entry_price) if position == 1 else ((entry_price - exit_price) / entry_price)
-            gross_pnl = entry_equity * gross_return
+            gross_pnl = entry_capital * gross_return
             capital += gross_pnl
-            if commission:
-                apply_commission(entry_equity + gross_pnl)
+
+            exit_fee = charge_fee()
+            net_pnl = capital - entry_capital
+
             exits += 1
-            wins += gross_pnl > 0
-            losses += gross_pnl <= 0
+            if gross_pnl > 0:
+                wins += 1
+            else:
+                losses += 1
+
             trades.append({
                 "entry_timestamp": entry_timestamp,
                 "exit_timestamp": ts,
@@ -133,29 +150,40 @@ def run(rows, initial_capital: float, f3: float, f4: float, window: int, commiss
                 "exit_price": exit_price,
                 "gross_return": gross_return,
                 "gross_pnl": gross_pnl,
+                "net_pnl": net_pnl,
+                "exit_fee": exit_fee,
             })
+
+            # Immediate reversal at the same close.
             position = pt
+            charge_fee()
             entry_price = c
-            entry_equity = capital
+            entry_capital = capital
             entry_timestamp = ts
-            if commission:
-                apply_commission(entry_equity)
             entries += 1
             changed = True
 
-        # Mark current equity at close. Open P&L is based on current close.
-        if position and entry_price is not None and entry_equity is not None:
+        if position and entry_price is not None and entry_capital is not None:
             unrealized_return = ((c - entry_price) / entry_price) if position == 1 else ((entry_price - c) / entry_price)
-            mark_equity = capital + entry_equity * unrealized_return
+            mark_equity = capital + entry_capital * unrealized_return
         else:
             mark_equity = capital
-        equity_rows.append({"timestamp": ts, "close": c, "pt": pt, "position": position, "capital": capital, "mark_equity": mark_equity, "changed": int(changed)})
+
+        equity_rows.append({
+            "timestamp": ts,
+            "close": c,
+            "pt": pt,
+            "position": position,
+            "capital": capital,
+            "mark_equity": mark_equity,
+            "changed": int(changed),
+        })
 
     open_trade = None
-    if position and entry_price is not None and entry_equity is not None:
+    if position and entry_price is not None and entry_capital is not None:
         last_close = rows[-1][3]
         unrealized_return = ((last_close - entry_price) / entry_price) if position == 1 else ((entry_price - last_close) / entry_price)
-        mark_equity = capital + entry_equity * unrealized_return
+        mark_equity = capital + entry_capital * unrealized_return
         open_trade = {
             "side": "LONG" if position == 1 else "SHORT",
             "entry_timestamp": entry_timestamp,
@@ -168,7 +196,7 @@ def run(rows, initial_capital: float, f3: float, f4: float, window: int, commiss
     return capital, entries, exits, wins, losses, commission_paid, trades, open_trade, equity_rows
 
 
-def main():
+def main() -> None:
     a = parse_args()
     rows = load_rows(Path(a.input), a.year)
     final_capital, entries, exits, wins, losses, fees, trades, open_trade, equity_rows = run(
@@ -179,16 +207,17 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8", newline="") as f:
         fields = ["timestamp", "close", "pt", "position", "capital", "mark_equity", "changed"]
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(equity_rows)
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(equity_rows)
 
     completed = len(trades)
     gross_sum = sum(float(t["gross_return"]) for t in trades)
-    net_return = final_capital / a.initial_capital - 1.0
+    final_return = final_capital / a.initial_capital - 1.0
+
     print(f"input={a.input}")
     print(f"output={out}")
-    print(f"rows={len(rows)}")
+    print(f"rows={len(rows)} frames={max(0, len(rows) - a.window - 1)}")
     print(f"initial_capital={a.initial_capital:.2f}")
     print(f"F3={a.f3:g} F4={a.f4:g} WINDOW={a.window}")
     print(f"commission_per_side={a.commission_per_side*100:.4f}%")
@@ -196,12 +225,12 @@ def main():
     print("RESULT")
     print(f"entries={entries} exits={exits} completed_trades={completed}")
     print(f"wins={wins} losses={losses} win_rate={(wins/completed*100 if completed else 0):.4f}%")
-    print(f"commission_total={fees:.2f}")
+    print(f"commission_total={fees:.6f}")
     print(f"gross_return_sum={gross_sum*100:.4f}%")
-    print(f"final_capital={final_capital:.2f}")
-    print(f"net_return={net_return*100:.4f}%")
+    print(f"final_capital={final_capital:.6f}")
+    print(f"net_return={final_return*100:.4f}%")
     if open_trade:
-        print(f"open_trade={open_trade['side']} entry={open_trade['entry_price']:.8f} last={open_trade['last_price']:.8f} unrealized={open_trade['unrealized_return']*100:.4f}% mark_equity={open_trade['mark_equity']:.2f}")
+        print(f"open_trade={open_trade['side']} entry={open_trade['entry_price']:.8f} last={open_trade['last_price']:.8f} unrealized={open_trade['unrealized_return']*100:.4f}% mark_equity={open_trade['mark_equity']:.6f}")
     else:
         print("open_trade=NO")
 
