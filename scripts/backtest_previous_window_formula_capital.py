@@ -1,24 +1,4 @@
 #!/usr/bin/env python3
-"""Backtest previous-window formula with compounding capital.
-
-Formula:
-body > F3 -> average previous N closes
-body < F4 -> average previous N highs
-otherwise -> current close
-
-Prediction-range filter:
-A signal is tradable only when abs(pred - current_close) / current_close * 100
-is at least --min-prediction-pct. Signals below the threshold are treated as
-PT=0, so a flat position stays flat and an open position is held.
-
-Position logic:
-- PT=1 opens/holds long.
-- PT=-1 opens/holds short.
-- PT=0 holds an existing position; flat remains flat.
-- Opposite qualifying PT reverses at the current close.
-
-Commission is charged on every real entry/exit side only.
-"""
 from __future__ import annotations
 
 import argparse
@@ -36,8 +16,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--f4", type=float, default=-150.0)
     p.add_argument("--window", type=int, choices=range(1, 6), default=3)
     p.add_argument("--commission-per-side", type=float, default=0.0)
-    p.add_argument("--min-prediction-pct", type=float, default=0.0, help="Minimum predicted move magnitude in percent.")
+    p.add_argument("--min-prediction-pct", type=float, default=0.0)
     p.add_argument("--year", type=int, default=None)
+    p.add_argument("--trades-output", default=None, help="Optional CSV path for completed trade-level commission/profit details.")
     return p.parse_args()
 
 
@@ -57,7 +38,6 @@ def load_rows(path: Path, year: Optional[int]):
         rows = list(csv.reader(f))
     if not rows:
         raise ValueError("Input CSV is empty")
-
     header = [x.strip().lower() for x in rows[0]]
     headered = all(x in header for x in ("timestamp", "open", "high", "close"))
     out = []
@@ -88,13 +68,12 @@ def direction(move: float) -> int:
 def run(rows, initial_capital: float, f3: float, f4: float, window: int, commission: float, min_prediction_pct: float):
     if len(rows) <= window + 1:
         raise ValueError("Not enough rows")
-    if min_prediction_pct < 0:
-        raise ValueError("min_prediction_pct must be >= 0")
-
     capital = initial_capital
     position = 0
     entry_price = None
     entry_capital = None
+    entry_capital_before_fee = None
+    entry_fee = 0.0
     entry_timestamp = None
     trades = []
     entries = exits = 0
@@ -109,9 +88,49 @@ def run(rows, initial_capital: float, f3: float, f4: float, window: int, commiss
         commission_paid += fee
         return fee
 
-    for i in range(window, len(rows) - 1):
-        ts, o, h, c = rows[i]
+    def close_trade(exit_timestamp: str, exit_price: float) -> None:
+        nonlocal capital, position, entry_price, entry_capital
+        nonlocal entry_capital_before_fee, entry_fee, entry_timestamp
+        nonlocal exits, wins, losses
+        if not position or entry_price is None or entry_capital is None or entry_capital_before_fee is None:
+            raise RuntimeError("Missing open trade state")
 
+        gross_return = ((exit_price - entry_price) / entry_price) if position == 1 else ((entry_price - exit_price) / entry_price)
+        gross_pnl = entry_capital * gross_return
+        capital_before_exit_fee = capital + gross_pnl
+        capital = capital_before_exit_fee
+        exit_fee = charge_fee()
+
+        net_pnl_after_both_fees = capital - entry_capital_before_fee
+        total_fees = entry_fee + exit_fee
+        trades.append({
+            "entry_timestamp": entry_timestamp,
+            "exit_timestamp": exit_timestamp,
+            "side": "LONG" if position == 1 else "SHORT",
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "capital_before_entry": entry_capital_before_fee,
+            "entry_fee": entry_fee,
+            "entry_fee_pct": entry_fee / entry_capital_before_fee * 100.0,
+            "capital_after_entry_fee": entry_capital,
+            "gross_return_pct": gross_return * 100.0,
+            "gross_pnl": gross_pnl,
+            "capital_before_exit_fee": capital_before_exit_fee,
+            "exit_fee": exit_fee,
+            "exit_fee_pct": exit_fee / capital_before_exit_fee * 100.0 if capital_before_exit_fee else 0.0,
+            "total_fees": total_fees,
+            "total_fee_pct_of_entry_capital": total_fees / entry_capital_before_fee * 100.0,
+            "net_pnl_after_fees": net_pnl_after_both_fees,
+            "net_return_pct": net_pnl_after_both_fees / entry_capital_before_fee * 100.0,
+        })
+        exits += 1
+        if gross_pnl > 0:
+            wins += 1
+        else:
+            losses += 1
+
+    for i in range(window, len(rows) - 1):
+        ts, o, _, c = rows[i]
         body = c - o
         if body > f3:
             pred = sum(rows[j][3] for j in range(i - window, i)) / window
@@ -124,48 +143,20 @@ def run(rows, initial_capital: float, f3: float, f4: float, window: int, commiss
         pt = direction(pred - c) if predicted_move_pct >= min_prediction_pct else 0
         changed = False
 
-        if position == 0 and pt != 0:
-            charge_fee()
+        if position == 0 and pt:
+            entry_capital_before_fee = capital
+            entry_fee = charge_fee()
             position = pt
             entry_price = c
             entry_capital = capital
             entry_timestamp = ts
             entries += 1
             changed = True
-
-        elif position != 0 and pt != 0 and pt != position:
-            if entry_price is None or entry_capital is None:
-                raise RuntimeError("Missing open trade state")
-
-            exit_price = c
-            gross_return = ((exit_price - entry_price) / entry_price) if position == 1 else ((entry_price - exit_price) / entry_price)
-            gross_pnl = entry_capital * gross_return
-            capital += gross_pnl
-
-            exit_fee = charge_fee()
-            net_pnl = capital - entry_capital
-
-            exits += 1
-            if gross_pnl > 0:
-                wins += 1
-            else:
-                losses += 1
-
-            trades.append({
-                "entry_timestamp": entry_timestamp,
-                "exit_timestamp": ts,
-                "side": "LONG" if position == 1 else "SHORT",
-                "entry_price": entry_price,
-                "exit_price": exit_price,
-                "gross_return": gross_return,
-                "gross_pnl": gross_pnl,
-                "net_pnl": net_pnl,
-                "exit_fee": exit_fee,
-            })
-
-            # Immediate reversal at the same close.
+        elif position and pt and pt != position:
+            close_trade(ts, c)
+            entry_capital_before_fee = capital
+            entry_fee = charge_fee()
             position = pt
-            charge_fee()
             entry_price = c
             entry_capital = capital
             entry_timestamp = ts
@@ -193,14 +184,13 @@ def run(rows, initial_capital: float, f3: float, f4: float, window: int, commiss
     if position and entry_price is not None and entry_capital is not None:
         last_close = rows[-1][3]
         unrealized_return = ((last_close - entry_price) / entry_price) if position == 1 else ((entry_price - last_close) / entry_price)
-        mark_equity = capital + entry_capital * unrealized_return
         open_trade = {
             "side": "LONG" if position == 1 else "SHORT",
             "entry_timestamp": entry_timestamp,
             "entry_price": entry_price,
             "last_price": last_close,
             "unrealized_return": unrealized_return,
-            "mark_equity": mark_equity,
+            "mark_equity": capital + entry_capital * unrealized_return,
         }
 
     return capital, entries, exits, wins, losses, commission_paid, trades, open_trade, equity_rows
@@ -212,19 +202,30 @@ def main() -> None:
     final_capital, entries, exits, wins, losses, fees, trades, open_trade, equity_rows = run(
         rows, a.initial_capital, a.f3, a.f4, a.window, a.commission_per_side, a.min_prediction_pct
     )
-
     out = Path(a.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8", newline="") as f:
         fields = ["timestamp", "close", "predicted_move_pct", "pt", "position", "capital", "mark_equity", "changed"]
         writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(equity_rows)
+        writer.writeheader(); writer.writerows(equity_rows)
+
+    if a.trades_output:
+        trades_out = Path(a.trades_output)
+        trades_out.parent.mkdir(parents=True, exist_ok=True)
+        fields = [
+            "entry_timestamp", "exit_timestamp", "side", "entry_price", "exit_price",
+            "capital_before_entry", "entry_fee", "entry_fee_pct", "capital_after_entry_fee",
+            "gross_return_pct", "gross_pnl", "capital_before_exit_fee", "exit_fee", "exit_fee_pct",
+            "total_fees", "total_fee_pct_of_entry_capital", "net_pnl_after_fees", "net_return_pct",
+        ]
+        with trades_out.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader(); writer.writerows(trades)
+        print(f"trades_output={trades_out}")
 
     completed = len(trades)
-    gross_sum = sum(float(t["gross_return"]) for t in trades)
+    gross_sum = sum(float(t["gross_return_pct"]) for t in trades)
     final_return = final_capital / a.initial_capital - 1.0
-
     print(f"input={a.input}")
     print(f"output={out}")
     print(f"rows={len(rows)} frames={max(0, len(rows) - a.window - 1)}")
@@ -237,7 +238,7 @@ def main() -> None:
     print(f"entries={entries} exits={exits} completed_trades={completed}")
     print(f"wins={wins} losses={losses} win_rate={(wins/completed*100 if completed else 0):.4f}%")
     print(f"commission_total={fees:.6f}")
-    print(f"gross_return_sum={gross_sum*100:.4f}%")
+    print(f"gross_return_sum={gross_sum:.4f}%")
     print(f"final_capital={final_capital:.6f}")
     print(f"net_return={final_return*100:.4f}%")
     if open_trade:
