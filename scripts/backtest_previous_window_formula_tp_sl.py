@@ -9,7 +9,7 @@ from typing import Optional
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Backtest previous-window formula with prediction-based take-profit and stop-loss."
+        description="Backtest previous-window formula with prediction-based TP and fixed or proportional SL."
     )
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-prediction-pct", type=float, default=1.0)
     p.add_argument("--tp-multiplier", type=float, default=1.0)
     p.add_argument("--sl-multiplier", type=float, default=1.0)
+    p.add_argument("--sl-pct", type=float, default=None, help="Fixed stop-loss distance as percent of entry price. Overrides --sl-multiplier when set.")
     p.add_argument("--year", type=int, default=None)
     return p.parse_args()
 
@@ -57,15 +58,7 @@ def load_rows(path: Path, year: Optional[int]):
             ts = r[idx["timestamp"]]
             if year is not None and year_of(ts) != year:
                 continue
-            out.append(
-                (
-                    ts,
-                    float(r[idx["open"]]),
-                    float(r[idx["high"]]),
-                    float(r[idx["low"]]),
-                    float(r[idx["close"]]),
-                )
-            )
+            out.append((ts, float(r[idx["open"]]), float(r[idx["high"]]), float(r[idx["low"]]), float(r[idx["close"]])))
     else:
         for r in rows:
             if len(r) < 5:
@@ -104,9 +97,16 @@ def run(
     min_prediction_pct: float,
     tp_multiplier: float,
     sl_multiplier: float,
+    sl_pct: Optional[float],
 ):
     if len(rows) <= window + 1:
         raise ValueError("Not enough rows")
+    if tp_multiplier <= 0:
+        raise ValueError("TP multiplier must be > 0")
+    if sl_pct is not None and sl_pct <= 0:
+        raise ValueError("SL percent must be > 0")
+    if sl_pct is None and sl_multiplier <= 0:
+        raise ValueError("SL multiplier must be > 0")
 
     capital = initial_capital
     trades = []
@@ -122,16 +122,14 @@ def run(
         predicted_move_pct = abs(predicted_move) / c * 100.0 if c else 0.0
         side = direction(predicted_move) if predicted_move_pct >= min_prediction_pct else 0
 
-        equity_rows.append(
-            {
-                "timestamp": ts,
-                "close": c,
-                "predicted_price": pred,
-                "predicted_move_pct": predicted_move_pct,
-                "signal": side,
-                "capital": capital,
-            }
-        )
+        equity_rows.append({
+            "timestamp": ts,
+            "close": c,
+            "predicted_price": pred,
+            "predicted_move_pct": predicted_move_pct,
+            "signal": side,
+            "capital": capital,
+        })
 
         if not side:
             i += 1
@@ -149,16 +147,21 @@ def run(
         distance = abs(predicted_move)
         if side == 1:
             target_price = entry_price + distance * tp_multiplier
-            stop_price = entry_price - distance * sl_multiplier
+            if sl_pct is not None:
+                stop_price = entry_price * (1.0 - sl_pct / 100.0)
+            else:
+                stop_price = entry_price - distance * sl_multiplier
         else:
             target_price = entry_price - distance * tp_multiplier
-            stop_price = entry_price + distance * sl_multiplier
+            if sl_pct is not None:
+                stop_price = entry_price * (1.0 + sl_pct / 100.0)
+            else:
+                stop_price = entry_price + distance * sl_multiplier
 
         exit_timestamp = None
         exit_price = None
         exit_reason = None
 
-        # Entry happens at the current candle close. Only future candles can hit TP/SL.
         j = i + 1
         while j < len(rows):
             nts, no, nh, nl, nc = rows[j]
@@ -169,8 +172,7 @@ def run(
                 hit_stop = nh >= stop_price
                 hit_target = nl <= target_price
 
-            # Conservative rule for an OHLC candle where both levels are touched:
-            # assume the stop is hit first.
+            # Conservative rule when both TP and SL are touched in one OHLC candle.
             if hit_stop:
                 exit_timestamp = nts
                 exit_price = stop_price
@@ -184,8 +186,6 @@ def run(
             j += 1
 
         if exit_price is None:
-            # No future candle reached either level. Mark the trade to the final close,
-            # without treating it as a TP/SL hit.
             nts, no, nh, nl, nc = rows[-1]
             exit_timestamp = nts
             exit_price = nc
@@ -213,35 +213,33 @@ def run(
         else:
             losses += 1
 
-        trades.append(
-            {
-                "entry_timestamp": entry_timestamp,
-                "exit_timestamp": exit_timestamp,
-                "side": "LONG" if side == 1 else "SHORT",
-                "entry_price": entry_price,
-                "predicted_price": pred,
-                "target_price": target_price,
-                "stop_price": stop_price,
-                "exit_price": exit_price,
-                "exit_reason": exit_reason,
-                "capital_before_entry": capital_before_entry,
-                "entry_fee": entry_fee,
-                "entry_fee_pct": entry_fee / capital_before_entry * 100.0,
-                "capital_after_entry_fee": entry_capital,
-                "gross_return_pct": gross_return * 100.0,
-                "gross_pnl": gross_pnl,
-                "capital_before_exit_fee": capital_before_exit_fee,
-                "exit_fee": exit_fee,
-                "exit_fee_pct": exit_fee / capital_before_exit_fee * 100.0 if capital_before_exit_fee else 0.0,
-                "total_fees": total_fees,
-                "total_fee_pct_of_entry_capital": total_fees / capital_before_entry * 100.0,
-                "net_pnl_after_fees": net_pnl,
-                "net_return_pct": net_return_pct,
-                "bars_held": max(1, j - i),
-            }
-        )
+        trades.append({
+            "entry_timestamp": entry_timestamp,
+            "exit_timestamp": exit_timestamp,
+            "side": "LONG" if side == 1 else "SHORT",
+            "entry_price": entry_price,
+            "predicted_price": pred,
+            "predicted_move_pct": predicted_move_pct,
+            "target_price": target_price,
+            "stop_price": stop_price,
+            "exit_price": exit_price,
+            "exit_reason": exit_reason,
+            "capital_before_entry": capital_before_entry,
+            "entry_fee": entry_fee,
+            "entry_fee_pct": entry_fee / capital_before_entry * 100.0,
+            "capital_after_entry_fee": entry_capital,
+            "gross_return_pct": gross_return * 100.0,
+            "gross_pnl": gross_pnl,
+            "capital_before_exit_fee": capital_before_exit_fee,
+            "exit_fee": exit_fee,
+            "exit_fee_pct": exit_fee / capital_before_exit_fee * 100.0 if capital_before_exit_fee else 0.0,
+            "total_fees": total_fees,
+            "total_fee_pct_of_entry_capital": total_fees / capital_before_entry * 100.0,
+            "net_pnl_after_fees": net_pnl,
+            "net_return_pct": net_return_pct,
+            "bars_held": max(1, j - i),
+        })
 
-        # Continue after the candle where the trade closed. This prevents overlapping trades.
         i = max(i + 1, j + 1)
 
     return capital, entries, exits, wins, losses, commission_total, trades, equity_rows
@@ -249,9 +247,6 @@ def run(
 
 def main() -> None:
     a = parse_args()
-    if a.tp_multiplier <= 0 or a.sl_multiplier <= 0:
-        raise ValueError("TP and SL multipliers must be > 0")
-
     rows = load_rows(Path(a.input), a.year)
     final_capital, entries, exits, wins, losses, fees, trades, equity_rows = run(
         rows,
@@ -263,6 +258,7 @@ def main() -> None:
         a.min_prediction_pct,
         a.tp_multiplier,
         a.sl_multiplier,
+        a.sl_pct,
     )
 
     out = Path(a.output)
@@ -277,29 +273,11 @@ def main() -> None:
         trades_out = Path(a.trades_output)
         trades_out.parent.mkdir(parents=True, exist_ok=True)
         fields = [
-            "entry_timestamp",
-            "exit_timestamp",
-            "side",
-            "entry_price",
-            "predicted_price",
-            "target_price",
-            "stop_price",
-            "exit_price",
-            "exit_reason",
-            "capital_before_entry",
-            "entry_fee",
-            "entry_fee_pct",
-            "capital_after_entry_fee",
-            "gross_return_pct",
-            "gross_pnl",
-            "capital_before_exit_fee",
-            "exit_fee",
-            "exit_fee_pct",
-            "total_fees",
-            "total_fee_pct_of_entry_capital",
-            "net_pnl_after_fees",
-            "net_return_pct",
-            "bars_held",
+            "entry_timestamp", "exit_timestamp", "side", "entry_price", "predicted_price", "predicted_move_pct",
+            "target_price", "stop_price", "exit_price", "exit_reason", "capital_before_entry", "entry_fee",
+            "entry_fee_pct", "capital_after_entry_fee", "gross_return_pct", "gross_pnl", "capital_before_exit_fee",
+            "exit_fee", "exit_fee_pct", "total_fees", "total_fee_pct_of_entry_capital", "net_pnl_after_fees",
+            "net_return_pct", "bars_held",
         ]
         with trades_out.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
@@ -319,7 +297,11 @@ def main() -> None:
     print(f"initial_capital={a.initial_capital:.2f}")
     print(f"F3={a.f3:g} F4={a.f4:g} WINDOW={a.window}")
     print(f"min_prediction_pct={a.min_prediction_pct:g}%")
-    print(f"tp_multiplier={a.tp_multiplier:g} sl_multiplier={a.sl_multiplier:g}")
+    print(f"tp_multiplier={a.tp_multiplier:g}")
+    if a.sl_pct is not None:
+        print(f"sl_pct={a.sl_pct:g}%")
+    else:
+        print(f"sl_multiplier={a.sl_multiplier:g}")
     print(f"commission_per_side={a.commission_per_side * 100:.4f}%")
     print()
     print("RESULT")
