@@ -8,7 +8,7 @@ from typing import Optional
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Test the range-based prediction formula over future candle horizons.")
+    p = argparse.ArgumentParser(description="Test MAX(previous closes) prediction over future candle horizons.")
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--window", type=int, default=5)
@@ -48,13 +48,7 @@ def load_rows(path: Path, year: Optional[int]):
             ts = r[idx["timestamp"]]
             if year is not None and year_of(ts) != year:
                 continue
-            out.append((
-                ts,
-                float(r[idx["open"]]),
-                float(r[idx["high"]]),
-                float(r[idx["low"]]),
-                float(r[idx["close"]]),
-            ))
+            out.append((ts, float(r[idx["open"]]), float(r[idx["high"]]), float(r[idx["low"]]), float(r[idx["close"]])))
     else:
         for r in raw:
             if len(r) < 5:
@@ -71,11 +65,9 @@ def load_rows(path: Path, year: Optional[int]):
 
 def predicted_price(rows, i: int, window: int) -> float:
     # Exact requested formula:
-    # =(MAX(E7:E11)-MIN(E7:E11))+E12
-    # E7:E11 = previous 5 closes, E12 = current close.
-    previous_closes = [rows[j][4] for j in range(i - window, i)]
-    current_close = rows[i][4]
-    return (max(previous_closes) - min(previous_closes)) + current_close
+    # =MAX(E7:E11)
+    # E7:E11 = previous 5 closes.
+    return max(rows[j][4] for j in range(i - window, i))
 
 
 def main() -> None:
@@ -109,7 +101,7 @@ def main() -> None:
         for h in horizons:
             future_close = rows[i + h][4]
             actual_move = future_close - current_close
-            direction_correct = int(actual_move > 0)  # formula always predicts above current close
+            direction_correct = int(actual_move >= 0)
             target_reached = int(future_close >= pred)
             prediction_error_pct = (future_close - pred) / current_close * 100.0 if current_close else 0.0
             row[f"future_close_h{h}"] = future_close
@@ -123,13 +115,7 @@ def main() -> None:
     out = Path(a.output)
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    fields = [
-        "timestamp",
-        "current_close",
-        "predicted_price",
-        "predicted_move",
-        "predicted_move_pct",
-    ]
+    fields = ["timestamp", "current_close", "predicted_price", "predicted_move", "predicted_move_pct"]
     for h in horizons:
         fields.extend([
             f"future_close_h{h}",
@@ -148,7 +134,7 @@ def main() -> None:
     print(f"output={out}")
     print(f"rows={len(rows)} signals={len(records)}")
     print(f"window={a.window}")
-    print("formula=(MAX(previous_closes)-MIN(previous_closes))+current_close")
+    print("formula=MAX(previous_closes)")
     print(f"min_prediction_pct={a.min_prediction_pct:g}%")
     print(f"horizons={','.join(map(str, horizons))}")
     print("commission=0")
