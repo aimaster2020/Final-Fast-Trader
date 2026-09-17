@@ -17,12 +17,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def exact_initial_trend(rows, i: int) -> int:
-    # Excel AW formula uses a progressively available prior window:
-    # row 2: AVERAGE(B1:E2) -> header text is ignored, so current row only.
-    # row 3: AVERAGE(B2:E2) -> previous 1 row.
-    # row 4: AVERAGE(B2:E3) -> previous 2 rows.
-    # row 5: AVERAGE(B2:E4) -> previous 3 rows.
-    # row 6+: rolling previous 4 rows.
+    # Excel AW formula uses the progressively available prior rows for the
+    # first few data rows, then the normal rolling 4-candle window.
     if i == 0:
         values = rows[0:1]
     else:
@@ -39,12 +35,18 @@ def exact_initial_trend(rows, i: int) -> int:
 
 
 def patch_bp_for_excel_initial_rows(rows, result) -> None:
-    # The base calculator already reproduces all candle-pattern columns.
+    # The base calculator already reproduces the candle-pattern columns.
     # Patch only the first four Trend-dependent score rows, where Excel uses
-    # shorter historical windows instead of the normal 4-candle window.
+    # shorter historical windows before the normal rolling 4-candle window.
     limit = min(4, len(result))
-    bullish_keys = list("KLMNOPQRSTUVWXY")
-    bearish_keys = list("AFGHIJKLMNOPQRS")
+    bullish_keys = [
+        "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
+        "U", "V", "W", "X", "Y",
+    ]
+    bearish_keys = [
+        "AF", "AG", "AH", "AI", "AJ", "AK", "AL", "AM", "AN", "AO",
+        "AP", "AQ", "AR", "AS", "AT",
+    ]
 
     for i in range(limit):
         trend = exact_initial_trend(rows, i)
