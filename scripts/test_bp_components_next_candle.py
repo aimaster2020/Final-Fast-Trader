@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-from collections import defaultdict
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,9 +33,9 @@ def main() -> None:
 
     result = calculate(rows)
 
-    # These are the actual components used to build Z/AU/AV/BP.
     components = {
-        "Trend": ("trend", None),
+        "Trend_Up": ("bull", None),
+        "Trend_Down": ("bear", None),
         "K_Hammer": ("bull", "K"),
         "L_InvertedHammer": ("bull", "L"),
         "M_DragonflyDoji": ("bull", "M"),
@@ -84,14 +83,17 @@ def main() -> None:
 
         active: list[str] = []
         for name, (kind, key) in components.items():
-            if kind == "trend":
+            if name == "Trend_Up":
                 active_now = result[i]["AW_Trend"] == "صعودی"
+            elif name == "Trend_Down":
+                active_now = result[i]["AW_Trend"] == "نزولی"
             else:
                 active_now = int(result[i][key]) == 1
+
             if not active_now:
                 continue
 
-            predicted = 1 if kind in ("trend", "bull") else -1
+            predicted = 1 if kind == "bull" else -1
             stats[name]["samples"] += 1
             if actual == 1:
                 stats[name]["up"] += 1
@@ -148,9 +150,9 @@ def main() -> None:
     print(f"output={summary_path}")
     print(f"details={details_path}")
     print("TEST=INDIVIDUAL_BP_COMPONENTS_NEXT_CANDLE")
-    print("Bullish component active -> predicts next direction +1")
-    print("Bearish component active -> predicts next direction -1")
-    print("Trend=صعودی -> predicts +1; Trend=نزولی is not used as a bearish component")
+    print("Each active bullish component predicts next direction +1")
+    print("Each active bearish component predicts next direction -1")
+    print("Trend_Up and Trend_Down are tested separately")
     print("zero-change next candles excluded")
     print(f"rows={len(rows)}")
     print()
